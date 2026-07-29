@@ -1,37 +1,128 @@
+# Autonomous Docking Platform — Status & Roadmap
 
-This directory is intended for project header files.
+**Last updated:** rotation-only subsystem is wireless and demonstrating real reaction-wheel torque coupling. Translation (fans) not yet started.
 
-A header file is a file containing C declarations and macro definitions
-to be shared between several project source files. You request the use of a
-header file in your project source file (C, C++, etc) located in `src` folder
-by including it, with the C preprocessing directive `#include'.
+---
 
-```src/main.c
+## 1. What this project actually is
 
-#include "header.h"
+A tabletop platform, riding on low-friction ball transfer units, that autonomously navigates from an arbitrary starting pose to a fixed docking station and arrives with near-zero velocity — a miniature, benchtop version of spacecraft rendezvous-and-docking (the same category of problem NASA's docking system solves for Dragon/Starliner). Rotation is controlled by a reaction wheel; translation (once built) will be controlled by four fixed-mount fans in a N/S/E/W cross pattern. An overhead camera + AprilTag will supply absolute pose; an onboard IMU fills in between camera frames. A Raspberry Pi will eventually handle vision and trajectory generation; an STM32 running FreeRTOS handles the real-time control loop.
 
-int main (void)
-{
- ...
-}
-```
+**The point of the project** is to showcase a full engineering stack in one coherent build: PID → state-space → LQR control design, multi-rate sensor fusion, RTOS-based real-time firmware, FOC motor control, and guidance/trajectory generation — the kind of skill spread that maps directly onto embedded/controls/robotics job postings, not just a single narrow demo.
 
-Including a header file produces the same results as copying the header file
-into each source file that needs it. Such copying would be time-consuming
-and error-prone. With a header file, the related declarations appear
-in only one place. If they need to be changed, they can be changed in one
-place, and programs that include the header file will automatically use the
-new version when next recompiled. The header file eliminates the labor of
-finding and changing all the copies as well as the risk that a failure to
-find one copy will result in inconsistencies within a program.
+**Two deliberate architectural decisions**, made early to keep the build tractable:
 
-In C, the convention is to give header files names that end with `.h'.
+1. **Translation is fully decoupled from rotation.** Four fans can produce any net planar force by throttling combinations, without needing to rotate the platform to redirect thrust. The reaction wheel is used *only* for heading control (needed for final docking alignment), turning the dynamics into a standard decoupled 3-DOF system (independent x, y, θ double-integrators) rather than an underactuated, rotate-then-translate spacecraft problem. That harder version is a legitimate stretch goal for later, not a requirement for the working demo.
+2. **Reaction wheel uses a BLDC gimbal motor + FOC**, not a brushed motor + H-bridge — a deliberate upgrade from the original plan based on parts already owned. This is more firmware work (the Nucleo has to run the full FOC control loop itself, since the driver board is a bare gate driver with no onboard MCU), but it buys a directly-measured wheel angle and speed via the MT6701 encoder, turning momentum-saturation monitoring into a simple threshold check on a real number instead of an inferred quantity.
 
-Read more about using header files in official GCC documentation:
+---
 
-* Include Syntax
-* Include Operation
-* Once-Only Headers
-* Computed Includes
+## 2. Hardware in use (rotation subsystem)
 
-https://gcc.gnu.org/onlinedocs/cpp/Header-Files.html
+| Component | Part | Notes |
+|---|---|---|
+| MCU | STM32 Nucleo-F446RE | Runs FreeRTOS (proven separately, see §4) + the full FOC control loop |
+| Reaction wheel motor | 12–36V 4015 BLDC hollow-shaft external-rotor motor | External rotor means the flywheel bolts to the rotor face directly |
+| Encoder | MT6701 magnetic encoder | **Wired in SSI mode (SPI-based)**, not I2C as originally planned — gives direct wheel angle/velocity for momentum-saturation monitoring and FOC commutation |
+| Motor driver | SimpleFOC-Mini-compatible board (DRV8313 chip) | Bare 3-phase gate driver, **no onboard MCU** — all FOC math (Clarke/Park, SVPWM, current/velocity control) runs on the Nucleo via the SimpleFOC library |
+| IMU | MPU6050 | On shared I2C1 bus (PB8/PB9) — **connected and working** |
+| Current/power monitor | INA219 | On shared I2C1 bus — **connected and working**, currently monitoring the reaction-wheel motor supply line |
+| Ball transfer units | KangTeer 5/8" ball, screw-mounted | 3 used, tripod-style (not 4 — avoids over-constraining on an imperfectly flat surface). **Real-world note:** manufacturer specs suggested near-zero rolling resistance (~0.5% of load), but in practice these are noticeably more "frictiony" than that spec implied — see §5 for how this shows up in actual behavior |
+| Battery | 12V pack | Feeds the system directly; buck-converted down for logic |
+| Buck converter | 12V → 5V | Powers Nucleo logic rail. **Open item:** the Nucleo's JP5 jumper needs to be set to the E5V position (with JP1 removed) to safely run this simultaneously with a USB connection — discussed but not yet confirmed done (see §6) |
+| Wireless link | HC-05 Bluetooth module | TXD→PC11, RXD→PC10, EN→PC12, STATE→PC0. Reconfigured from factory-default 9600 baud to **115200 baud** via AT commands. Fully verified working (see §3) |
+
+**Not yet built/ordered** (translation subsystem — see §7): Raspberry Pi 5, overhead camera, 4x translation motors + ESCs, second INA219 (for main battery line), final chassis material, LiPo swap, magnetic docking connector, prop guards.
+
+---
+
+## 3. What's done and verified
+
+### Rotation subsystem — mechanically and electrically complete
+- Reaction wheel mounted; all mechanical mounting for the rotation subsystem is finished.
+- MT6701 encoder wired and working in SSI/SPI mode.
+- MPU6050 and INA219 both connected and streaming real data over shared I2C1.
+- SimpleFOC bring-up complete: pole-pair count set, sensor alignment done, driver initializing correctly on pins D10–D13.
+
+### Wireless operation — fully working
+- HC-05 wired, reconfigured to 115200 baud (via AT commands in reduced-AT-mode), and verified end-to-end: `STATE` pin correctly reflects live connection status, and a stable serial link over Bluetooth has been confirmed via PuTTY.
+- Folded into the actual control sketch as a second, parallel command/telemetry channel: a second `Commander` instance (`commandBT`) handles motor commands over Bluetooth exactly like the USB link does, and telemetry rows mirror to both. A real bug was found and fixed here — both Commander instances were initially replying over USB only, due to a shared callback function; each now correctly replies on its own stream.
+- **The device is now completely wireless for the rotation subsystem** — power (battery + buck converter) and command/telemetry (HC-05) both untethered from any wired connection.
+- Known friction (not yet solved, workaround exists): Windows' classic Bluetooth SPP stack is flaky on the dev laptop — typically needs a forget/re-pair cycle each power-on, and `pio device monitor` doesn't reliably open the port while PuTTY does. A PuTTY saved session removes most of the manual reconfiguration each time; a full fix (or determining whether one's possible) hasn't been pursued further, since it doesn't block progress.
+
+### Reaction wheel torque coupling — confirmed working
+- Commanding a velocity step from 0 → 50 rad/s produces enough reaction torque to spin the entire platform roughly 360°, with ball-transfer-unit friction eventually arresting the rotation. This is a real, physical confirmation that the wheel-to-platform torque coupling works as intended — it satisfies the "manually command a wheel spin and confirm the platform reacts" sanity check from the original build plan.
+- This same result is also the first real-world data point on actual platform friction, and it's part of why the ball transfer units are flagged above as more "frictiony" than the manufacturer spec implied — a 50 rad/s step should be a very aggressive input for a system with genuinely tiny friction, so seeing the rotation self-arrest within about one full turn suggests real friction is higher than the ~0.5%-of-load spec assumed. Worth keeping in mind when sizing translation thrust later.
+
+### RTOS skeleton — proven, but currently a separate codebase
+- **Step 1:** bare FreeRTOS scheduler confirmed alive on the Nucleo (two tasks at different priorities/rates, verified via LED + serial heartbeat).
+- **Step 2:** the real pattern the Control Loop task will use — a hardware timer (TIM2) driving a binary semaphore that wakes a task deterministically — confirmed working at 1kHz.
+- **This skeleton has no sensors, no FOC, and no HC-05 in it yet.** It's a proven pattern sitting in a separate project from the actual working sensor/motor/Bluetooth sketch described above. Merging them is the largest remaining integration task (see §6).
+
+---
+
+## 4. Known issues / open anomalies (flagged, not yet root-caused)
+
+1. **`current_mA` reads `inf`** from the INA219 in telemetry output. Points to a calibration or initialization issue — `ina219.begin()` returning true isn't sufficient proof it's fully configured correctly. Not yet investigated.
+2. **`gyroZ_filt_dps` and `zAngle_deg` show implausibly large values** (hundreds of degrees/sec filtered rate, tens of thousands of degrees of integrated angle) during otherwise normal-looking bench tests. Either a genuine units/calibration bug in the gyro integration, or the wheel really was spinning fast enough during that particular test to justify it — not yet distinguished.
+
+---
+
+## 5. Important architectural item to resolve before real control design
+
+The reaction wheel motor is currently commanded in **`MotionControlType::velocity`** (SimpleFOC's own internal velocity PID) — appropriate for bring-up and for the torque-coupling sanity check in §3, but **not** the mode the real platform-angle controller should use.
+
+As established earlier in this project: the outer platform-angle controller (PID, then LQR) needs to command **torque** directly (`MotionControlType::torque`, `TorqueControlType::voltage` — true current-sensed FOC isn't feasible with the current bare-gate-driver board without added hardware, but voltage-mode torque control is a well-understood, adequate substitute at this project's torque/speed scale). Velocity mode inserts an extra closed loop between the outer controller and the physical torque the wheel actually produces, which breaks the clean state-space model (`θ_p'' = -τ/J_p`, `ω_w' = τ/J_w`) that the PID/LQR design depends on.
+
+**This needs to be switched deliberately before building the actual angle-hold controller — not carried forward by default.**
+
+---
+
+## 6. Next steps (near-term, rotation-only)
+
+In a sensible order:
+
+1. **Resolve the INA219 `inf` reading and the gyro/angle anomalies** — don't want to build a controller on sensor data that isn't trusted yet.
+2. **Switch the motor to torque/voltage mode** (`MotionControlType::torque`) and re-verify basic behavior — command a small torque, confirm the wheel and platform respond sensibly — before any outer-loop design work.
+3. **Build the two-body state-space model** (wheel + platform, conserved angular momentum) in Python (`control`/`scipy.signal`) or MATLAB. Not yet done. This is meant to inform PID/LQR gains before hardware trial-and-error, and to make momentum-saturation risk visible in simulation before it's a hardware surprise.
+4. **Build the actual platform-angle-hold controller** — real closed-loop heading hold using gyro feedback + torque commands. Everything so far has been open-loop/manual velocity setpoints via Commander, not an autonomous controller.
+5. **Merge the sensor/FOC/HC-05 codebase into the proven RTOS skeleton.** Currently two separate projects. Target structure (per the original plan): a Control Loop task (sensors + FOC + control law, timer/semaphore-driven at 500Hz–1kHz), a Safety/Watchdog task (INA219 + wheel-RPM saturation thresholds, 10–20Hz), and a Comms task (HC-05 command parsing, event-driven).
+6. **Confirm the JP5/JP1 jumper change** on the Nucleo if buck converter + USB will be run simultaneously going forward (see §2) — flagged as a safety item, not yet confirmed done.
+7. **Tune PID on real hardware first**, even though the eventual plan is PID → LQR — a measured step response gives a real platform inertia (`J_p`) to feed into the LQR model, making the computed LQR gains much closer to correct on the first hardware trial.
+8. **Move to LQR** once PID heading-hold is solid, using the real hardware-derived inertia estimate.
+
+---
+
+## 7. Looking further ahead: translation subsystem (not started)
+
+Per the original project plan, once rotation is solid, the following brings in the fan-actuated translation subsystem — genuinely separate hardware and a separate control problem (independent x/y double-integrators, decoupled from heading by design):
+
+**Hardware still to add:**
+- Raspberry Pi 5 (vision + trajectory generation + high-level guidance)
+- Overhead machine-vision-style USB camera (manual exposure preferred over a webcam's auto-everything, for reliable AprilTag detection)
+- 4x brushless motors + ESCs (translation actuators, mounted N/S/E/W)
+- A second INA219, added to the **main battery line** once the LiPo swap happens (the existing one stays on the reaction-wheel motor line as a per-motor load/stall indicator)
+- Final chassis material (acrylic disc) if not already finalized
+- 3S LiPo battery + charger, for the final untethered demo (bench supply/current 12V pack is fine until then)
+- Neodymium disc magnets for the docking connector (no active mechanism needed)
+- Prop guards for the exposed fan propellers — a real safety item, not cosmetic
+
+**Software/control work that comes with it:**
+- UART link between Pi and STM32, framed packet protocol (start byte, length, payload, checksum)
+- AprilTag detection + camera calibration on the Pi
+- Complementary filter fusing fast IMU with slow/latent vision, later upgraded to a Kalman filter
+- Minimum-jerk (or similar) trajectory generator producing time-varying x/y/θ setpoints from arbitrary start to the fixed dock pose, zero terminal velocity
+- Reduced-speed, tightened-deadband terminal docking approach logic
+- Full end-to-end integration testing from many random start poses
+
+**De-scoping priorities if time runs short** (from the original plan, unchanged): cut the mechanical docking connector first (redefine "docked" as reaching a position/velocity tolerance), cut the Kalman filter second (complementary filter alone is a legitimate fallback), cut LQR third (well-tuned PID is still a strong result) — but never cut the RTOS structure, sensor fusion in some form, or the trajectory generator, since those three are what separate this from a generic "robot drives to a point" project.
+
+---
+
+## 8. Codebase note
+
+Two separate project folders currently exist and have **not** been merged:
+- `docking-rtos/` — the proven FreeRTOS skeleton (timer/semaphore pattern), no sensors or FOC yet.
+- `reaction-wheel-control/` — the working sensor/FOC/HC-05 sketch (plain `loop()`, no RTOS), where all the hardware bring-up and Bluetooth integration described above actually lives.
+
+Merging these is explicitly called out as the top structural task in §6.
