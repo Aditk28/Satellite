@@ -3,60 +3,63 @@
 filter_calibration.py
 
 Turns a raw calibration_run_* folder (written by capture_calibration.py) into
-a filtered/ copy with the sensor corrections applied and useful derived
-columns added. Raw files are never modified -- reruns are safe and
-repeatable, which is the whole point of the calibration sweep being
-automated in the first place.
+a filtered/ copy with sensor corrections applied and derived columns added.
+Raw files are never modified, so reruns are safe.
 
-WHAT IT CORRECTS, AND WHY:
+Handles the current firmware format (repeats, measured wheel angle, INA219
+current, staircase mode) and still reads the older pre-repeats format.
 
-  1. GYRO BIAS. The MPU6050 reads a small nonzero rate even at rest --
-     measured at roughly +0.42 dps in this rig, consistent to within
-     0.01 dps across every at-rest test. That's normal MEMS behavior, not a
-     fault, but left uncorrected it integrates straight into fake platform
-     rotation: ~0.4 dps over a 5 s test is ~2 degrees of drift that never
-     happened.
+WHAT IT CORRECTS:
 
-     The bias is measured automatically from the PHASE A WINDOW OF TESTS
-     THAT START FROM REST (from=0.00V in the file's metadata header). Those
-     are the only windows where the platform is provably undisturbed --
-     tests that spin up first (from!=0V) have real leftover platform motion
-     in their phase A, and in at least one case (the 3.0V hold) a genuine
-     decaying oscillation that crosses zero. Averaging those in would
-     corrupt the bias estimate, so they're excluded by construction.
+  GYRO BIAS. The MPU6050 reads a small nonzero rate at rest (~0.42 dps in
+  this rig). Left in, it integrates into rotation that never happened. The
+  bias is measured from the phase-A windows of tests that start from rest
+  (from=0.00V) -- the only windows where the platform is provably
+  undisturbed. Tests that spin up first are excluded; their phase A holds
+  real motion. The firmware now also reports its own startup measurement as
+  gyro_bias_dps in each file's metadata, and this script cross-checks the
+  two and warns if they disagree meaningfully (which would suggest thermal
+  drift over the sweep, or that the rig wasn't actually still at startup).
 
-  2. WHEEL/PLATFORM SIGN CONVENTION. sensor.getVelocity() (vel_raw) and
-     motor.shaft_velocity (vel_filtered) are near-perfect mirrors of each
-     other -- SimpleFOC applies the direction correction found during
-     initFOC() alignment to shaft_velocity, so vel_filtered is the
-     canonical, physically-consistent wheel velocity. This script uses
-     vel_filtered and ignores vel_raw.
+  WHEEL/PLATFORM SIGN CONVENTION. Wheel velocity and gyro rate come out
+  positively correlated in raw data, which would mean both bodies turning
+  the same way. They aren't -- the encoder's positive direction and the
+  IMU's positive gyro-Z are defined oppositely by how they're mounted.
+  --flip-gyro (default on) negates the gyro so both share a convention.
 
-     Separately: wheel velocity and platform gyro rate come out POSITIVELY
-     correlated in the raw data (+0.33 to +0.84 in every test). Newton's
-     third law says a wheel accelerating one way pushes the platform the
-     other way, so a positive correlation just means the encoder's positive
-     direction and the IMU's positive gyro-Z direction are defined
-     oppositely relative to each other -- a fixed mounting/axis convention,
-     not a physics violation. --flip-gyro (ON by default) negates the gyro
-     channel so both agree on which way is positive, which is what you want
-     before any momentum bookkeeping or before telling a controller which
-     way to spin the wheel to correct a given platform error.
+  WHEEL ANGLE ZEROING. The encoder reports absolute accumulated angle that
+  does not reset between tests, so each test starts from whatever the last
+  one left behind. Each test's angle is re-zeroed to its own first sample.
 
-WHAT IT ADDS (derived columns):
-     t_s              seconds since the start of that test
-     phase            'A' (pre-step hold) or 'B' (post-step transient)
-     wheel_vel        canonical wheel velocity (from vel_filtered)
-     wheel_angle_rad  integrated wheel velocity
-     gyro_dps         bias-corrected (and optionally sign-flipped) rate
-     platform_deg     integrated gyro_dps -- platform heading, degrees
+WHAT IT ADDS:
+  t_s              seconds since the start of that test
+  phase            'A' (pre-step hold) or 'B' (post-step transient)
+  wheel_angle_rad  measured encoder angle, zeroed per test
+  wheel_accel      d(wheel_vel)/dt -- sets reaction torque on the platform
+  gyro_dps         bias-corrected (and optionally sign-flipped) rate
+  platform_deg     integrated gyro_dps -- platform heading, degrees
+  power_mW         busV * current_mA
+  iq_est_A         estimated q-axis current, see below
+
+IQ ESTIMATE -- READ BEFORE TRUSTING IT. The INA219 is on the DC bus, not
+the phase wires, so Iq is not measured directly. In voltage mode SimpleFOC
+drives Ud ~= 0, so essentially all electrical power is Uq*Iq and must come
+from the bus:  V_bus*I_bus ~= Uq*Iq  ->  Iq ~= V_bus*I_bus/Uq.
+This neglects switching and conduction losses (a few percent) and blows up
+as Uq approaches zero. Samples where |targetV| < --iq-min-v (default 0.15 V)
+are left as NaN rather than reporting a huge meaningless number -- that
+includes every release-to-zero test's phase B, by design.
+
+STAIRCASE FILES are detected by mode=staircase in the metadata and passed
+through with bias correction and derived columns, but no phase split (there
+is no single step). breakaway_summary.csv reports, per staircase file, the
+first tread where platform motion leaves the noise floor going up and where
+it re-sticks coming down.
 
 USAGE:
-    python filter_calibration.py calibration_run_20260729_112929
+    python filter_calibration.py calibration_run_20260730_101500
     python filter_calibration.py <run_folder> --no-flip-gyro
-    python filter_calibration.py <run_folder> --outdir somewhere_else
-
-Output lands in <run_folder>/filtered/ unless --outdir says otherwise.
+    python filter_calibration.py <run_folder> --bias 0.42 --iq-min-v 0.2
 """
 
 import argparse
@@ -69,56 +72,84 @@ try:
     import numpy as np
     import pandas as pd
 except ImportError:
-    print("This script needs numpy and pandas:  pip install numpy pandas")
+    print("This script needs numpy and pandas:  py -m pip install numpy pandas")
     sys.exit(1)
 
-RE_META = re.compile(r"^#\s*from=([-\d.]+)V\s+to=([-\d.]+)V\s+hold=(\d+)ms\s+stop_reason=(\w+)")
 RE_TITLE = re.compile(r"^#\s*test\s+(\d+)/(\d+):\s*(.*)$")
 
 
+def parse_meta_line(line):
+    """Pull key=value pairs out of the metadata comment line.
+
+    Deliberately generic: the firmware's metadata fields change as the sweep
+    evolves, and an exact-match regex on that line is what silently broke
+    capture once already. Anything of the form key=value is picked up;
+    unknown keys are simply ignored.
+    """
+    out = {}
+    for m in re.finditer(r"(\w+)=([^\s]+)", line):
+        out[m.group(1)] = m.group(2)
+    return out
+
+
 def read_test(path):
-    """Read one calibration CSV, returning (dataframe, metadata dict)."""
     meta = {}
-    with open(path, "r") as f:
+    with open(path) as f:
         for line in f:
             if not line.startswith("#"):
                 break
             m = RE_TITLE.match(line)
             if m:
-                meta["test_num"], meta["test_total"], meta["label"] = int(m.group(1)), int(m.group(2)), m.group(3)
-            m = RE_META.match(line)
-            if m:
-                meta["from_v"] = float(m.group(1))
-                meta["to_v"] = float(m.group(2))
-                meta["hold_ms"] = int(m.group(3))
-                meta["stop_reason"] = m.group(4)
+                meta["test_num"] = int(m.group(1))
+                meta["test_total"] = int(m.group(2))
+                meta["label"] = m.group(3)
+            meta.update(parse_meta_line(line[1:]))
     df = pd.read_csv(path, comment="#")
+
+    # Normalise column names across firmware revisions. The older sweep
+    # logged vel_filtered (plus an unused vel_raw); the current one logs
+    # wheel_vel. Everything downstream uses wheel_vel.
+    if "wheel_vel" not in df.columns and "vel_filtered" in df.columns:
+        df = df.rename(columns={"vel_filtered": "wheel_vel"})
     return df, meta
 
 
-def transition_index(df):
-    """Index of the first sample after targetV changes (phase A -> B)."""
+def fnum(meta, key, default=np.nan):
+    try:
+        return float(str(meta.get(key, default)).rstrip("V"))
+    except (TypeError, ValueError):
+        return default
+
+
+def is_staircase(meta):
+    return str(meta.get("mode", "")).lower() == "staircase"
+
+
+def transition_index(df, meta):
+    """First phase-B sample. Prefer the firmware's own index; fall back to
+    detecting where targetV changes (needed for older files)."""
+    if "phaseB_start_sample" in meta:
+        try:
+            return int(meta["phaseB_start_sample"])
+        except ValueError:
+            pass
     tv = df["targetV"].to_numpy()
     for i in range(1, len(tv)):
         if tv[i] != tv[i - 1]:
             return i
-    return len(tv)  # no transition found -- treat everything as phase A
+    return len(tv)
 
 
 def measure_bias(files):
-    """Average gyro bias from the phase-A windows of at-rest tests only.
-
-    At-rest means from=0.00V in the metadata: the platform is provably
-    undisturbed for that whole window. Tests that spin up first are
-    excluded -- their phase A contains real motion.
-    """
-    samples = []
-    used = []
+    """Average gyro bias from the phase-A windows of at-rest step tests."""
+    samples, used = [], []
     for path in files:
         df, meta = read_test(path)
-        if abs(meta.get("from_v", 0.0)) > 1e-9:
-            continue  # not an at-rest test, skip for bias purposes
-        ti = transition_index(df)
+        if is_staircase(meta):
+            continue
+        if abs(fnum(meta, "from", 1.0)) > 1e-9:
+            continue
+        ti = transition_index(df, meta)
         if ti < 10:
             continue
         seg = df["gyroZ_dps"].to_numpy()[:ti]
@@ -126,31 +157,44 @@ def measure_bias(files):
         used.append((os.path.basename(path), seg.mean(), seg.std()))
     if not samples:
         return None, []
-    allsamples = np.concatenate(samples)
-    return float(allsamples.mean()), used
+    return float(np.concatenate(samples).mean()), used
 
 
 def integrate(y, t):
-    """Cumulative trapezoidal integral of y over t, starting at 0."""
     out = np.zeros(len(y))
     if len(y) < 2:
         return out
-    dt = np.diff(t)
-    incr = (y[1:] + y[:-1]) / 2.0 * dt
-    out[1:] = np.cumsum(incr)
+    out[1:] = np.cumsum((y[1:] + y[:-1]) / 2.0 * np.diff(t))
     return out
+
+
+def find_breakaway(df, bias, settle_dps):
+    """First tread where platform motion leaves the noise floor (climbing)
+    and where it settles back (descending)."""
+    v = df["targetV"].to_numpy()
+    g = np.abs(df["gyro_dps"].to_numpy())
+    peak_v = v.max()
+    up = np.arange(len(v)) <= int(np.argmax(v))
+    moving = g > settle_dps
+    bo = v[up & moving]
+    dn = v[~up & moving]
+    return (float(bo.min()) if len(bo) else np.nan,
+            float(dn.min()) if len(dn) else np.nan,
+            float(peak_v))
 
 
 def main():
     ap = argparse.ArgumentParser(description="Apply sensor corrections to a raw calibration run.")
-    ap.add_argument("run_folder", help="Folder holding the raw test*.csv files")
-    ap.add_argument("--outdir", default=None, help="Where to write filtered copies (default: <run_folder>/filtered)")
+    ap.add_argument("run_folder")
+    ap.add_argument("--outdir", default=None)
     ap.add_argument("--flip-gyro", dest="flip", action="store_true", default=True,
                     help="Negate gyro so wheel and platform share a sign convention (default)")
-    ap.add_argument("--no-flip-gyro", dest="flip", action="store_false",
-                    help="Leave the gyro sign exactly as recorded")
-    ap.add_argument("--bias", type=float, default=None,
-                    help="Override the measured gyro bias, in dps")
+    ap.add_argument("--no-flip-gyro", dest="flip", action="store_false")
+    ap.add_argument("--bias", type=float, default=None, help="Override measured gyro bias, dps")
+    ap.add_argument("--iq-min-v", type=float, default=0.15,
+                    help="Below this |targetV|, iq_est_A is left NaN (default 0.15)")
+    ap.add_argument("--settle-dps", type=float, default=3.0,
+                    help="Motion threshold for staircase breakaway detection (default 3.0)")
     args = ap.parse_args()
 
     files = sorted(glob.glob(os.path.join(args.run_folder, "test*.csv")))
@@ -167,81 +211,191 @@ def main():
     else:
         bias, used = measure_bias(files)
         if bias is None:
-            print("Could not find any at-rest (from=0.00V) tests to measure bias from.")
-            print("Pass --bias <dps> explicitly, or include at least one from-rest test in the sweep.")
+            print("No at-rest (from=0.00V) step tests found to measure bias from.")
+            print("Pass --bias <dps>, or include at least one from-rest test in the sweep.")
             sys.exit(1)
-        print(f"Gyro bias measured from {len(used)} at-rest test(s):")
-        for name, m, s in used:
-            print(f"   {name:62s} mean={m:+.4f} std={s:.4f}")
-        print(f"  -> using bias = {bias:+.4f} dps")
+        print(f"Gyro bias measured from {len(used)} at-rest test(s): {bias:+.4f} dps")
+        if used:
+            spread = max(m for _, m, _ in used) - min(m for _, m, _ in used)
+            print(f"  spread across those tests: {spread:.4f} dps")
 
-    print(f"Gyro sign flip: {'ON (wheel and platform share a convention)' if args.flip else 'OFF (as recorded)'}")
+    # Cross-check against the firmware's own startup measurement.
+    fw = []
+    for path in files:
+        _, meta = read_test(path)
+        if "gyro_bias_dps" in meta:
+            try:
+                fw.append(float(meta["gyro_bias_dps"]))
+            except ValueError:
+                pass
+    if fw:
+        fwb = float(np.mean(fw))
+        print(f"Firmware-reported bias: {fwb:+.4f} dps  (difference {abs(fwb-bias):.4f})")
+        if abs(fwb - bias) > 0.15:
+            print("  ! These disagree more than expected. Possible causes: the rig wasn't")
+            print("    still during the firmware's startup measurement, or the gyro drifted")
+            print("    over the sweep. The value measured here (from at-rest windows) is used.")
+
+    print(f"Gyro sign flip: {'ON' if args.flip else 'OFF'}")
     print()
 
-    summary_rows = []
+    rows, stair_rows = [], []
+    n_angle_flips = [0]   # list so the per-test loop can increment it
 
     for path in files:
         df, meta = read_test(path)
-        ti = transition_index(df)
+        stair = is_staircase(meta)
+        name = os.path.basename(path)
 
         t_us = df["t_us"].to_numpy().astype(np.float64)
         t_s = (t_us - t_us[0]) / 1e6
-
-        wheel_vel = df["vel_filtered"].to_numpy().astype(np.float64)
+        wheel_vel = df["wheel_vel"].to_numpy().astype(np.float64)
         gyro_raw = df["gyroZ_dps"].to_numpy().astype(np.float64)
 
         gyro = gyro_raw - bias
         if args.flip:
             gyro = -gyro
 
-        wheel_angle = integrate(wheel_vel, t_s)
-        platform_deg = integrate(gyro, t_s)
+        # Encoder angle is absolute and does not reset between tests -- zero
+        # it per test. Older files without the column fall back to
+        # integrating velocity.
+        #
+        # SIGN: sensor.getAngle() returns the RAW encoder direction, while
+        # motor.shaft_velocity has the direction correction found during
+        # initFOC() alignment applied to it. On this rig they come out
+        # opposite (d(angle)/dt tracks -wheel_vel at slope ~-0.98 in every
+        # test), exactly like the old vel_raw/vel_filtered mirror. Left
+        # uncorrected, angle and velocity would disagree about which way the
+        # wheel is turning, which would silently corrupt anything using both.
+        # Detected per test rather than assumed, so a firmware change that
+        # switches to motor.shaft_angle won't break this.
+        angle_flipped = False
+        if "wheel_angle_rad" in df.columns:
+            wa = df["wheel_angle_rad"].to_numpy().astype(np.float64)
+            wheel_angle = wa - wa[0]
+            moving = np.abs(wheel_vel) > 1.0
+            if moving.sum() >= 10:
+                dadt = np.gradient(wheel_angle, t_s)
+                slope = np.polyfit(wheel_vel[moving], dadt[moving], 1)[0]
+                if slope < 0:
+                    wheel_angle = -wheel_angle
+                    angle_flipped = True
+                    n_angle_flips[0] += 1
+        else:
+            wheel_angle = integrate(wheel_vel, t_s)
 
-        phase = np.where(np.arange(len(df)) < ti, "A", "B")
+        wheel_accel = np.gradient(wheel_vel, t_s)
+        platform_deg = integrate(gyro, t_s)
 
         out = pd.DataFrame({
             "t_s": np.round(t_s, 6),
-            "phase": phase,
             "targetV": df["targetV"].to_numpy(),
             "wheel_vel": np.round(wheel_vel, 4),
             "wheel_angle_rad": np.round(wheel_angle, 4),
+            "wheel_accel": np.round(wheel_accel, 3),
             "gyro_dps_raw": np.round(gyro_raw, 4),
             "gyro_dps": np.round(gyro, 4),
             "platform_deg": np.round(platform_deg, 4),
         })
 
-        name = os.path.basename(path)
+        if not stair:
+            ti = transition_index(df, meta)
+            out.insert(1, "phase", np.where(np.arange(len(df)) < ti, "A", "B"))
+
+        if "current_mA" in df.columns and "busV" in df.columns:
+            cur = df["current_mA"].to_numpy().astype(np.float64)
+            bus = df["busV"].to_numpy().astype(np.float64)
+            tv = df["targetV"].to_numpy().astype(np.float64)
+            out["current_mA"] = np.round(cur, 3)
+            out["busV"] = np.round(bus, 4)
+            out["power_mW"] = np.round(bus * cur, 3)
+            # Iq from power balance; masked where Uq is too small to divide by.
+            with np.errstate(divide="ignore", invalid="ignore"):
+                iq = np.where(np.abs(tv) >= args.iq_min_v, bus * (cur / 1000.0) / tv, np.nan)
+            out["iq_est_A"] = np.round(iq, 5)
+
         outpath = os.path.join(outdir, name)
         with open(outpath, "w", newline="") as f:
-            f.write(f"# test {meta.get('test_num','?')}/{meta.get('test_total','?')}: {meta.get('label','')}\n")
-            f.write(f"# from={meta.get('from_v',float('nan')):.2f}V to={meta.get('to_v',float('nan')):.2f}V "
-                    f"hold={meta.get('hold_ms','?')}ms stop_reason={meta.get('stop_reason','?')}\n")
-            f.write(f"# FILTERED: gyro_bias_removed={bias:+.4f}dps  gyro_sign_flipped={args.flip}\n")
-            f.write(f"# phase A samples={ti}  phase B samples={len(df)-ti}\n")
+            f.write(f"# test {meta.get('test_num','?')}/{meta.get('test_total','?')}: "
+                    f"{meta.get('label','')}\n")
+            keep = [k for k in ("from", "to", "rep", "mode", "step_v", "max_v",
+                                "dwell_ms", "phaseA_clean", "stop_reason") if k in meta]
+            f.write("# " + " ".join(f"{k}={meta[k]}" for k in keep) + "\n")
+            f.write(f"# FILTERED: gyro_bias_removed={bias:+.4f}dps gyro_sign_flipped={args.flip} "
+                    f"wheel_angle_sign_flipped={angle_flipped} iq_min_v={args.iq_min_v}\n")
             out.to_csv(f, index=False)
 
-        b = out[out["phase"] == "B"]
-        summary_rows.append({
-            "test": meta.get("test_num", 0),
-            "label": meta.get("label", name),
-            "from_v": meta.get("from_v", np.nan),
-            "to_v": meta.get("to_v", np.nan),
-            "n": len(out),
-            "duration_s": round(float(t_s[-1]), 3),
-            "wheel_vel_final": round(float(wheel_vel[-20:].mean()), 3),
-            "wheel_vel_peak": round(float(wheel_vel[np.argmax(np.abs(wheel_vel))]), 3),
-            "platform_net_deg": round(float(platform_deg[-1]), 2),
-            "platform_peak_dps": round(float(gyro[np.argmax(np.abs(gyro))]), 2),
-            "stop_reason": meta.get("stop_reason", "?"),
-        })
-        print(f"  wrote {outpath}  ({len(out)} rows, phase A={ti} / B={len(df)-ti})")
+        if stair:
+            bo, rs, pk = find_breakaway(out, bias, args.settle_dps)
+            stair_rows.append({"file": name, "breakaway_V": bo, "restick_V": rs,
+                               "max_V": pk, "n": len(out)})
+            print(f"  wrote {outpath}  [staircase] breakaway~{bo:.2f}V restick~{rs:.2f}V")
+        else:
+            iq_ss = np.nan
+            if "iq_est_A" in out.columns:
+                tail = out["iq_est_A"].to_numpy()[-20:]
+                # All-NaN is expected and correct for release-to-zero tests:
+                # targetV is 0 there, so Iq can't be recovered from power
+                # balance. nanmean would warn on an all-NaN slice, so check.
+                if np.any(np.isfinite(tail)):
+                    iq_ss = round(float(np.nanmean(tail)), 5)
+            rows.append({
+                "test": meta.get("test_num", 0),
+                "label": meta.get("label", name),
+                "rep": int(meta.get("rep", 1)) if str(meta.get("rep", "1")).isdigit() else 1,
+                "from_v": fnum(meta, "from"),
+                "to_v": fnum(meta, "to"),
+                "phaseA_clean": meta.get("phaseA_clean", "?"),
+                "n": len(out),
+                "duration_s": round(float(t_s[-1]), 3),
+                "wheel_vel_final": round(float(wheel_vel[-20:].mean()), 3),
+                "wheel_vel_peak": round(float(wheel_vel[np.argmax(np.abs(wheel_vel))]), 3),
+                "platform_net_deg": round(float(platform_deg[-1]), 2),
+                "platform_peak_dps": round(float(gyro[np.argmax(np.abs(gyro))]), 2),
+                "iq_ss_A": iq_ss,
+                "stop_reason": meta.get("stop_reason", "?"),
+            })
+            print(f"  wrote {outpath}  ({len(out)} rows)")
 
-    summary = pd.DataFrame(summary_rows).sort_values("test")
-    spath = os.path.join(outdir, "summary.csv")
-    summary.to_csv(spath, index=False)
-    print(f"\n  wrote {spath}")
-    print()
-    print(summary.to_string(index=False))
+    if rows:
+        summary = pd.DataFrame(rows).sort_values("test")
+        summary.to_csv(os.path.join(outdir, "summary.csv"), index=False)
+        print(f"\n  wrote {os.path.join(outdir,'summary.csv')}")
+
+        if n_angle_flips[0]:
+            print(f"\n  note: wheel_angle_rad sign was inverted relative to wheel_vel in "
+                  f"{n_angle_flips[0]} test(s) and has been corrected.")
+            print("    sensor.getAngle() reports raw encoder direction; motor.shaft_velocity")
+            print("    has the initFOC() alignment correction applied. Logging")
+            print("    motor.shaft_angle instead would fix this at the source.")
+
+        bad = summary[summary["phaseA_clean"] == "no"]
+        if len(bad):
+            print(f"\n  ! {len(bad)} test(s) reported phaseA_clean=no -- the platform was still")
+            print("    moving when the step fired, so phase B started from a contaminated")
+            print("    initial condition. Consider excluding these from fits:")
+            for _, r in bad.iterrows():
+                print(f"      test {int(r['test']):3d} rep {int(r['rep'])}  {r['label']}")
+
+        # Repeatability across reps of the same condition.
+        if summary["rep"].nunique() > 1:
+            grp = summary.groupby(["from_v", "to_v"]).agg(
+                n_reps=("rep", "count"),
+                wheel_peak_mean=("wheel_vel_peak", "mean"),
+                wheel_peak_std=("wheel_vel_peak", "std"),
+                platform_net_mean=("platform_net_deg", "mean"),
+                platform_net_std=("platform_net_deg", "std"),
+            ).reset_index().round(3)
+            grp.to_csv(os.path.join(outdir, "repeatability.csv"), index=False)
+            print(f"  wrote {os.path.join(outdir,'repeatability.csv')}")
+            print()
+            print(grp.to_string(index=False))
+
+    if stair_rows:
+        sdf = pd.DataFrame(stair_rows)
+        sdf.to_csv(os.path.join(outdir, "breakaway_summary.csv"), index=False)
+        print(f"\n  wrote {os.path.join(outdir,'breakaway_summary.csv')}")
+        print(sdf.to_string(index=False))
 
 
 if __name__ == "__main__":

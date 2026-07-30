@@ -1,0 +1,49 @@
+test,label,rep,from_v,to_v,phaseA_clean,n,duration_s,wheel_vel_final,wheel_vel_peak,platform_net_deg,platform_peak_dps,iq_ss_A,stop_reason
+1,step 0 -> +1.0V [rep 1/3],1,0.0,1.0,yes,409,2.124,8.006,8.078,-10.72,-29.67,0.09236,platform_settled
+2,step 0 -> -1.0V [rep 1/3],1,0.0,-1.0,yes,356,1.89,-7.55,-7.659,16.41,40.07,-0.0795,platform_settled
+3,step 0 -> +1.5V [rep 1/3],1,0.0,1.5,yes,355,1.884,11.401,11.564,-30.59,-64.19,0.21366,platform_settled
+4,step 0 -> -1.5V [rep 1/3],1,0.0,-1.5,yes,382,2.004,-12.304,-12.388,28.29,58.91,-0.17772,platform_settled
+5,step 0 -> +2.5V [rep 1/3],1,0.0,2.5,yes,525,2.645,19.556,19.765,-83.71,-130.83,0.52293,platform_settled
+6,step 0 -> -2.5V [rep 1/3],1,0.0,-2.5,yes,382,2.004,-19.753,-19.895,54.08,114.68,-0.4359,platform_settled
+7,step 0 -> +4.0V [rep 1/3],1,0.0,4.0,yes,490,2.488,27.351,27.559,-124.45,-187.57,1.08653,platform_settled
+8,step 0 -> -4.0V [rep 1/3],1,0.0,-4.0,yes,555,2.777,-29.122,-29.607,166.9,197.68,-0.94249,platform_settled
+9,spin +1.0V -> release to 0 [rep 1/3],1,1.0,0.0,yes,368,2.017,0.925,8.403,2.86,16.57,,platform_settled
+10,spin -1.0V -> release to 0 [rep 1/3],1,-1.0,0.0,yes,368,2.017,-1.044,-8.562,-4.53,-24.8,,platform_settled
+11,spin +1.0V -> reverse to -1.0V [rep 1/3],1,1.0,-1.0,yes,556,2.857,-8.16,8.476,44.07,71.67,-0.04042,platform_settled
+12,spin -1.0V -> reverse to +1.0V [rep 1/3],1,-1.0,1.0,yes,457,2.415,7.434,-8.551,-42.4,-88.56,0.10341,platform_settled
+13,spin +1.5V -> reverse to -0.8V [rep 1/3],1,1.5,-0.8,yes,514,2.669,-5.475,12.892,69.58,119.78,-0.06327,platform_settled
+14,spin -1.5V -> reverse to +0.8V [rep 1/3],1,-1.5,0.8,yes,570,2.924,5.803,-13.17,-55.22,-153.0,0.03742,platform_settled
+15,spin +3.0V -> reverse to -2.0V [rep 1/3],1,3.0,-2.0,yes,841,4.257,-16.906,24.096,255.23,347.97,-0.2117,platform_settled
+16,spin -3.0V -> reverse to +2.0V [rep 1/3],1,-3.0,2.0,yes,625,3.29,14.635,-25.304,-117.42,-334.42,0.38586,platform_settled
+17,step 0 -> +1.0V [rep 2/3],2,0.0,1.0,yes,345,1.839,7.337,7.509,-9.63,-26.71,0.11477,platform_settled
+18,step 0 -> -1.0V [rep 2/3],2,0.0,-1.0,yes,317,1.713,-7.207,-7.376,2.52,12.65,-0.09654,platform_settled
+19,step 0 -> +1.5V [rep 2/3],2,0.0,1.5,yes,317,1.715,10.694,11.069,-9.87,-41.38,0.23755,platform_settled
+20,step 0 -> -1.5V [rep 2/3],2,0.0,-1.5,yes,412,2.139,-12.349,-12.473,37.17,69.78,-0.14189,platform_settled
+21,step 0 -> +2.5V [rep 2/3],2,0.0,2.5,yes,415,2.152,18.931,19.233,-62.29,-106.93,0.52365,platform_settled
+22,step 0 -> -2.5V [rep 2/3],2,0.0,-2.5,yes,391,2.044,-19.942,-20.073,45.07,95.84,-0.39855,platform_settled
+23,step 0 -> +4.0V [rep 2/3],2,0.0,4.0,yes,442,2.273,27.221,27.464,-93.8,-173.74,1.15363,platform_settled
+24,step 0 -> -4.0V [rep 2/3],2,0.0,-4.0,yes,490,2.48,-29.21,-29.485,126.84,192.75,-0.92478,platform_settled
+25,spin +1.0V -> release to 0 [rep 2/3],2,1.0,0.0,yes,408,2.196,0.021,8.444,17.71,36.33,,platform_settled
+26,spin -1.0V -> release to 0 [rep 2/3],2,-1.0,0.0,yes,389,2.111,0.235,-8.594,-17.19,-53.11,,platform_settled
+27,spin +1.0V -> reverse to -1.0V [rep 2/3],2,1.0,-1.0,yes,540,2.786,-7.556,8.418,99.34,123.58,-0.08774,platform_settled
+28,spin -1.0V -> reverse to +1.0V [rep 2/3],2,-1.0,1.0,yes,508,2.643,7.513,-8.504,-56.42,-122.65,0.08918,platform_settled
+29,spin +1.5V -> reverse to -0.8V [rep 2/3],2,1.5,-0.8,yes,506,2.634,-5.558,12.806,57.73,148.36,-0.05218,platform_settled
+30,spin -1.5V -> reverse to +0.8V [rep 2/3],2,-1.5,0.8,yes,464,2.446,4.873,-13.232,-49.99,-120.65,0.09948,platform_settled
+31,spin +3.0V -> reverse to -2.0V [rep 2/3],2,3.0,-2.0,yes,894,4.492,-16.566,24.137,376.98,353.32,-0.22779,platform_settled
+32,spin -3.0V -> reverse to +2.0V [rep 2/3],2,-3.0,2.0,yes,678,3.527,15.434,-25.099,-91.37,-339.17,0.32192,platform_settled
+33,step 0 -> +1.0V [rep 3/3],3,0.0,1.0,yes,359,1.9,7.529,7.622,-11.54,-26.15,0.07646,platform_settled
+34,step 0 -> -1.0V [rep 3/3],3,0.0,-1.0,yes,323,1.74,-7.271,-7.443,3.39,11.46,-0.10071,platform_settled
+35,step 0 -> +1.5V [rep 3/3],3,0.0,1.5,yes,379,1.991,11.709,11.82,-29.26,-65.19,0.19646,platform_settled
+36,step 0 -> -1.5V [rep 3/3],3,0.0,-1.5,yes,348,1.851,-11.814,-11.956,15.28,47.49,-0.14845,platform_settled
+37,step 0 -> +2.5V [rep 3/3],3,0.0,2.5,yes,371,1.955,18.709,18.799,-35.88,-85.43,0.50767,platform_settled
+38,step 0 -> -2.5V [rep 3/3],3,0.0,-2.5,yes,385,2.018,-19.944,-20.07,41.32,88.74,-0.37351,platform_settled
+39,step 0 -> +4.0V [rep 3/3],3,0.0,4.0,yes,503,2.546,26.807,27.335,-187.31,-230.33,1.12249,platform_settled
+40,step 0 -> -4.0V [rep 3/3],3,0.0,-4.0,yes,545,2.733,-29.133,-29.401,192.51,235.35,-0.90886,platform_settled
+41,spin +1.0V -> release to 0 [rep 3/3],3,1.0,0.0,yes,372,2.041,0.465,8.517,5.52,26.4,,platform_settled
+42,spin -1.0V -> release to 0 [rep 3/3],3,-1.0,0.0,yes,388,2.107,0.004,-8.575,-7.89,-38.38,,platform_settled
+43,spin +1.0V -> reverse to -1.0V [rep 3/3],3,1.0,-1.0,yes,481,2.533,-7.559,8.47,50.89,87.88,-0.08,platform_settled
+44,spin -1.0V -> reverse to +1.0V [rep 3/3],3,-1.0,1.0,yes,522,2.705,7.646,-8.534,-50.28,-97.9,0.10417,platform_settled
+45,spin +1.5V -> reverse to -0.8V [rep 3/3],3,1.5,-0.8,yes,517,2.683,-5.601,12.852,50.37,151.94,-0.04837,platform_settled
+46,spin -1.5V -> reverse to +0.8V [rep 3/3],3,-1.5,0.8,yes,585,2.987,5.777,-13.176,-77.57,-156.91,0.05277,platform_settled
+47,spin +3.0V -> reverse to -2.0V [rep 3/3],3,3.0,-2.0,yes,768,3.929,-16.527,24.145,263.18,346.07,-0.26632,platform_settled
+48,spin -3.0V -> reverse to +2.0V [rep 3/3],3,-3.0,2.0,yes,647,3.393,15.28,-25.432,-167.71,-319.03,0.37008,platform_settled
