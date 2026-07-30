@@ -63,7 +63,6 @@ A tabletop platform, riding on low-friction ball transfer units, that autonomous
 
 ## 4. Known issues / open anomalies (flagged, not yet root-caused)
 
-1. **`current_mA` reads `inf`** from the INA219 in telemetry output. Points to a calibration or initialization issue — `ina219.begin()` returning true isn't sufficient proof it's fully configured correctly. Not yet investigated.
 2. **`gyroZ_filt_dps` and `zAngle_deg` show implausibly large values** (hundreds of degrees/sec filtered rate, tens of thousands of degrees of integrated angle) during otherwise normal-looking bench tests. Either a genuine units/calibration bug in the gyro integration, or the wheel really was spinning fast enough during that particular test to justify it — not yet distinguished.
 
 ---
