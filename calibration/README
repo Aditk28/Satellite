@@ -1,0 +1,96 @@
+# Calibration analysis pipeline
+
+Three scripts, run in order. Each reads the previous one's output; raw
+capture files are never modified, so every stage is safe to re-run.
+
+```
+capture_calibration.py   ->  calibration_run_<timestamp>/     (raw, from the board)
+filter_calibration.py    ->  <run>/filtered/                  (corrected + derived columns)
+plot_calibration.py      ->  <run>/filtered/plots/*.png       (static figures)
+make_replay.py           ->  <run>/filtered/replay.html       (animated attitude replay)
+```
+
+## Setup
+
+```
+pip install numpy pandas matplotlib pyserial
+```
+
+## 1. Filter
+
+```
+python filter_calibration.py calibration_run_20260729_112929
+```
+
+Applies two corrections and adds derived columns.
+
+**Gyro bias.** The MPU6050 reads ~+0.42 dps at rest. Normal for MEMS, but
+it integrates into fake rotation (~2 deg over a 5 s test). The bias is
+measured automatically from the phase-A windows of the tests that start
+from rest (`from=0.00V`) — the only windows where the platform is provably
+undisturbed. Tests that spin up first are excluded, because their phase A
+contains real leftover motion, including a genuine decaying oscillation in
+the 3.0 V case.
+
+**Sign convention.** Wheel velocity and gyro rate come out of the board
+positively correlated, which would mean both bodies turning the same way.
+They aren't: the encoder's positive direction and the IMU's positive
+gyro-Z are just defined oppositely by how they're mounted. `--flip-gyro`
+(on by default) negates the gyro so the two share a convention. After the
+flip, momentum bookkeeping comes out right — e.g. test 1's wheel goes to
++7.7 rad/s while the platform goes to −12.6 deg.
+
+Also uses `vel_filtered` (`motor.shaft_velocity`) as the canonical wheel
+velocity and ignores `vel_raw` — SimpleFOC applies its `initFOC()`
+alignment correction to the former, so it's the one that's physically
+consistent.
+
+Derived columns added: `t_s`, `phase` (A/B), `wheel_angle_rad`,
+`gyro_dps` (corrected), `platform_deg` (integrated heading). A
+`summary.csv` collects one row per test.
+
+Options: `--no-flip-gyro`, `--bias <dps>`, `--outdir <path>`.
+
+## 2. Plot
+
+```
+python plot_calibration.py calibration_run_20260729_112929/filtered
+```
+
+- `test<NN>_*.png` — per test: command, wheel velocity, platform rate +
+  heading, all sharing a time axis with the phase A/B boundary marked.
+- `overview_steps.png` — from-rest steps overlaid, aligned at the step.
+- `overview_scaling.png` — steady-state wheel velocity and peak platform
+  rate vs command. This is the one to look at before fitting anything: if
+  the points sit near a straight line through the origin, a linear model is
+  defensible.
+
+## 3. Replay
+
+```
+python make_replay.py calibration_run_20260729_112929/filtered
+```
+
+One self-contained HTML file, no server or network needed. Top-down view
+of the platform with the reaction wheel inside it, both turning from the
+recorded data, plus telemetry readouts, a momentum-exchange bar, and
+scrubable traces. Test selector switches between all nine runs.
+
+The wheel's spokes alias at speed, like a strobed wheel — read the numeric
+velocity instead. The momentum bars are relative within each body, not a
+conserved total: `J_w` and `J_p` aren't measured yet, so the two channels
+can't share units.
+
+Options: `--out <path>`, `--frames <n>` (default 500 per test).
+
+## Notes on the current data
+
+The 2026-07-29 run came out clean: ~320 Hz realized log rate with under
+100 µs of jitter, all nine tests ending on `platform_settled` rather than
+hitting a buffer or timeout ceiling, and peak wheel velocity scaling
+near-linearly with command (7.7–8.3 rad/s per volt across a 4× range).
+
+One thing to carry forward: the 3.0 V hold shows the platform ringing
+rather than settling quietly — a smooth decaying swing through zero in the
+last ~175 ms of phase A, not sensor noise. Larger disturbances may need
+more settle margin than the fixed hold currently gives them.
