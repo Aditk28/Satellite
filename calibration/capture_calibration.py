@@ -65,6 +65,16 @@ RE_START = re.compile(r"^--- capture start \(test (\d+)/(\d+): (.*)\) ---$")
 RE_META = re.compile(r"^from=([-\d.]+)V to=([-\d.]+)V hold=(\d+)ms stop_reason=(\w+)$")
 RE_END = re.compile(r"^--- capture end ---$")
 
+# The CSV header is whatever line starts with the time column. Detecting the
+# header rather than pattern-matching the metadata line is deliberate: the
+# firmware's metadata fields change as the sweep evolves (repeats, phase
+# flags, bias, staircase parameters), and an exact-match regex on that line
+# silently stalls the whole capture whenever it changes -- which is exactly
+# what happened when repeats and the phase-A flags were added. Everything
+# between the start marker and this header is treated as opaque metadata and
+# copied through verbatim, so new fields never break capture again.
+RE_HEADER = re.compile(r"^t_us\s*,")
+
 
 def sanitize(label):
     """Turn a test label into a safe filename fragment."""
@@ -127,12 +137,13 @@ def main():
     forwarder.start()
 
     sent_start_signal = False
-    state = "IDLE"  # IDLE -> AWAIT_META -> AWAIT_HEADER -> IN_DATA
+    state = "IDLE"  # IDLE -> AWAIT_HEADER -> IN_DATA
     cur_test_num = cur_total = cur_label = None
-    cur_meta = None
+    cur_meta_lines = []
     cur_header = None
     cur_rows = []
     files_written = 0
+    stall_guard = 0
 
     print(f"Writing CSV files to: {outdir}/")
     print("Type + Enter at any time to send it to the board (e.g. to abort manually).")
@@ -161,25 +172,32 @@ def main():
                 m = RE_START.match(line)
                 if m:
                     cur_test_num, cur_total, cur_label = m.group(1), m.group(2), m.group(3)
+                    cur_meta_lines = []
                     cur_rows = []
-                    state = "AWAIT_META"
+                    cur_header = None
+                    stall_guard = 0
+                    state = "AWAIT_HEADER"
+                    print(f">> Capturing test {cur_test_num}/{cur_total}: {cur_label}")
                 else:
                     print(line)  # ordinary status line -- just echo it
 
-            elif state == "AWAIT_META":
-                m = RE_META.match(line)
-                if m:
-                    cur_meta = {
-                        "from": m.group(1), "to": m.group(2),
-                        "hold_ms": m.group(3), "stop_reason": m.group(4),
-                    }
-                    state = "AWAIT_HEADER"
-                else:
-                    print(line)
-
             elif state == "AWAIT_HEADER":
-                cur_header = line  # e.g. "t_us,targetV,vel_raw,vel_filtered,gyroZ_dps"
-                state = "IN_DATA"
+                if RE_HEADER.match(line):
+                    cur_header = line
+                    state = "IN_DATA"
+                else:
+                    # Opaque metadata -- copied through without being parsed.
+                    cur_meta_lines.append(line)
+                    stall_guard += 1
+                    # If the header never arrives, don't silently swallow the
+                    # rest of the sweep the way the old parser did. Bail back
+                    # to IDLE and say so, loudly.
+                    if stall_guard > 12:
+                        print("!! No CSV header found after the capture-start marker.")
+                        print("!! Expected a line beginning with 't_us,'. Skipping this block.")
+                        for ml in cur_meta_lines:
+                            print("   " + ml)
+                        state = "IDLE"
 
             elif state == "IN_DATA":
                 if RE_END.match(line):
@@ -187,8 +205,8 @@ def main():
                     path = os.path.join(outdir, fname)
                     with open(path, "w", newline="") as f:
                         f.write(f"# test {cur_test_num}/{cur_total}: {cur_label}\n")
-                        f.write(f"# from={cur_meta['from']}V to={cur_meta['to']}V "
-                                f"hold={cur_meta['hold_ms']}ms stop_reason={cur_meta['stop_reason']}\n")
+                        for ml in cur_meta_lines:
+                            f.write(f"# {ml}\n")
                         f.write(cur_header + "\n")
                         f.write("\n".join(cur_rows) + "\n")
                     files_written += 1
@@ -202,6 +220,11 @@ def main():
         print(f"\nStopped. {files_written} test file(s) written to {outdir}/")
     finally:
         ser.close()
+        if files_written:
+            print(f"{files_written} test file(s) in {outdir}/")
+        else:
+            print(f"No files written. If the board was streaming data, the capture-start "
+                  f"marker or CSV header didn't match what this script expects.")
 
 
 if __name__ == "__main__":

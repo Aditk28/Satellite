@@ -1,108 +1,161 @@
 /*
-  PURPOSE: Fully automated system-ID sweep for the reaction-wheel subsystem.
+  PURPOSE: Automated system-ID sweep for the reaction-wheel subsystem.
   NOT the run-time control sketch (that's full.cpp) -- flash this instead of
   it, run once per reset, re-run any time the control algorithm needs fresh
   data to retune against.
 
-  REVISION NOTES (what changed from the fixed-window version, and why):
+  ============================================================================
+  REVISION NOTES -- what changed since the 2026-07-29 run, and why
+  ============================================================================
 
-    1. CAPTURE UNTIL THE PLATFORM SETTLES, not a fixed sample count.
-       Each test now runs in two phases: hold at `fromVoltage` for
-       `holdBeforeStepMs`, then step to `toVoltage` -- and capture continues
-       through BOTH phases and the decay afterward, stopping only once the
-       platform's own gyro rate has been below GYRO_SETTLE_DPS for
-       SETTLE_DEBOUNCE_N consecutive logged samples in a row (debounced so a
-       single noisy near-zero reading mid-motion doesn't end the capture
-       early). This is deliberately checking the PLATFORM's rate, not the
-       wheel's -- the wheel can sit at a nonzero steady-state velocity
-       indefinitely once torque disappears (holding a constant voltage
-       produces no more torque once the wheel stops accelerating), while the
-       platform is what actually decays back to zero under real friction.
-       Conflating the two would either cut capture short (waiting on a wheel
-       velocity that may never hit zero) or never stop. Two independent
-       backstops still apply so a test can't run away: MAX_LOG_SAMPLES (hard
-       buffer ceiling) and MAX_CAPTURE_MS (wall-clock cap on phase B).
-       This is also what "keeps more friction information" -- the decay
-       tail, which the old fixed 800/2000-sample window often cut off, is
-       now captured in full.
+  That run was usable (clean ~320 Hz logging, all tests ended on
+  platform_settled, wheel response linear at 7.71 rad/s per volt), but
+  analysis of it exposed one structural limit and several fixable gaps.
+  All are addressed below.
 
-    2. LOGGING IS NOW DECIMATED UNIFORMLY (LOG_DECIM), not "wheel fields at
-       full rate, gyro decimated separately." The FOC loop itself
-       (motor.loopFOC()/motor.move()) still runs every single iteration,
-       full rate, undecimated -- only what gets STORED is decimated. This
-       had to change because captures can now run for several seconds
-       (through a full settle), and storing every field at full loop rate
-       for that long would overflow the F446RE's 128KB SRAM. The trade-off:
-       wheel-velocity samples are no longer at full loop rate. This costs
-       essentially nothing here -- the motor's electrical time constant
-       isn't observable through velocity alone anyway (no current sensing
-       on this board), and the MECHANICAL time constants that are
-       observable through wheel_velocity are almost certainly much slower
-       than a few-hundred-Hz logging rate. Watch the realized log rate
-       printed after each test and adjust LOG_DECIM/MAX_LOG_SAMPLES if it
-       looks wrong for what you're trying to resolve.
+  1. INA219 IS NOW LOGGED (bus voltage + current). THIS IS THE BIG ONE.
+     Velocity-only data cannot separate R, Kt, Kv and friction b -- at
+     steady state Uq = omega*(R*b/Kt + Kv), so the measured 7.71 rad/s per
+     volt slope is ONE number produced by FOUR unknowns. No amount of extra
+     voltage-step data fixes that; the information simply isn't in the
+     velocity signal.
 
-    3. RELEASE AND REVERSAL TESTS are now first-class entries in
-       TEST_SEQUENCE, not just an incidental thing that happens after a
-       step test. Each entry is (fromVoltage, toVoltage, holdBeforeStepMs) --
-       fromVoltage=0 gives a plain step-and-release test (with a small free
-       baseline/pre-roll window at the start, useful as a zero-reference);
-       fromVoltage!=0 spins the wheel up first, THEN steps to a DIFFERENT
-       target (often 0 or negative) while already spinning, which is
-       exactly what an angle-hold controller does routinely when
-       correcting overshoot. Only characterizing 0->+V steps would leave
-       zero data on crossing back through zero, which is exactly where
-       gate-driver/motor nonlinearities (dead-time, minimum pulse width,
-       cogging) tend to live.
+     The INA219 sits on the DC bus, not the phase wires, so it does NOT
+     measure Iq directly. It helps via power balance instead: in voltage
+     mode SimpleFOC drives Ud ~= 0, so essentially all electrical power is
+     Uq*Iq, which must come from the bus:
+           V_bus * I_bus  ~=  Uq * Iq     ->     Iq ~= V_bus*I_bus / Uq
+     Uq is known (it's the commanded target) and V_bus/I_bus are now
+     logged, so Iq is recoverable in post-processing. With Iq in hand,
+     Uq = R*Iq + Kv*omega becomes one equation in two unknowns per test,
+     and several voltage levels solve R and Kv separately by regression.
+     Caveats worth remembering when fitting: this assumes Ud~=0 and
+     neglects switching/conduction losses (a few percent), and it blows up
+     near Uq=0 (division by ~zero) -- fine here since targetV is held at a
+     constant nonzero value through phase B, but do not trust it at a
+     reversal's zero crossing.
 
-    4. NOT IN THIS REVISION, ON PURPOSE: desaturation ramp-rate testing
-       (slowly ramping voltage down at various SLOPES to find how slow a
-       ramp friction can absorb "for free"). That's a genuinely different
-       experiment from step-response system ID and is deferred until it's
-       actually needed.
+  2. WHEEL ANGLE IS NOW LOGGED DIRECTLY (sensor.getAngle()). Previously
+     wheel angle was integrated from velocity in post-processing, which
+     accumulates error. The encoder already provides absolute angle and is
+     already read every FOC iteration, so this costs nothing. It also gives
+     a better basis for computing wheel ACCELERATION, which is what sets
+     the reaction torque on the platform (tau = -J_w * domega/dt).
+
+  3. PHASE A NOW ENDS ON A SETTLE CONDITION, NOT A FIXED HOLD TIME.
+     In the previous run, test 9's phase-A tail averaged +0.785 dps -- the
+     platform was still ringing when the step fired, so that test's phase B
+     started from a contaminated initial condition (tests 6 and 7 showed
+     elevated noise too, std ~0.4 vs ~0.03 for the at-rest tests). Phase A
+     now requires ALL THREE of: minimum hold elapsed, wheel velocity steady
+     (its change between logged samples below a threshold, debounced), and
+     platform gyro rate settled (debounced) -- with a timeout backstop so a
+     never-settling rig can't hang the sweep.
+
+  4. REPEATS. Each condition now runs N_REPEATS times, so the fit can carry
+     a variance/repeatability figure instead of a single unqualified number.
+     IMPORTANT ORDERING DETAIL: repeats are the OUTER loop, not the inner
+     one -- the whole ordered condition list runs start to finish, then
+     repeats. Running rep 1,2,3 of a condition back-to-back would confound
+     any thermal/mechanical drift with that specific condition; spreading
+     reps across the sweep averages drift over all conditions instead.
+
+  5. SIGN-INTERLEAVED ORDERING. In the previous run the platform accumulated
+     -365 degrees (a full turn) by test 4 before later tests unwound it back
+     to -7.67 degrees net. Any tether attached to the platform therefore had
+     DIFFERENT drag in early vs late tests, quietly confounding the
+     comparison. Conditions are now ordered so consecutive tests alternate
+     direction, which cancels rotation continuously rather than at the end.
+     Net rotation per test and a running sweep total are printed for
+     confirmation -- informational only, no threshold and no mid-sweep pause.
+
+  6. MIRRORED NEGATIVE-DIRECTION TESTS. Previously there were four positive
+     steps and only one negative, which showed ~5% asymmetry (-7.39 vs
+     +7.76 rad/s at 1 V) that n=1 can't confirm. Every condition now has a
+     sign-mirrored counterpart, which both tests that asymmetry properly
+     and provides the alternating order item 5 needs.
+
+  7. STICTION STAIRCASE MODE (new, SWEEP_MODE = MODE_STAIRCASE).
+     The sub-1V tests were previously removed from the step sweep because
+     they "stop almost instantly" -- correct call, since they're poor
+     step-response data. But that instant stop IS the stiction signature,
+     and an angle-hold controller needs to know the command below which the
+     platform does not move at all, or it will wind up and limit-cycle
+     against a deadband it doesn't know exists. That's a different
+     experiment, so it's a different mode: a slow voltage staircase (small
+     increments, dwell at each) up past breakaway and back down to find
+     re-stick, logged continuously.
+
+  8. SPLIT LOG RATE BY PHASE (LOG_DECIM_A vs LOG_DECIM_B). Phase A is now
+     settle-gated and can run longer, but it's mostly steady-state holding
+     and only needs enough resolution to confirm settling -- so it logs at
+     ~107 Hz while phase B keeps the full ~320 Hz that proved adequate last
+     run (54-63 samples on the rise). This is what pays for the two new
+     columns: despite 28 bytes/sample vs the old 20, total SRAM use goes
+     DOWN because phase A no longer burns samples at full rate.
+
+  NOTE ON A RESIDUAL NONLINEARITY (not "fixed", just known): measured wheel
+  time constant fell monotonically with voltage last run -- 196.7, 190.6,
+  184.2, 177.9 ms at 1.0/1.5/2.5/4.0 V. A truly linear first-order system
+  has constant tau. That ~10% drift is the signature of Coulomb (dry)
+  friction in the wheel bearings, proportionally more significant at low
+  speed. It doesn't invalidate a linear model near an operating point, but
+  one global linear fit will be slightly wrong at the extremes. The new
+  current data (item 1) is what will let you model it properly if you want
+  to.
+
+  ============================================================================
 
   WHAT THE DATA IS FOR:
-    - Wheel-side unknowns (effective back-EMF constant, winding resistance,
-      J_w, damping): fit these from (targetV, wheel_velocity) pairs across
-      the step tests, e.g. via scipy.optimize.curve_fit against
-      Uq = R*i + Kv*omega and the step-response rise time.
-    - Reversal-test data: check for asymmetry/deadband crossing zero,
-      separately from the linear-model fit above.
-    - Platform inertia (J_p): do NOT derive this from momentum conservation
-      in these transients -- friction here is already known to be higher
-      than the ball-transfer-unit spec implied, so any energy lost to
-      friction during the step shows up as error in a momentum-conservation
-      -derived J_p. Measure J_p geometrically instead (mass + radius,
-      I ~= 1/2*m*r^2, or a physical pendulum test).
+    - Wheel-side parameters: with current now logged, R and Kv separate by
+      regression across voltage levels (see item 1), and J_w/damping fit
+      from the transient with Kt*Iq(t) as a MEASURED forcing term rather
+      than an assumed step shape. The motor's electrical time constant
+      (L/R, typically microseconds to a few ms) is far faster than the
+      ~180-200 ms mechanical tau, so Iq(t) tracks (Uq - Kv*omega(t))/R
+      essentially instantly -- the electrical dynamics can be treated as
+      quasi-static in the fit.
+    - Reversal tests: check for asymmetry/deadband crossing zero, now with
+      mirrored conditions so the check is symmetric.
+    - Staircase mode: breakaway (static friction) threshold for the
+      platform -- the controller deadband.
+    - Platform inertia (J_p): still do NOT derive this from momentum
+      conservation in these transients -- friction is higher than the
+      ball-transfer-unit spec implied, so friction losses show up as error
+      in a momentum-derived J_p. Measure it geometrically instead
+      (mass + radius, I ~= 1/2*m*r^2, or a physical pendulum test).
 
   SAFETY / ABORT: type ANYTHING into either serial link (USB or HC-05) at
   any point and the sweep aborts immediately -- motor forced to 0V, sweep
   halted, requires a physical reset to run again.
 
+  PROMPTS AND ABORT DON'T MIX WELL -- READ THIS BEFORE ADDING ONE: because
+  any stray byte means abort, a mid-sweep prompt that waits for input must
+  drain the link completely before returning, or the trailing Enter from the
+  keypress that answered the prompt lands in the buffer a few ms later and
+  aborts the sweep it just resumed. A previous revision hit exactly this.
+  ALWAYS use waitForKeypress() for prompts -- it waits, then drains until
+  the link has been quiet for START_FLUSH_MS. Never hand-roll a
+  wait-then-drain-once.
+
   START GATE: WAIT_FOR_START_SIGNAL (on by default) makes the sweep pause
-  after hardware bring-up and wait for any byte on either serial link (USB
-  or HC-05) before starting -- gives you time to open a monitor / connect
-  over Bluetooth and actually be watching before the wheel does anything.
-  That waiting-to-start byte is consumed as a "go" signal, NOT an abort --
-  once the sweep is actually running, incoming bytes go back to meaning
-  abort (see SAFETY / ABORT above). Set the toggle to false to skip this
-  and start immediately, e.g. for unattended reruns.
+  after hardware bring-up and wait for any byte on either serial link
+  before starting. That byte is consumed as "go", NOT an abort -- once the
+  sweep is running, incoming bytes go back to meaning abort.
 
-  HOW TO FLASH THIS: same convention already used elsewhere in this repo --
-  move full.cpp out of src/ into unflashed_files/, drop this file into src/
-  in its place, flash. MagneticSensorMT6701SSI.h/.cpp stay in src/ either
-  way -- both sketches need them.
+  HOW TO FLASH THIS: move full.cpp out of src/ into unflashed_files/, drop
+  this file into src/ in its place, flash. MagneticSensorMT6701SSI.h/.cpp
+  stay in src/ either way -- both sketches need them.
 
-  SRAM NOTE: MAX_LOG_SAMPLES * 20 bytes/sample must comfortably fit in the
-  F446RE's 128KB SRAM alongside everything else (SimpleFOC, Adafruit libs,
-  stack). Defaults below (4000 samples, ~80KB) leave real margin -- if you
-  raise MAX_LOG_SAMPLES further and the build warns/fails on RAM, targetV
-  is the first field worth dropping (it's piecewise-constant and
-  reconstructible from the phase-transition timestamp; kept here for
-  convenience only).
+  SRAM NOTE: MAX_LOG_SAMPLES * 28 bytes/sample must fit in the F446RE's
+  128KB SRAM alongside SimpleFOC, the Adafruit libs, and stack. The default
+  2400 samples is ~66KB (~51%), leaving real margin. If you raise it and
+  the build warns on RAM, busV is the first field worth dropping -- on a
+  bench supply it barely moves, and Iq recovery is far more sensitive to
+  current than to bus voltage.
 
   BOARD: STM32 Nucleo-F446RE. Pin mapping identical to full.cpp -- see that
-  file's header for the full wiring writeup if needed.
+  file's header for the full wiring writeup.
 */
 
 #include <SimpleFOC.h>
@@ -137,128 +190,134 @@ MagneticSensorMT6701SSI sensor(PIN_ENCODER_CS);
 Adafruit_MPU6050 mpu;
 Adafruit_INA219 ina219;
 
+// ======================= SWEEP MODE =======================
+// MODE_STEP      -- voltage-step / reversal system ID (the main sweep)
+// MODE_STAIRCASE -- slow voltage staircase to find the platform's
+//                   breakaway (static friction) threshold
+// These answer different questions and produce differently-shaped data, so
+// they're separate modes rather than mixed into one sequence. Change this
+// define and reflash to switch.
+#define MODE_STEP       0
+#define MODE_STAIRCASE  1
+#define SWEEP_MODE      MODE_STEP
+// ==========================================================
+
 // ======================= TUNABLE TEST PARAMETERS =======================
 
-// Each entry: hold at fromVoltage for holdBeforeStepMs, then step to
-// toVoltage, and capture continues (through both phases) until the
-// platform settles. fromVoltage=0 => plain step-and-release test.
-// fromVoltage!=0 => spin-up-then-transition: release-from-speed if
-// toVoltage=0, true reversal if toVoltage is opposite sign.
 struct TestStep {
   float fromVoltage;
   float toVoltage;
-  unsigned long holdBeforeStepMs;
+  unsigned long minHoldMs;   // floor on phase A; it then waits for settle
   const char* label;
 };
 
+// Ordered so consecutive entries alternate direction -- this is what keeps
+// accumulated platform rotation (and therefore cable twist) near zero
+// throughout the sweep instead of only at the end. Keep that alternation if
+// you edit this list.
 const TestStep TEST_SEQUENCE[] = {
-  // --- Plain step-and-release: spin-up + natural decay, 1V-4V (current cap) ---
-  {0.0f,  1.0f, 1500, "step 0 -> 1.0V, then release to 0"},
-  {0.0f,  1.5f, 1500, "step 0 -> 1.5V, then release to 0"},
-  {0.0f,  2.5f, 1500, "step 0 -> 2.5V, then release to 0"},
-  {0.0f,  4.0f, 1500, "step 0 -> 4.0V, then release to 0"},
-  {0.0f, -1.0f, 1500, "step 0 -> -1.0V (negative direction), then release to 0"},
+  // --- From-rest steps, sign-mirrored pairs ---
+  // {0.0f,  1.0f, 1200, "step 0 -> +1.0V"},
+  // {0.0f, -1.0f, 1200, "step 0 -> -1.0V"},
+  // {0.0f,  1.5f, 1200, "step 0 -> +1.5V"},
+  // {0.0f, -1.5f, 1200, "step 0 -> -1.5V"},
+  // {0.0f,  2.5f, 1200, "step 0 -> +2.5V"},
+  // {0.0f, -2.5f, 1200, "step 0 -> -2.5V"},
+  // {0.0f,  4.0f, 1200, "step 0 -> +4.0V"},
+  // {0.0f, -4.0f, 1200, "step 0 -> -4.0V"},
 
-  // --- Release/reversal from an already-spinning state -- these take
-  // longer to complete than a from-rest step of the same magnitude (a
-  // reversal has to traverse roughly DOUBLE the velocity range: from
-  // +ss all the way down through zero to -ss), which is why
-  // holdBeforeStepMs and the MAX_CAPTURE_MS ceiling below both got more
-  // headroom in this revision -- see the header note on negative voltage. ---
-  {1.0f,  0.0f, 2000, "spin to 1.0V, then release to 0 (release-from-speed)"},
-  {1.0f, -1.0f, 2000, "spin to 1.0V, then reverse to -1.0V"},
-  {1.5f, -0.8f, 2000, "spin to 1.5V, then reverse to -0.8V"},
-  {3.0f, -2.0f, 3000, "spin to 3.0V, then reverse to -2.0V"},
+  // // --- Release from speed, sign-mirrored ---
+  // { 1.0f, 0.0f, 1500, "spin +1.0V -> release to 0"},
+  // {-1.0f, 0.0f, 1500, "spin -1.0V -> release to 0"},
+
+  // // --- Reversals through zero, sign-mirrored ---
+  // { 1.0f, -1.0f, 1500, "spin +1.0V -> reverse to -1.0V"},
+  // {-1.0f,  1.0f, 1500, "spin -1.0V -> reverse to +1.0V"},
+  // { 1.5f, -0.8f, 1500, "spin +1.5V -> reverse to -0.8V"},
+  // {-1.5f,  0.8f, 1500, "spin -1.5V -> reverse to +0.8V"},
+  { 3.0f, -2.0f, 2000, "spin +3.0V -> reverse to -2.0V"},
+  {-3.0f,  2.0f, 2000, "spin -3.0V -> reverse to +2.0V"},
 };
-const int NUM_TESTS = sizeof(TEST_SEQUENCE) / sizeof(TEST_SEQUENCE[0]);
+const int NUM_CONDITIONS = sizeof(TEST_SEQUENCE) / sizeof(TEST_SEQUENCE[0]);
 
-// Logging: a sample is stored every LOG_DECIM FOC-loop iterations. The FOC
-// loop itself is never decimated -- only storage is. See revision note 2.
-#define LOG_DECIM            20
+// Repeats run as the OUTER loop (whole list, then repeat) so drift is
+// spread across conditions rather than confounded with any single one.
+#define N_REPEATS               3
 
-// Hard ceiling on stored samples per test (SRAM budget -- see header).
-// Raised from 2500 -> 4000 this revision: higher-voltage steps reach
-// higher steady-state speeds (longer friction decay) and reversals now
-// traverse roughly double the velocity range of a from-rest step, both of
-// which need more samples to capture in full without hitting this ceiling
-// early. At 20 bytes/sample this is ~80KB -- still comfortable margin
-// inside the F446RE's 128KB SRAM.
-#define MAX_LOG_SAMPLES     4000
+// --- Logging rates. The FOC loop itself is NEVER decimated -- only what
+// gets stored is. Phase A logs slower because it's mostly steady-state
+// holding and only needs enough resolution to confirm settling; phase B
+// keeps the rate that proved adequate last run. ---
+#define LOG_DECIM_A            60      // ~107 Hz  (phase A / hold)
+#define LOG_DECIM_B            20      // ~320 Hz  (phase B / transient)
 
-// Wall-clock cap on phase B (post-transition) duration, regardless of
-// whether settle was detected -- a backstop, not the normal stop condition.
-// Raised from 8000 -> 12000ms this revision for the same reason as
-// MAX_LOG_SAMPLES above -- reversals and high-voltage decays legitimately
-// take longer.
-#define MAX_CAPTURE_MS     12000
+#define MAX_LOG_SAMPLES      2400      // ~66KB at 28 bytes/sample
 
-// Minimum time into phase B before settle-detection is even EVALUATED.
-// Without this, small steps (1V, 1.5V...) can satisfy the debounce almost
-// instantly -- the platform barely moved to begin with, or friction
-// arrests it very fast, so the gyro rate is already under GYRO_SETTLE_DPS
-// within the first handful of logged samples and the capture ends before
-// there's much of a decay curve to look at. This forces every test to run
-// for at least this long before settle is allowed to end it, regardless of
-// how quickly the platform actually goes quiet.
-#define MIN_CAPTURE_MS        500
+// --- Phase A exit conditions: ALL must hold (plus minHoldMs elapsed) ---
+#define WHEEL_STEADY_DELTA     0.15f   // rad/s change between logged samples
+#define WHEEL_STEADY_N            8    // consecutive samples below that
+#define PHASE_A_TIMEOUT_MS     9000    // backstop if it never settles
 
-// Platform considered "settled" below this gyro rate, in dps.
-#define GYRO_SETTLE_DPS      3.0f
+// --- Phase B stop conditions ---
+#define MIN_CAPTURE_MS          500    // settle not even evaluated before this
+#define MAX_CAPTURE_MS        12000    // wall-clock backstop
+#define GYRO_SETTLE_DPS         3.0f   // platform "settled" below this
+#define SETTLE_DEBOUNCE_N          5   // consecutive samples required
 
-// Consecutive logged samples below GYRO_SETTLE_DPS required before
-// declaring settle (debounced against transient near-zero noise).
-#define SETTLE_DEBOUNCE_N       5
+// --- Between-test cleanup (wheel AND platform must both come to rest) ---
+#define SETTLE_VEL_THRESH       1.0f   // rad/s
+#define SETTLE_TIMEOUT_MS      15000
 
-// --- Between-test cleanup: make sure BOTH the wheel AND the platform are
-// back near rest before starting the next queued test. The wheel returning
-// to ~0 rad/s does NOT mean the platform has stopped -- the release-to-0V
-// at the end of the previous test (or a test that hit MAX_LOG_SAMPLES/
-// MAX_CAPTURE_MS before truly settling) can leave the platform still
-// coasting on its own residual momentum after the wheel itself is already
-// still. Reuses GYRO_SETTLE_DPS/SETTLE_DEBOUNCE_N below -- same underlying
-// condition as the in-test platform-settle detection, just used here as a
-// gate before the next test instead of as a capture stop condition. ---
-#define SETTLE_VEL_THRESH    1.0f   // rad/s -- wheel settle threshold
-#define SETTLE_TIMEOUT_MS   15000
+#define PRE_TEST_DELAY_MS       1500
 
-#define PRE_TEST_DELAY_MS    2000
+// --- Cable twist guard. Sign-alternating order should keep this near zero;
+// this catches the case where it doesn't (e.g. a condition list edited out
+// of alternation, or badly asymmetric response). ---
 
-// --- Start gate: wait for any byte on either serial link before the sweep
-// starts, so you have a chance to open a monitor / connect over Bluetooth
-// and be watching before the wheel does anything. Set to false to start
-// immediately after hardware bring-up (e.g. unattended reruns). Note: this
-// only applies BEFORE the sweep starts -- once a test is running, any
-// serial byte means ABORT instead (see checkAbort()), not "start again." ---
-#define WAIT_FOR_START_SIGNAL  true
+// --- Start gate ---
+#define WAIT_FOR_START_SIGNAL   true
+#define START_FLUSH_MS           400   // quiet window before any prompt
+                                        // returns -- see waitForKeypress()
 
-// After the first "go" byte arrives, keep draining the buffer for this long
-// before actually starting. A terminal like PuTTY sends a typed character
-// and its trailing Enter (\r and/or \n) as SEPARATE bytes a few ms apart --
-// draining only once, immediately, can miss the trailing byte(s), which
-// then land in the buffer just as the sweep starts and get read by
-// checkAbort() as an (unintended) abort. This window resets every time a
-// new byte shows up, so it only returns once the link has been quiet.
-#define START_FLUSH_MS        400
+// --- Staircase mode parameters (only used when SWEEP_MODE==MODE_STAIRCASE) ---
+#define STAIR_STEP_V           0.05f   // increment per tread
+#define STAIR_MAX_V            1.20f   // climb to here, then back down
+#define STAIR_DWELL_MS           800   // hold at each tread
+#define STAIR_LOG_DECIM           60   // ~107 Hz throughout
 // =========================================================================
 
 unsigned long log_time_us[MAX_LOG_SAMPLES];
-float         log_targetV[MAX_LOG_SAMPLES];
-float         log_vel_raw[MAX_LOG_SAMPLES];
-float         log_vel_filt[MAX_LOG_SAMPLES];
-float         log_gyroZ_dps[MAX_LOG_SAMPLES];
+float log_targetV[MAX_LOG_SAMPLES];
+float log_wheel_vel[MAX_LOG_SAMPLES];
+float log_wheel_angle[MAX_LOG_SAMPLES];
+float log_gyroZ_dps[MAX_LOG_SAMPLES];
+float log_current_mA[MAX_LOG_SAMPLES];
+float log_busV[MAX_LOG_SAMPLES];
 int samplesLogged = 0;
+int phaseBStartSample = 0;   // index of the first phase-B sample in the log
 
 volatile bool aborted = false;
+float sweepNetRotationDeg = 0.0f;   // running cable-twist estimate
+bool mpuOK = false, inaOK = false;
+
+// Measured once at startup with the platform at rest. Used ONLY for the
+// cable-twist accumulator below -- the logged gyroZ_dps column stays raw,
+// so post-processing can measure and remove bias itself (and cross-check
+// against this value, which is reported in the sweep header).
+// This matters: the bias is small (~0.4 dps) but it integrates. Left in,
+// it would add roughly two degrees of phantom rotation per five-second
+// capture, which across a full sweep is enough to trip the twist warning
+// on a rig whose cable is actually fine.
+float gyroBiasDps = 0.0f;
 
 void printBoth(const String &s) {
   Serial.println(s);
   hc05Serial.println(s);
 }
 
-// Safety check -- call every loop iteration, including inside the tight
-// capture loop. Serial.available()/hc05Serial.available() are cheap,
-// non-blocking flag reads. Typing ANYTHING into either link is the kill
-// switch, content doesn't matter.
+// Safety check -- call every loop iteration, including inside tight capture
+// loops. Serial.available() is a cheap non-blocking flag read. Typing
+// ANYTHING into either link is the kill switch; content doesn't matter.
 bool checkAbort() {
   if (aborted) return true;
   if (Serial.available() || hc05Serial.available()) {
@@ -273,64 +332,334 @@ bool checkAbort() {
   return aborted;
 }
 
-void dumpBurstTo(Print &out, int testIndex, const TestStep &t, const String &stopReason) {
-  out.print("--- capture start (test ");
-  out.print(testIndex + 1);
-  out.print("/");
-  out.print(NUM_TESTS);
-  out.print(": ");
-  out.print(t.label);
-  out.println(") ---");
-  out.print("from=");   out.print(t.fromVoltage, 2);
-  out.print("V to=");   out.print(t.toVoltage, 2);
-  out.print("V hold=");  out.print(t.holdBeforeStepMs);
-  out.print("ms stop_reason=");  out.println(stopReason);
-  out.println("t_us,targetV,vel_raw,vel_filtered,gyroZ_dps");
+// One decimated sensor read + log-row write. Returns the gyro rate so
+// callers can use it for settle detection without re-reading I2C.
+// Both the MPU6050 and the INA219 are read here, in the same decimated
+// slot -- these are the slow I2C transactions, which is exactly why they're
+// decimated rather than run every FOC iteration.
+float logSample() {
+  float gyroZ_dps = 0.0f;
+  float current_mA = 0.0f, busV = 0.0f;
+
+  if (mpuOK) {
+    sensors_event_t a, g, temp;
+    mpu.getEvent(&a, &g, &temp);
+    gyroZ_dps = g.gyro.z * 180.0f / PI;
+  }
+  if (inaOK) {
+    busV = ina219.getBusVoltage_V();
+    current_mA = ina219.getCurrent_mA();
+  }
+
+  if (samplesLogged < MAX_LOG_SAMPLES) {
+    int i = samplesLogged;
+    log_time_us[i]     = micros();
+    log_targetV[i]     = motor.target;
+    log_wheel_vel[i]   = motor.shaft_velocity;
+    log_wheel_angle[i] = sensor.getAngle();
+    log_gyroZ_dps[i]   = gyroZ_dps;
+    log_current_mA[i]  = current_mA;
+    log_busV[i]        = busV;
+    samplesLogged++;
+  }
+  return gyroZ_dps;
+}
+
+void dumpTo(Print &out, const String &header, const String &meta) {
+  out.println(header);
+  out.println(meta);
+  out.println("t_us,targetV,wheel_vel,wheel_angle_rad,gyroZ_dps,current_mA,busV");
   for (int i = 0; i < samplesLogged; i++) {
-    out.print(log_time_us[i]);    out.print(",");
-    out.print(log_targetV[i], 2); out.print(",");
-    out.print(log_vel_raw[i], 3); out.print(",");
-    out.print(log_vel_filt[i], 3);out.print(",");
-    out.println(log_gyroZ_dps[i], 3);
+    out.print(log_time_us[i]);          out.print(",");
+    out.print(log_targetV[i], 3);       out.print(",");
+    out.print(log_wheel_vel[i], 3);     out.print(",");
+    out.print(log_wheel_angle[i], 4);   out.print(",");
+    out.print(log_gyroZ_dps[i], 3);     out.print(",");
+    out.print(log_current_mA[i], 2);    out.print(",");
+    out.println(log_busV[i], 3);
   }
   out.println("--- capture end ---");
 }
 
-void dumpBurst(int testIndex, const TestStep &t, const String &stopReason) {
-  dumpBurstTo(Serial, testIndex, t, stopReason);
-  dumpBurstTo(hc05Serial, testIndex, t, stopReason);
+void dumpBoth(const String &header, const String &meta) {
+  dumpTo(Serial, header, meta);
+  dumpTo(hc05Serial, header, meta);
 }
 
-// Waits for any byte on either serial link before letting the sweep start,
-// if WAIT_FOR_START_SIGNAL is on. Unlike checkAbort(), this treats the
-// incoming byte as a "go" signal, not an abort -- this function only runs
-// BEFORE the sweep begins, so there's nothing to abort yet. Keeps the FOC
-// loop serviced (target held at 0) the whole time it's waiting, same as
-// everywhere else motor/driver are live.
-void waitForStartSignal() {
-  if (!WAIT_FOR_START_SIGNAL) return;
+// Measure the gyro's at-rest bias. Call once at startup with the platform
+// genuinely stationary and the motor idle. Takes about a second.
+void measureGyroBias() {
+  if (!mpuOK) return;
+  const int N = 200;
+  float sum = 0.0f;
+  for (int i = 0; i < N; i++) {
+    sensors_event_t a, g, temp;
+    mpu.getEvent(&a, &g, &temp);
+    sum += g.gyro.z * 180.0f / PI;
+    motor.loopFOC();
+    motor.move();
+    delay(5);
+  }
+  gyroBiasDps = sum / N;
+  printBoth("[GYRO] at-rest bias measured: " + String(gyroBiasDps, 4)
+            + " dps (removed from the twist accumulator; logged data stays raw)");
+}
 
-  // Clear out any stray bytes already buffered (e.g. a terminal sending a
-  // newline on connect) so they don't get mistaken for the real "go".
-  while (Serial.available())      Serial.read();
-  while (hc05Serial.available())  hc05Serial.read();
+// Report the net platform rotation of the capture just finished, and keep a
+// running total for the sweep. Informational only -- no threshold, no
+// warning, no pause. Sign-alternating condition order (see the test list) is
+// what actually keeps accumulated rotation near zero; this just reports it
+// so you can confirm that's working.
+void reportNetRotation() {
+  float deg = 0.0f;
+  for (int i = 1; i < samplesLogged; i++) {
+    float dt = (log_time_us[i] - log_time_us[i-1]) / 1e6f;
+    float g0 = log_gyroZ_dps[i-1] - gyroBiasDps;
+    float g1 = log_gyroZ_dps[i]   - gyroBiasDps;
+    deg += (g1 + g0) * 0.5f * dt;
+  }
+  sweepNetRotationDeg += deg;
+  printBoth("  net rotation this test: " + String(deg, 1)
+            + " deg | sweep total: " + String(sweepNetRotationDeg, 1) + " deg");
+}
 
-  Serial.println("Hardware bring-up done. Send any character on Serial or HC-05 to start the sweep...");
-  hc05Serial.println("Hardware bring-up done. Send any character to start the sweep...");
+// Between-test cleanup: wheel velocity AND platform gyro rate must both be
+// at rest before the next test starts. The wheel reaching ~0 does NOT mean
+// the platform has stopped -- it can still be coasting on residual
+// momentum. Not logged; this is administrative, not an experiment.
+bool waitForRest() {
+  unsigned long start = millis();
+  unsigned long iterCount = 0;
+  bool wheelRest = false;
+  int platformCount = 0;
+
+  while (millis() - start < SETTLE_TIMEOUT_MS) {
+    motor.loopFOC();
+    motor.move();
+    if (checkAbort()) return false;
+
+    if (fabs(motor.shaft_velocity) < SETTLE_VEL_THRESH) wheelRest = true;
+
+    iterCount++;
+    if (iterCount % LOG_DECIM_A == 0 && mpuOK) {
+      sensors_event_t a, g, temp;
+      mpu.getEvent(&a, &g, &temp);
+      float gyroZ = g.gyro.z * 180.0f / PI;
+      if (fabs(gyroZ) < GYRO_SETTLE_DPS) platformCount++;
+      else platformCount = 0;
+    }
+
+    if (wheelRest && platformCount >= SETTLE_DEBOUNCE_N) {
+      printBoth("  wheel + platform at rest after " + String(millis() - start) + " ms.");
+      return true;
+    }
+  }
+  printBoth("  !!! Rest timeout -- wheel " + String(wheelRest ? "ok" : "still moving")
+            + ", platform " + String(platformCount >= SETTLE_DEBOUNCE_N ? "ok" : "still moving")
+            + " -- proceeding anyway. !!!");
+  return true;
+}
+
+// ===================== STEP / REVERSAL TEST =====================
+// Phase A: hold at fromVoltage until minHoldMs elapsed AND the wheel is
+// steady AND the platform has settled (all three), then step.
+// Phase B: capture through the transient until the platform settles again.
+bool runStepTest(int condIdx, int rep, int testNum, int testTotal) {
+  const TestStep &t = TEST_SEQUENCE[condIdx];
+
+  printBoth("");
+  printBoth("=== Test " + String(testNum) + "/" + String(testTotal)
+            + " (rep " + String(rep) + "/" + String(N_REPEATS) + "): " + String(t.label) + " ===");
+  printBoth("  hold " + String(t.fromVoltage, 2) + "V (min " + String(t.minHoldMs)
+            + " ms, then until steady), step to " + String(t.toVoltage, 2) + "V");
+  delay(PRE_TEST_DELAY_MS);
+  if (checkAbort()) return false;
+
+  samplesLogged = 0;
+  phaseBStartSample = 0;
+  unsigned long iterCount = 0;
+
+  // ---------------- PHASE A ----------------
+  motor.target = t.fromVoltage;
+  unsigned long phaseAStart = millis();
+  float lastWheelVel = motor.shaft_velocity;
+  int wheelSteadyCount = 0, platformSettleCount = 0;
+  bool phaseAClean = false;
+
+  while (true) {
+    motor.loopFOC();
+    motor.move();
+    if (checkAbort()) return false;
+
+    iterCount++;
+    if (iterCount % LOG_DECIM_A == 0) {
+      if (samplesLogged >= MAX_LOG_SAMPLES) break;
+      float gyroZ = logSample();
+
+      float v = motor.shaft_velocity;
+      if (fabs(v - lastWheelVel) < WHEEL_STEADY_DELTA) wheelSteadyCount++;
+      else wheelSteadyCount = 0;
+      lastWheelVel = v;
+
+      if (fabs(gyroZ) < GYRO_SETTLE_DPS) platformSettleCount++;
+      else platformSettleCount = 0;
+
+      bool minElapsed = (millis() - phaseAStart >= t.minHoldMs);
+      if (minElapsed && wheelSteadyCount >= WHEEL_STEADY_N
+                     && platformSettleCount >= SETTLE_DEBOUNCE_N) {
+        phaseAClean = true;
+        break;
+      }
+    }
+
+    if (millis() - phaseAStart >= PHASE_A_TIMEOUT_MS) break;
+  }
+
+  if (!phaseAClean) {
+    printBoth("  !!! Phase A did not fully settle before timeout -- phase B's initial "
+              "condition is contaminated for this test. !!!");
+  }
+  phaseBStartSample = samplesLogged;
+
+  // ---------------- PHASE B ----------------
+  motor.target = t.toVoltage;
+  unsigned long phaseBStart = millis();
+  int settleCount = 0;
+  bool stoppedBySettle = false, stoppedByCeiling = false, stoppedByTimeout = false;
+  printBoth("  -> stepped to " + String(t.toVoltage, 2) + "V, capturing transient...");
+
+  while (true) {
+    motor.loopFOC();
+    motor.move();
+    if (checkAbort()) return false;
+
+    iterCount++;
+    if (iterCount % LOG_DECIM_B == 0) {
+      if (samplesLogged >= MAX_LOG_SAMPLES) { stoppedByCeiling = true; break; }
+      float gyroZ = logSample();
+
+      if (millis() - phaseBStart >= MIN_CAPTURE_MS) {
+        if (fabs(gyroZ) < GYRO_SETTLE_DPS) {
+          settleCount++;
+          if (settleCount >= SETTLE_DEBOUNCE_N) { stoppedBySettle = true; break; }
+        } else settleCount = 0;
+      }
+      if (millis() - phaseBStart >= MAX_CAPTURE_MS) { stoppedByTimeout = true; break; }
+    }
+  }
+
+  String stopReason = stoppedBySettle ? "platform_settled"
+                     : stoppedByCeiling ? "sample_buffer_full" : "capture_timeout";
+
+  float durMs = samplesLogged >= 2
+              ? (log_time_us[samplesLogged-1] - log_time_us[0]) / 1000.0f : 0.0f;
+  printBoth("  stopped: " + stopReason + " -- " + String(samplesLogged)
+            + " samples (A=" + String(phaseBStartSample)
+            + " B=" + String(samplesLogged - phaseBStartSample) + ") over "
+            + String(durMs, 0) + " ms");
+  if (stoppedByCeiling)
+    printBoth("  !!! Hit MAX_LOG_SAMPLES before settling -- raise it (watch SRAM). !!!");
+  if (stoppedByTimeout)
+    printBoth("  !!! Hit MAX_CAPTURE_MS before settling -- decay may be truncated. !!!");
+
+  String header = "--- capture start (test " + String(testNum) + "/" + String(testTotal)
+                + ": " + String(t.label) + " [rep " + String(rep) + "/" + String(N_REPEATS) + "]) ---";
+  String meta = "from=" + String(t.fromVoltage, 2) + "V to=" + String(t.toVoltage, 2)
+              + "V rep=" + String(rep) + " phaseB_start_sample=" + String(phaseBStartSample)
+              + " phaseA_clean=" + String(phaseAClean ? "yes" : "no")
+              + " gyro_bias_dps=" + String(gyroBiasDps, 4)
+              + " stop_reason=" + stopReason;
+  dumpBoth(header, meta);
+
+  reportNetRotation();
 
   motor.target = 0.0f;
+  printBoth("  target 0V -- waiting for wheel and platform to rest...");
+  return waitForRest();
+}
+
+// ===================== STICTION STAIRCASE =====================
+// Climbs in small voltage treads to find where the platform first breaks
+// free of static friction, then descends to find where it re-sticks (these
+// are not the same voltage -- that gap is the hysteresis you care about).
+// Logged as one continuous capture; find the breakaway in post-processing
+// by looking for where gyro rate first leaves the noise floor.
+bool runStaircase() {
+  printBoth("");
+  printBoth("=== STICTION STAIRCASE ===");
+  printBoth("  " + String(STAIR_STEP_V, 3) + "V treads, " + String(STAIR_DWELL_MS)
+            + " ms dwell, up to " + String(STAIR_MAX_V, 2) + "V and back down");
+  printBoth("  Find breakaway in post: first tread where gyro rate leaves the noise floor.");
+  delay(PRE_TEST_DELAY_MS);
+  if (checkAbort()) return false;
+
+  samplesLogged = 0;
+  phaseBStartSample = 0;
+  unsigned long iterCount = 0;
+
+  int nUp = (int)(STAIR_MAX_V / STAIR_STEP_V + 0.5f);
+  // Climb, then descend back through the same treads.
+  for (int dir = 0; dir < 2; dir++) {
+    for (int k = 0; k <= nUp; k++) {
+      int tread = (dir == 0) ? k : (nUp - k);
+      motor.target = tread * STAIR_STEP_V;
+      unsigned long dwellStart = millis();
+
+      while (millis() - dwellStart < STAIR_DWELL_MS) {
+        motor.loopFOC();
+        motor.move();
+        if (checkAbort()) return false;
+        iterCount++;
+        if (iterCount % STAIR_LOG_DECIM == 0) {
+          if (samplesLogged >= MAX_LOG_SAMPLES) {
+            printBoth("  !!! Sample buffer full mid-staircase -- raise MAX_LOG_SAMPLES, "
+                      "or widen STAIR_STEP_V / shorten STAIR_DWELL_MS. !!!");
+            goto done;
+          }
+          logSample();
+        }
+      }
+    }
+  }
+done:
+  motor.target = 0.0f;
+
+  float durMs = samplesLogged >= 2
+              ? (log_time_us[samplesLogged-1] - log_time_us[0]) / 1000.0f : 0.0f;
+  printBoth("  staircase complete -- " + String(samplesLogged) + " samples over "
+            + String(durMs, 0) + " ms");
+
+  String header = "--- capture start (test 1/1: stiction staircase) ---";
+  String meta = "mode=staircase step_v=" + String(STAIR_STEP_V, 3)
+              + " max_v=" + String(STAIR_MAX_V, 2)
+              + " dwell_ms=" + String(STAIR_DWELL_MS)
+              + " stop_reason=staircase_complete";
+  dumpBoth(header, meta);
+
+  reportNetRotation();
+  return waitForRest();
+}
+
+// ===================== START GATE =====================
+// Wait for any byte on either serial link, then drain the link COMPLETELY
+// before returning. Use this for EVERY mid-sweep prompt -- never hand-roll a
+// wait-then-drain-once, which is the bug this exists to prevent.
+//
+// Why the settle window: a typed character's trailing Enter (\r and/or \n)
+// arrives a few ms AFTER the character itself. Draining once and returning
+// immediately misses it, so it lands in the buffer moments later and
+// checkAbort() reads it as an unintended abort -- the sweep dies right after
+// the prompt that was supposed to resume it. So: keep draining, and reset
+// the quiet window on every new byte, until the link has actually gone
+// silent for START_FLUSH_MS.
+//
+// The FOC loop is kept serviced (whatever target is currently set) the whole
+// time, since the driver stays live throughout.
+void waitForKeypress() {
   while (!Serial.available() && !hc05Serial.available()) {
     motor.loopFOC();
     motor.move();
   }
-
-  // A typed character's trailing Enter (\r and/or \n) can arrive a few ms
-  // AFTER the character itself -- draining once here and returning
-  // immediately can miss it, leaving it to land in the buffer just as the
-  // sweep starts and get picked up by checkAbort() as an unintended abort.
-  // So: keep draining, and keep resetting the settle window every time a
-  // new byte shows up, until the link has actually been quiet for
-  // START_FLUSH_MS.
   unsigned long lastByteMs = millis();
   while (millis() - lastByteMs < START_FLUSH_MS) {
     motor.loopFOC();
@@ -341,157 +670,21 @@ void waitForStartSignal() {
       lastByteMs = millis();
     }
   }
+}
+
+void waitForStartSignal() {
+  if (!WAIT_FOR_START_SIGNAL) return;
+
+  while (Serial.available())      Serial.read();
+  while (hc05Serial.available())  hc05Serial.read();
+
+  Serial.println("Hardware bring-up done. Send any character on Serial or HC-05 to start the sweep...");
+  hc05Serial.println("Hardware bring-up done. Send any character to start the sweep...");
+
+  motor.target = 0.0f;
+  waitForKeypress();
 
   printBoth("Starting sweep now.");
-}
-
-// Between-test cleanup: wait for the WHEEL (velocity) AND the PLATFORM
-// (debounced gyro rate) to both settle before the next queued test starts.
-// Not logged -- this is administrative, not itself an experiment.
-bool waitForSettle() {
-  unsigned long start = millis();
-  unsigned long iterCount = 0;
-  bool wheelSettled = false;
-  int platformSettleCount = 0;
-
-  while (millis() - start < SETTLE_TIMEOUT_MS) {
-    motor.loopFOC();
-    motor.move();
-    if (checkAbort()) return false;
-
-    if (fabs(motor.shaft_velocity) < SETTLE_VEL_THRESH) {
-      wheelSettled = true;
-    }
-
-    // Gyro read decimated the same way as in-test logging -- an I2C
-    // transaction every single iteration would be wasted effort here,
-    // and a few hundred Hz is plenty to debounce a decaying platform rate.
-    iterCount++;
-    if (iterCount % LOG_DECIM == 0) {
-      sensors_event_t a, g, temp;
-      mpu.getEvent(&a, &g, &temp);
-      float gyroZ_dps = g.gyro.z * 180.0f / PI;
-      if (fabs(gyroZ_dps) < GYRO_SETTLE_DPS) {
-        platformSettleCount++;
-      } else {
-        platformSettleCount = 0;
-      }
-    }
-
-    if (wheelSettled && platformSettleCount >= SETTLE_DEBOUNCE_N) {
-      printBoth("Wheel + platform both settled after " + String(millis() - start) + " ms.");
-      return true;
-    }
-  }
-
-  String wheelMsg    = wheelSettled ? String("settled")
-                                     : ("still at " + String(motor.shaft_velocity, 2) + " rad/s");
-  String platformMsg = (platformSettleCount >= SETTLE_DEBOUNCE_N) ? String("settled") : String("still moving");
-  printBoth("!!! Settle timeout -- wheel " + wheelMsg + ", platform " + platformMsg
-            + " -- proceeding anyway. Next test's data may show carryover motion. !!!");
-  return true;
-}
-
-// Runs one test: hold at fromVoltage, step to toVoltage, capture
-// continuously through both phases until the PLATFORM settles (debounced),
-// hits MAX_LOG_SAMPLES, or hits MAX_CAPTURE_MS on phase B -- whichever
-// comes first. Dumps the full capture, then does the between-test wheel
-// cleanup above.
-bool runOneTest(int testIndex) {
-  const TestStep &t = TEST_SEQUENCE[testIndex];
-
-  printBoth("");
-  printBoth("=== Test " + String(testIndex + 1) + "/" + String(NUM_TESTS) + ": " + String(t.label) + " ===");
-  printBoth("  hold " + String(t.fromVoltage, 2) + "V for " + String(t.holdBeforeStepMs)
-            + " ms, then step to " + String(t.toVoltage, 2) + "V, capture until platform settles.");
-  delay(PRE_TEST_DELAY_MS);
-  if (checkAbort()) return false;
-
-  samplesLogged = 0;
-  unsigned long iterCount = 0;
-  int settleCount = 0;
-  bool inPhaseB = false;
-  unsigned long phaseAStartMs = millis();
-  unsigned long phaseBStartMs = 0;
-
-  bool stoppedBySettle = false, stoppedByCeiling = false, stoppedByTimeout = false;
-
-  motor.target = t.fromVoltage;
-
-  while (true) {
-    motor.loopFOC();
-    motor.move();
-    if (checkAbort()) return false;
-
-    if (!inPhaseB && (millis() - phaseAStartMs >= t.holdBeforeStepMs)) {
-      motor.target = t.toVoltage;
-      inPhaseB = true;
-      phaseBStartMs = millis();
-      printBoth("  -> stepping to " + String(t.toVoltage, 2) + "V now, watching for platform settle...");
-    }
-
-    iterCount++;
-    if (iterCount % LOG_DECIM == 0) {
-      if (samplesLogged >= MAX_LOG_SAMPLES) {
-        stoppedByCeiling = true;
-        break;
-      }
-
-      sensors_event_t a, g, temp;
-      mpu.getEvent(&a, &g, &temp);
-      float gyroZ_dps = g.gyro.z * 180.0f / PI;
-
-      int i = samplesLogged;
-      log_time_us[i]   = micros();
-      log_targetV[i]   = motor.target;
-      log_vel_raw[i]   = sensor.getVelocity();
-      log_vel_filt[i]  = motor.shaft_velocity;
-      log_gyroZ_dps[i] = gyroZ_dps;
-      samplesLogged++;
-
-      if (inPhaseB) {
-        bool minTimeElapsed = (millis() - phaseBStartMs >= MIN_CAPTURE_MS);
-        if (minTimeElapsed) {
-          if (fabs(gyroZ_dps) < GYRO_SETTLE_DPS) {
-            settleCount++;
-            if (settleCount >= SETTLE_DEBOUNCE_N) {
-              stoppedBySettle = true;
-              break;
-            }
-          } else {
-            settleCount = 0;
-          }
-        }
-
-        if (millis() - phaseBStartMs >= MAX_CAPTURE_MS) {
-          stoppedByTimeout = true;
-          break;
-        }
-      }
-    }
-  }
-
-  String stopReason = stoppedBySettle  ? "platform_settled" :
-                       stoppedByCeiling ? "sample_buffer_full" :
-                                          "capture_timeout";
-  printBoth("  capture stopped: " + stopReason + " -- " + String(samplesLogged) + " samples logged.");
-  if (samplesLogged >= 2) {
-    float durationMs = (log_time_us[samplesLogged - 1] - log_time_us[0]) / 1000.0f;
-    printBoth("  captured " + String(durationMs, 1) + " ms (realized log rate ~"
-              + String(samplesLogged / (durationMs / 1000.0f), 0) + " Hz).");
-  }
-  if (stoppedByCeiling) {
-    printBoth("  !!! Hit MAX_LOG_SAMPLES before settling -- raise it (watch SRAM) or shorten holdBeforeStepMs. !!!");
-  }
-  if (stoppedByTimeout) {
-    printBoth("  !!! Hit MAX_CAPTURE_MS before settling -- data may not show the full decay. !!!");
-  }
-
-  dumpBurst(testIndex, t, stopReason);
-
-  motor.target = 0.0f;   // ensure fully released regardless of how phase B ended
-  printBoth("Target forced to 0V -- waiting for wheel and platform to settle before next test...");
-  return waitForSettle();
 }
 
 void setup() {
@@ -505,8 +698,10 @@ void setup() {
 
   Wire.begin();
 
-  if (!mpu.begin()) {
-    printBoth("[MPU6050] NOT FOUND -- check wiring / address (0x68)");
+  mpuOK = mpu.begin();
+  if (!mpuOK) {
+    printBoth("[MPU6050] NOT FOUND -- check wiring / address (0x68). Settle detection "
+              "and platform data will not work.");
   } else {
     mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
     mpu.setGyroRange(MPU6050_RANGE_500_DEG);
@@ -514,10 +709,13 @@ void setup() {
     printBoth("[MPU6050] OK");
   }
 
-  if (!ina219.begin()) {
-    printBoth("[INA219] NOT FOUND -- check wiring / address (0x40)");
+  inaOK = ina219.begin();
+  if (!inaOK) {
+    printBoth("[INA219] NOT FOUND -- current/voltage will log as 0. R and Kv cannot be "
+              "separated without it (see header note 1).");
   } else {
-    printBoth("[INA219] OK (not logged in this sweep -- motor-side data is what matters here)");
+    ina219.setCalibration_32V_2A();
+    printBoth("[INA219] OK -- logging bus voltage and current");
   }
 
   sensor.init(&encoderSPI);
@@ -539,30 +737,47 @@ void setup() {
   motor.initFOC();
   motor.target = 0.0f;
 
-  waitForStartSignal();  // placed after motor/FOC init since it keeps the
-                          // FOC loop serviced (target=0) while it waits
+  // Platform must be stationary here -- this runs before the start gate, so
+  // it happens while you're still setting up rather than mid-sweep.
+  measureGyroBias();
+
+  waitForStartSignal();
 
   if (!aborted) {
-    printBoth("=== Automated voltage-step calibration sweep (settle-based capture) ===");
-    printBoth(String(NUM_TESTS) + " tests queued.");
+#if SWEEP_MODE == MODE_STAIRCASE
+    printBoth("=== Stiction staircase mode ===");
+    printBoth("Type anything into either serial link at any time to abort.");
+    runStaircase();
+#else
+    int total = NUM_CONDITIONS * N_REPEATS;
+    printBoth("=== Voltage-step system-ID sweep ===");
+    printBoth(String(NUM_CONDITIONS) + " conditions x " + String(N_REPEATS)
+              + " repeats = " + String(total) + " tests.");
+    printBoth("Repeats run as the outer loop (full list, then repeat) so drift spreads "
+              "across conditions instead of confounding one.");
     printBoth("Type anything into either serial link at any time to abort.");
     printBoth("");
 
-    for (int t = 0; t < NUM_TESTS; t++) {
-      if (!runOneTest(t)) {
-        break;  // aborted, or a fault occurred mid-test
+    int testNum = 0;
+    bool ok = true;
+    for (int rep = 1; rep <= N_REPEATS && ok; rep++) {
+      for (int c = 0; c < NUM_CONDITIONS && ok; c++) {
+        testNum++;
+        ok = runStepTest(c, rep, testNum, total);
       }
     }
+#endif
   }
 
   if (!aborted) {
     printBoth("");
-    printBoth("=== Sweep complete -- all " + String(NUM_TESTS) + " tests done. Reset the board to run again. ===");
+    printBoth("=== Sweep complete. Reset the board to run again. ===");
+    printBoth("Final accumulated platform rotation: " + String(sweepNetRotationDeg, 1) + " deg");
   }
 }
 
 void loop() {
-  // The entire sweep runs once, inside setup(). Idle the FOC loop at 0V
+  // The whole sweep runs once, inside setup(). Idle the FOC loop at 0V
   // afterward (also the state the abort path leaves things in).
   motor.target = 0.0f;
   motor.loopFOC();
