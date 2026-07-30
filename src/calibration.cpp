@@ -199,7 +199,7 @@ Adafruit_INA219 ina219;
 // define and reflash to switch.
 #define MODE_STEP       0
 #define MODE_STAIRCASE  1
-#define SWEEP_MODE      MODE_STEP
+#define SWEEP_MODE      MODE_STAIRCASE
 // ==========================================================
 
 // ======================= TUNABLE TEST PARAMETERS =======================
@@ -697,6 +697,7 @@ void setup() {
   hc05Serial.begin(HC05_BAUD);
 
   Wire.begin();
+  Wire.setClock(400000);
 
   mpuOK = mpu.begin();
   if (!mpuOK) {
