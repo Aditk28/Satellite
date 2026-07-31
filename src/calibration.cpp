@@ -75,16 +75,27 @@
      sign-mirrored counterpart, which both tests that asymmetry properly
      and provides the alternating order item 5 needs.
 
-  7. STICTION STAIRCASE MODE (new, SWEEP_MODE = MODE_STAIRCASE).
-     The sub-1V tests were previously removed from the step sweep because
-     they "stop almost instantly" -- correct call, since they're poor
-     step-response data. But that instant stop IS the stiction signature,
-     and an angle-hold controller needs to know the command below which the
-     platform does not move at all, or it will wind up and limit-cycle
-     against a deadband it doesn't know exists. That's a different
-     experiment, so it's a different mode: a slow voltage staircase (small
-     increments, dwell at each) up past breakaway and back down to find
-     re-stick, logged continuously.
+  7. STICTION MEASUREMENT -- TWO MODES, ONE SUPERSEDED.
+     MODE_STAIRCASE (voltage-level staircase) was the first attempt and does
+     NOT work for platform breakaway. Reaction torque on the platform is
+     proportional to WHEEL ACCELERATION; at a constant commanded voltage the
+     wheel accelerates briefly then plateaus, so each tread delivers a torque
+     impulse set by the STEP SIZE (a constant 0.05 V), not by the absolute
+     voltage. Climbing the staircase applies the identical impulse at every
+     rung. The 2026-07-30 run confirmed it: platform peak rate stayed flat at
+     1.0-2.2 dps from 0.35 V to 0.80 V while wheel speed climbed 1.7 -> 6.4
+     rad/s. That run also overran the sample buffer (~6700 samples needed vs
+     2400 available) and stopped at 0.85 V without descending.
+
+     It did find something real, though: the MOTOR's own deadband. The wheel
+     does not turn at all below ~0.35 V (0.001-0.056 rad/s, i.e. noise), then
+     jumps to 1.72 rad/s. Below that command the controller has NO authority,
+     which is a genuine limit-cycle risk for any integral term.
+
+     MODE_BREAKAWAY (new) sweeps STEP SIZE from rest instead, which is what
+     actually scales torque delivered to the platform. Each trial dumps
+     before the next starts, so the buffer holds one trial (~580 samples)
+     rather than a whole sweep -- that's the structural fix for the overrun.
 
   8. SPLIT LOG RATE BY PHASE (LOG_DECIM_A vs LOG_DECIM_B). Phase A is now
      settle-gated and can run longer, but it's mostly steady-state holding
@@ -192,14 +203,27 @@ Adafruit_INA219 ina219;
 
 // ======================= SWEEP MODE =======================
 // MODE_STEP      -- voltage-step / reversal system ID (the main sweep)
-// MODE_STAIRCASE -- slow voltage staircase to find the platform's
-//                   breakaway (static friction) threshold
-// These answer different questions and produce differently-shaped data, so
-// they're separate modes rather than mixed into one sequence. Change this
-// define and reflash to switch.
+// MODE_STAIRCASE -- slow voltage staircase. KEPT FOR REFERENCE BUT SUPERSEDED
+//                   BY MODE_BREAKAWAY: it cannot measure platform breakaway.
+//                   Reaction torque on the platform is proportional to WHEEL
+//                   ACCELERATION, and at a constant commanded voltage the
+//                   wheel accelerates briefly then plateaus. Each tread
+//                   therefore delivers a torque impulse proportional to the
+//                   STEP SIZE (a constant 0.05 V), not to the absolute
+//                   voltage -- so climbing the staircase applies the same
+//                   impulse at every rung and nothing changes. The
+//                   2026-07-30 run confirmed this directly: platform peak
+//                   rate stayed flat at 1.0-2.2 dps from 0.35 V all the way
+//                   to 0.80 V while wheel speed climbed 1.7 -> 6.4 rad/s.
+//                   It IS still useful for the motor's own deadband: that
+//                   run found the wheel does not turn at all below ~0.35 V.
+// MODE_BREAKAWAY -- sweeps STEP SIZE from rest, which is what actually scales
+//                   the torque delivered to the platform. This is the mode to
+//                   use for platform stiction.
 #define MODE_STEP       0
 #define MODE_STAIRCASE  1
-#define SWEEP_MODE      MODE_STAIRCASE
+#define MODE_BREAKAWAY  2
+#define SWEEP_MODE      MODE_BREAKAWAY
 // ==========================================================
 
 // ======================= TUNABLE TEST PARAMETERS =======================
@@ -217,24 +241,24 @@ struct TestStep {
 // you edit this list.
 const TestStep TEST_SEQUENCE[] = {
   // --- From-rest steps, sign-mirrored pairs ---
-  // {0.0f,  1.0f, 1200, "step 0 -> +1.0V"},
-  // {0.0f, -1.0f, 1200, "step 0 -> -1.0V"},
-  // {0.0f,  1.5f, 1200, "step 0 -> +1.5V"},
-  // {0.0f, -1.5f, 1200, "step 0 -> -1.5V"},
-  // {0.0f,  2.5f, 1200, "step 0 -> +2.5V"},
-  // {0.0f, -2.5f, 1200, "step 0 -> -2.5V"},
-  // {0.0f,  4.0f, 1200, "step 0 -> +4.0V"},
-  // {0.0f, -4.0f, 1200, "step 0 -> -4.0V"},
+  {0.0f,  1.0f, 1200, "step 0 -> +1.0V"},
+  {0.0f, -1.0f, 1200, "step 0 -> -1.0V"},
+  {0.0f,  1.5f, 1200, "step 0 -> +1.5V"},
+  {0.0f, -1.5f, 1200, "step 0 -> -1.5V"},
+  {0.0f,  2.5f, 1200, "step 0 -> +2.5V"},
+  {0.0f, -2.5f, 1200, "step 0 -> -2.5V"},
+  {0.0f,  4.0f, 1200, "step 0 -> +4.0V"},
+  {0.0f, -4.0f, 1200, "step 0 -> -4.0V"},
 
-  // // --- Release from speed, sign-mirrored ---
-  // { 1.0f, 0.0f, 1500, "spin +1.0V -> release to 0"},
-  // {-1.0f, 0.0f, 1500, "spin -1.0V -> release to 0"},
+  // --- Release from speed, sign-mirrored ---
+  { 1.0f, 0.0f, 1500, "spin +1.0V -> release to 0"},
+  {-1.0f, 0.0f, 1500, "spin -1.0V -> release to 0"},
 
-  // // --- Reversals through zero, sign-mirrored ---
-  // { 1.0f, -1.0f, 1500, "spin +1.0V -> reverse to -1.0V"},
-  // {-1.0f,  1.0f, 1500, "spin -1.0V -> reverse to +1.0V"},
-  // { 1.5f, -0.8f, 1500, "spin +1.5V -> reverse to -0.8V"},
-  // {-1.5f,  0.8f, 1500, "spin -1.5V -> reverse to +0.8V"},
+  // --- Reversals through zero, sign-mirrored ---
+  { 1.0f, -1.0f, 1500, "spin +1.0V -> reverse to -1.0V"},
+  {-1.0f,  1.0f, 1500, "spin -1.0V -> reverse to +1.0V"},
+  { 1.5f, -0.8f, 1500, "spin +1.5V -> reverse to -0.8V"},
+  {-1.5f,  0.8f, 1500, "spin -1.5V -> reverse to +0.8V"},
   { 3.0f, -2.0f, 2000, "spin +3.0V -> reverse to -2.0V"},
   {-3.0f,  2.0f, 2000, "spin -3.0V -> reverse to +2.0V"},
 };
@@ -280,10 +304,39 @@ const int NUM_CONDITIONS = sizeof(TEST_SEQUENCE) / sizeof(TEST_SEQUENCE[0]);
                                         // returns -- see waitForKeypress()
 
 // --- Staircase mode parameters (only used when SWEEP_MODE==MODE_STAIRCASE) ---
+// NOTE: this mode is superseded for platform stiction -- see the mode notes
+// above. If you do run it, be aware the full up+down sweep is ~50 treads and
+// at the MEASURED 168 Hz log rate that's ~6700 samples, which overruns
+// MAX_LOG_SAMPLES by ~2.8x (the 2026-07-30 run stopped at 0.85 V and never
+// descended). Shorten the range or the dwell if you need it.
 #define STAIR_STEP_V           0.05f   // increment per tread
 #define STAIR_MAX_V            1.20f   // climb to here, then back down
 #define STAIR_DWELL_MS           800   // hold at each tread
-#define STAIR_LOG_DECIM           60   // ~107 Hz throughout
+#define STAIR_LOG_DECIM           60
+
+// --- Breakaway mode parameters (SWEEP_MODE==MODE_BREAKAWAY) ---
+// Sweeps STEP SIZE from rest. Each trial: settle at 0 V, step to S, watch for
+// a fixed window, return to 0, wait for rest, dump. Because each trial dumps
+// before the next begins, the buffer only ever holds ONE trial (~580 samples
+// at the measured 168/224 Hz rates) -- comfortably inside MAX_LOG_SAMPLES.
+// That is the structural difference from the staircase, which tried to hold
+// an entire 40 s sweep in one buffer.
+//
+// Range rationale: the motor's own deadband is ~0.35 V (below that the wheel
+// doesn't turn, so no torque reaches the platform at all), and a 1.0 V step
+// visibly moves the platform (~28 dps peak in the main sweep). So platform
+// breakaway is bracketed between those. Starting at 0.05 V re-confirms the
+// motor deadband in the same run for free.
+#define BREAK_MIN_V            0.05f
+#define BREAK_MAX_V            1.20f
+#define BREAK_STEP_V           0.05f
+#define BREAK_REPEATS              2   // near threshold this is stochastic
+#define BREAK_MIN_HOLD_MS        800   // floor on the at-rest hold before stepping
+#define BREAK_CAPTURE_MS        1500   // FIXED capture window after the step
+// Fixed, not settle-stopped, on purpose: below breakaway the platform never
+// moves, so a settle-stop would fire immediately and capture nothing. A fixed
+// window gives every trial the same observation period, which is what makes
+// "did it move" comparable across step sizes.
 // =========================================================================
 
 unsigned long log_time_us[MAX_LOG_SAMPLES];
@@ -640,6 +693,155 @@ done:
   return waitForRest();
 }
 
+// ===================== BREAKAWAY (STEP-SIZE SWEEP) =====================
+// One trial: settle at 0 V, step to stepV, observe for a FIXED window,
+// return to 0, wait for rest. Records the peak platform rate and peak wheel
+// speed reached, which is what makes breakaway visible without any
+// post-processing.
+//
+// Why step size rather than voltage level: reaction torque on the platform
+// is proportional to wheel ACCELERATION, and a step from rest to stepV
+// produces an acceleration proportional to stepV. Holding a constant voltage
+// (what MODE_STAIRCASE does) produces acceleration only transiently, and its
+// magnitude depends on the change in command, not its absolute value -- which
+// is why that mode's platform response was flat across the whole sweep.
+bool runBreakawayTrial(float stepV, int rep, int trialNum, int trialTotal,
+                        float &peakGyroOut, float &peakWheelOut) {
+  printBoth("");
+  printBoth("=== Breakaway trial " + String(trialNum) + "/" + String(trialTotal)
+            + ": step 0 -> " + String(stepV, 2) + "V  [rep " + String(rep)
+            + "/" + String(BREAK_REPEATS) + "] ===");
+  delay(PRE_TEST_DELAY_MS);
+  if (checkAbort()) return false;
+
+  samplesLogged = 0;
+  phaseBStartSample = 0;
+  unsigned long iterCount = 0;
+
+  // ---- Phase A: sit at 0 V until the platform is genuinely still ----
+  motor.target = 0.0f;
+  unsigned long phaseAStart = millis();
+  int platformSettleCount = 0;
+  bool phaseAClean = false;
+
+  while (true) {
+    motor.loopFOC();
+    motor.move();
+    if (checkAbort()) return false;
+
+    iterCount++;
+    if (iterCount % LOG_DECIM_A == 0) {
+      if (samplesLogged >= MAX_LOG_SAMPLES) break;
+      float gyroZ = logSample();
+      if (fabs(gyroZ) < GYRO_SETTLE_DPS) platformSettleCount++;
+      else platformSettleCount = 0;
+
+      if ((millis() - phaseAStart >= BREAK_MIN_HOLD_MS)
+          && platformSettleCount >= SETTLE_DEBOUNCE_N) {
+        phaseAClean = true;
+        break;
+      }
+    }
+    if (millis() - phaseAStart >= PHASE_A_TIMEOUT_MS) break;
+  }
+  if (!phaseAClean)
+    printBoth("  !!! Platform not settled before the step -- this trial's result is suspect. !!!");
+
+  phaseBStartSample = samplesLogged;
+
+  // ---- Phase B: step, observe for a fixed window ----
+  motor.target = stepV;
+  unsigned long phaseBStart = millis();
+  float peakGyro = 0.0f, peakWheel = 0.0f;
+
+  while (millis() - phaseBStart < BREAK_CAPTURE_MS) {
+    motor.loopFOC();
+    motor.move();
+    if (checkAbort()) return false;
+
+    iterCount++;
+    if (iterCount % LOG_DECIM_B == 0) {
+      if (samplesLogged >= MAX_LOG_SAMPLES) break;
+      float gyroZ = logSample();
+      if (fabs(gyroZ) > fabs(peakGyro)) peakGyro = gyroZ;
+      if (fabs(motor.shaft_velocity) > fabs(peakWheel)) peakWheel = motor.shaft_velocity;
+    }
+  }
+
+  peakGyroOut = peakGyro;
+  peakWheelOut = peakWheel;
+
+  printBoth("  peak platform rate " + String(peakGyro, 2) + " dps"
+            + "   peak wheel " + String(peakWheel, 2) + " rad/s"
+            + (fabs(peakGyro) > GYRO_SETTLE_DPS ? "   <-- PLATFORM MOVED" : ""));
+
+  String header = "--- capture start (test " + String(trialNum) + "/" + String(trialTotal)
+                + ": breakaway step 0 -> " + String(stepV, 2) + "V [rep " + String(rep)
+                + "/" + String(BREAK_REPEATS) + "]) ---";
+  String meta = "mode=breakaway from=0.00V to=" + String(stepV, 2)
+              + "V rep=" + String(rep)
+              + " phaseB_start_sample=" + String(phaseBStartSample)
+              + " phaseA_clean=" + String(phaseAClean ? "yes" : "no")
+              + " peak_gyro_dps=" + String(peakGyro, 3)
+              + " peak_wheel_rads=" + String(peakWheel, 3)
+              + " gyro_bias_dps=" + String(gyroBiasDps, 4)
+              + " stop_reason=fixed_window";
+  dumpBoth(header, meta);
+
+  reportNetRotation();
+
+  motor.target = 0.0f;
+  return waitForRest();
+}
+
+bool runBreakawaySweep() {
+  int nSteps = (int)((BREAK_MAX_V - BREAK_MIN_V) / BREAK_STEP_V + 0.5f) + 1;
+  int total = nSteps * BREAK_REPEATS;
+
+  printBoth("=== Breakaway sweep (step-size) ===");
+  printBoth("  " + String(nSteps) + " step sizes from " + String(BREAK_MIN_V, 2)
+            + "V to " + String(BREAK_MAX_V, 2) + "V x " + String(BREAK_REPEATS)
+            + " repeats = " + String(total) + " trials");
+  printBoth("  Watch for the first step size where platform rate clears "
+            + String(GYRO_SETTLE_DPS, 1) + " dps.");
+  printBoth("  Type anything into either serial link at any time to abort.");
+
+  // Summary is accumulated and printed at the end so the breakaway point is
+  // readable in one place, without scrolling back through every trial dump.
+  static float sumPeak[64];
+  static int   sumCount[64];
+  for (int i = 0; i < 64; i++) { sumPeak[i] = 0.0f; sumCount[i] = 0; }
+
+  int trial = 0;
+  for (int rep = 1; rep <= BREAK_REPEATS; rep++) {
+    for (int k = 0; k < nSteps; k++) {
+      float stepV = BREAK_MIN_V + k * BREAK_STEP_V;
+      trial++;
+      float pg = 0.0f, pw = 0.0f;
+      if (!runBreakawayTrial(stepV, rep, trial, total, pg, pw)) return false;
+      if (k < 64) { sumPeak[k] += fabs(pg); sumCount[k]++; }
+    }
+  }
+
+  printBoth("");
+  printBoth("=== BREAKAWAY SUMMARY (mean peak platform rate per step size) ===");
+  printBoth("  step_V, mean_peak_dps, moved");
+  float firstMoved = -1.0f;
+  for (int k = 0; k < nSteps && k < 64; k++) {
+    if (!sumCount[k]) continue;
+    float mean = sumPeak[k] / sumCount[k];
+    bool moved = mean > GYRO_SETTLE_DPS;
+    if (moved && firstMoved < 0) firstMoved = BREAK_MIN_V + k * BREAK_STEP_V;
+    printBoth("  " + String(BREAK_MIN_V + k * BREAK_STEP_V, 2) + ", "
+              + String(mean, 2) + ", " + String(moved ? "yes" : "no"));
+  }
+  if (firstMoved >= 0)
+    printBoth("  -> platform breakaway step size ~ " + String(firstMoved, 2) + " V");
+  else
+    printBoth("  -> platform never moved. Raise BREAK_MAX_V and rerun.");
+  return true;
+}
+
 // ===================== START GATE =====================
 // Wait for any byte on either serial link, then drain the link COMPLETELY
 // before returning. Use this for EVERY mid-sweep prompt -- never hand-roll a
@@ -697,6 +899,12 @@ void setup() {
   hc05Serial.begin(HC05_BAUD);
 
   Wire.begin();
+  // 400 kHz fast mode. Measured on the 2026-07-30 runs: each logged sample
+  // costs ~3.7 ms of I2C (MPU6050 + two INA219 reads) against a ~27 kHz bare
+  // FOC loop, making I2C by far the dominant per-sample expense -- it's why
+  // phase B logged at 224 Hz rather than the 320 Hz its decimation implies.
+  // Both sensors support 400 kHz. The same reads will sit inside the
+  // real-time control task later, so the headroom matters there too.
   Wire.setClock(400000);
 
   mpuOK = mpu.begin();
@@ -745,8 +953,12 @@ void setup() {
   waitForStartSignal();
 
   if (!aborted) {
-#if SWEEP_MODE == MODE_STAIRCASE
+#if SWEEP_MODE == MODE_BREAKAWAY
+    runBreakawaySweep();
+#elif SWEEP_MODE == MODE_STAIRCASE
     printBoth("=== Stiction staircase mode ===");
+    printBoth("NOTE: this mode cannot measure PLATFORM breakaway (see the mode");
+    printBoth("notes at the top of this file). Use MODE_BREAKAWAY for that.");
     printBoth("Type anything into either serial link at any time to abort.");
     runStaircase();
 #else

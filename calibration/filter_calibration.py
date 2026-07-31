@@ -125,6 +125,13 @@ def is_staircase(meta):
     return str(meta.get("mode", "")).lower() == "staircase"
 
 
+def is_breakaway(meta):
+    """Breakaway trials are structurally from-rest step tests (they have the
+    same phase A/B split), so they flow through the normal path -- this is
+    only used to build the extra breakaway summary at the end."""
+    return str(meta.get("mode", "")).lower() == "breakaway"
+
+
 def transition_index(df, meta):
     """First phase-B sample. Prefer the firmware's own index; fall back to
     detecting where targetV changes (needed for older files)."""
@@ -240,6 +247,7 @@ def main():
     print()
 
     rows, stair_rows = [], []
+    brk_rows = []
     n_angle_flips = [0]   # list so the per-test loop can increment it
 
     for path in files:
@@ -339,6 +347,17 @@ def main():
                 # balance. nanmean would warn on an all-NaN slice, so check.
                 if np.any(np.isfinite(tail)):
                     iq_ss = round(float(np.nanmean(tail)), 5)
+            b = out[out["phase"] == "B"]
+            gB = b["gyro_dps"].to_numpy()
+            peak_gyro = float(gB[np.argmax(np.abs(gB))]) if len(gB) else np.nan
+            if is_breakaway(meta):
+                brk_rows.append({
+                    "step_V": fnum(meta, "to"),
+                    "rep": int(meta.get("rep", 1)) if str(meta.get("rep", "1")).isdigit() else 1,
+                    "peak_gyro_dps": round(abs(peak_gyro), 3),
+                    "peak_wheel_rads": round(float(np.abs(b["wheel_vel"].to_numpy()).max()), 3),
+                    "phaseA_clean": meta.get("phaseA_clean", "?"),
+                })
             rows.append({
                 "test": meta.get("test_num", 0),
                 "label": meta.get("label", name),
@@ -390,6 +409,32 @@ def main():
             print(f"  wrote {os.path.join(outdir,'repeatability.csv')}")
             print()
             print(grp.to_string(index=False))
+
+    if brk_rows:
+        B = pd.DataFrame(brk_rows)
+        agg = B.groupby("step_V").agg(
+            n=("rep", "count"),
+            peak_gyro_mean=("peak_gyro_dps", "mean"),
+            peak_gyro_std=("peak_gyro_dps", "std"),
+            peak_wheel_mean=("peak_wheel_rads", "mean"),
+        ).reset_index().round(3)
+        agg["platform_moved"] = agg["peak_gyro_mean"] > args.settle_dps
+        agg["wheel_moved"] = agg["peak_wheel_mean"] > 0.2
+        agg.to_csv(os.path.join(outdir, "breakaway_summary.csv"), index=False)
+        print(f"\n  wrote {os.path.join(outdir,'breakaway_summary.csv')}")
+        print()
+        print(agg.to_string(index=False))
+
+        moved = agg[agg["platform_moved"]]
+        wmoved = agg[agg["wheel_moved"]]
+        print()
+        if len(wmoved):
+            print(f"  MOTOR deadband:    wheel first turns at step {wmoved.step_V.iloc[0]:.2f} V")
+        if len(moved):
+            print(f"  PLATFORM breakaway: first moves at step {moved.step_V.iloc[0]:.2f} V "
+                  f"(threshold {args.settle_dps} dps)")
+        else:
+            print(f"  PLATFORM never exceeded {args.settle_dps} dps -- raise BREAK_MAX_V and rerun.")
 
     if stair_rows:
         sdf = pd.DataFrame(stair_rows)
