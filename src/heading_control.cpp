@@ -195,7 +195,7 @@ float deadzone  = 0.035f;   // rad (~2 deg)
 
 // ------------------- safety -------------------
 #define W_MOVING            0.05f    // rad/s, "platform is moving" threshold
-#define WHEEL_SAT_LIMIT     25.0f    // rad/s -- abort above this.
+#define WHEEL_SAT_LIMIT     45.0f    // rad/s -- abort above this.
                                      // 25 while debugging the inner loop;
                                      // restore to 45 for normal tuning.
 #define CONTROL_PERIOD_US   5000     // 200 Hz control loop
