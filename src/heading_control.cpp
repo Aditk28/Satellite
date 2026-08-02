@@ -182,9 +182,9 @@ static const float GYRO_SIGN   = -1.0f;    // aligns gyro with wheel convention
 // ------------------- runtime-tunable gains -------------------
 // Start conservative (3.0 s row) and work down using P/D over serial --
 // no reflash needed between tuning steps.
-float K_theta   = 19.1f;
-float K_omega   = 14.0f;
-float ffFrac    = 0.85f;    // trim up until it overshoots, then back off
+float K_theta   = 119.3f;
+float K_omega   = 35.1f;
+float ffFrac    = 0.9f;    // trim up until it overshoots, then back off
 // Fraction of the modelled A_2 actually applied in the linearisation.
 // 1.0 = trust the model exactly. Below 1.0 deliberately UNDER-compensates.
 // This asymmetry is the whole point: under-compensation leaves a stable
@@ -201,7 +201,7 @@ float ffFrac    = 0.85f;    // trim up until it overshoots, then back off
 // session drift seen between the 150258 and 151508 runs.
 // Do NOT make this direction-dependent: the measured asymmetry REVERSED sign
 // between those two runs, so a per-direction value would be wrong half the time.
-float compFrac  = 0.80f;
+float compFrac  = 0.89f;
 float deadzone  = 0.035f;   // rad (~2 deg)
 
 // ------------------- safety -------------------
