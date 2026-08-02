@@ -199,37 +199,55 @@ float ffFrac    = 0.90f;    // trim up until it overshoots, then back off
 // Note cf = 1.0 is ALREADY UNSTABLE positive-going even with the re-identified
 // A_1/A_2, so the true damping pole is nearer 5.0 than 5.35. Rather than chase
 // A_2 again, the margin lives here where it is visible.
-// 0.80 = lower neutral (0.892) derated ~10%, covering the +/-4% session-to-
-// session drift seen between the 150258 and 151508 runs.
+// 0.89 = essentially AT the lower measured neutral (0.892). Chosen over the
+// initially-suggested 0.80 because under-compensation is not free: the shortfall
+// is subtracted from every commanded alpha, and at 0.80 a sustained alpha died
+// out after ~1.9 s, so slews ran out of torque mid-manoeuvre. 0.89 gives a
+// ~4 s torque hold. Measured residual pole at this value: about -0.84 /s.
 // Do NOT make this direction-dependent: the measured asymmetry REVERSED sign
 // between those two runs, so a per-direction value would be wrong half the time.
-float compFrac  = 0.80f;
-float deadzone  = 0.035f;   // rad (~2 deg)
+float compFrac  = 0.89f;
+float deadzone  = 0.035f;   // rad (2.0 deg) -- tuned value, matches captures
 
 // ------------------- safety -------------------
 #define W_MOVING            0.05f    // rad/s, "platform is moving" threshold
 
 // ---- momentum management ----------------------------------------------
-// Two problems solved by one routine:
-//  (1) DESATURATION. Every slew banks wheel speed; Coulomb friction holds the
-//      platform at its new heading so the momentum never comes back on its own.
-//  (2) SAFE STOP. Setting motor.target = 0 at 40 rad/s dumps the wheel with a
-//      0.19 s time constant -- ~220 rad/s^2 of wheel decel, i.e. ~42 rad/s^2 on
-//      the platform against a 4.24 breakaway. That is the observed 360 deg spin.
-// The fix for both: ramp the wheel down at an acceleration whose reaction
-// torque stays BELOW platform breakaway, so friction holds the platform while
-// the wheel unwinds. Breakaway equivalent is A_FRICTION = 22.3 rad/s^2 of wheel
-// accel; 10 gives better than 2x margin. Unwinding 40 rad/s takes about 4 s.
-#define DESAT_ALPHA         10.0f    // rad/s^2, must stay well under A_FRICTION
-#define DESAT_ENTER_WW      15.0f    // rad/s, start unwinding when parked
-#define DESAT_EXIT_WW        1.0f    // rad/s, done
-// STALL: outside the deadzone, platform not moving, wheel already fast. The
-// wheel cannot deliver the commanded alpha at high speed (the compensation
-// shortfall eats it), so pushing harder only winds toward the abort. Give up
-// and unwind instead.
+// DESATURATION IS PASSIVE -- there is deliberately no active unwind routine.
+// Inside the deadzone alpha = 0, so u = compFrac*A_2*omega_w/A_1 = 0.105*omega_w,
+// while merely holding speed needs 0.123*omega_w. The shortfall bleeds the wheel
+// down as  d(omega_w)/dt = -0.84*omega_w,  a 1.2 s exponential.
+//
+// The important property is that it is SELF-LIMITING: reaction torque during the
+// unwind is 0.19*0.84*omega_w = 0.16*omega_w rad/s^2 on the platform, which stays
+// under the 4.24 rad/s^2 breakaway for any omega_w below 26.5 rad/s. So the wheel
+// comes home and friction holds the heading, with no logic and no tuning.
+//
+// An active ramp was tried and REMOVED. Commanding alpha = -10 to brake gives
+// u = (-10 + 0.89*5.35*20)/45.5 = 1.87 V at 20 rad/s, against a 2.46 V hold
+// voltage -- so the wheel actually decelerated at 27 rad/s^2, not 10. That is
+// 5.1 rad/s^2 on the platform, ABOVE breakaway: the platform broke free, the
+// heading drifted, the controller fought back, and the wheel wound up. The
+// compensation shortfall that starves a positive alpha ADDS to a negative one.
+// Do not command braking torque through the linearisation at speed.
+//
+// STALL is the one case passive unwind cannot reach: parked OUTSIDE the deadzone
+// with the wheel already fast, where the wheel cannot deliver the commanded alpha
+// and pushing harder only winds toward the abort (see the 120 deg and 179 deg
+// slews, 2026-08-02). Recovery is simply to stop commanding for a moment and let
+// the passive unwind restore authority, then retry.
+// NOTE: above omega_w = 26.5 the passive unwind torque (0.16*omega_w) does
+// exceed the 4.24 breakaway, so a slew ending fast may drag the heading a little
+// on the way down. An active ramp to cover that band was written and removed --
+// it is not currently needed, and braking through the linearisation is actively
+// dangerous (the compensation shortfall ADDS to a negative alpha, so a commanded
+// -10 rad/s^2 came out as -27). If it is ever revisited, it must command VOLTAGE
+// directly from the wheel's hold curve (u_hold = omega_w/K_HOLD, K_HOLD ~ 8.13
+// (rad/s)/V measured at 42 rad/s), never a negative alpha.
+#define ALPHA_STALL_MAX     28.0f    // rad/s^2, cap while platform is stationary
 #define STALL_WW            30.0f    // rad/s
-#define STALL_MS             600     // ms of continuous stall before acting
-#define WHEEL_HARD_ABORT    55.0f    // rad/s -- true emergency, hard stop
+#define STALL_MS             600     // ms of continuous stall before backing off
+#define STALL_HOLD_MS       2000     // ms of alpha = 0 before retrying
 #define WHEEL_SAT_LIMIT     45.0f    // rad/s -- abort above this.
                                      // Keep at 45: a C3 spin-up alone reaches
                                      // ~26 rad/s, so a lower limit aborts the
@@ -256,8 +274,9 @@ float omega_w    = 0.0f;    // wheel rate, rad/s
 float target     = 0.0f;    // commanded heading, rad
 float gyroBias   = 0.0f;    // dps, measured at startup
 float lastAlpha  = 0.0f;
-bool  desatActive = false;
+bool  stallHold = false;
 unsigned long stallStartMs = 0;
+unsigned long stallHoldUntil = 0;
 float lastU      = 0.0f;
 bool  controllerEnabled = true;
 
@@ -292,6 +311,7 @@ void stopMotor(const String &why) {
   controllerEnabled = false;
   ctrlMode = CTRL_IDLE;
   capturing = false;
+  stallHold = false; stallStartMs = 0;
   motor.target = 0.0f;
   motor.loopFOC();
   motor.move();
@@ -318,7 +338,7 @@ void printGains() {
   printBoth("K_theta=" + String(K_theta, 2) + "  K_omega=" + String(K_omega, 2)
             + "  ff=" + String(ffFrac, 2) + "  deadzone=" + String(degrees(deadzone), 2) + "deg"
             + "  compFrac=" + String(compFrac, 2)
-            + (desatActive ? "  [DESAT]" : ""));
+            + (stallHold ? "  [STALL-HOLD]" : ""));
   printBoth("theta=" + String(degrees(theta), 2) + "deg  target=" + String(degrees(target), 2)
             + "deg  omega_p=" + String(omega_p, 3) + "  omega_w=" + String(omega_w, 2)
             + "  mode=" + String(ctrlMode == CTRL_IDLE ? "IDLE" : (ctrlMode == CTRL_HOLD ? "HOLD" : "STEP")));
@@ -411,10 +431,10 @@ void controlUpdate(float dt) {
     return;
   }
 
-  // ---- safety: true emergency only. Ordinary saturation is handled by the
-  //      desaturation ramp below, which unwinds gently instead of dumping. ----
-  if (fabsf(omega_w) > WHEEL_HARD_ABORT) {
-    stopMotor("wheel HARD abort " + String(omega_w, 1) + " rad/s");
+  // ---- safety: wheel saturation. Hard stop, deliberately. The platform will
+  //      spin as the wheel dumps its momentum; that is accepted behaviour. ----
+  if (fabsf(omega_w) > WHEEL_SAT_LIMIT) {
+    stopMotor("wheel saturation " + String(omega_w, 1) + " rad/s");
     return;
   }
 
@@ -423,31 +443,29 @@ void controlUpdate(float dt) {
   bool outside   = fabsf(e) > deadzone;
   bool notMoving = fabsf(omega_p) < W_MOVING;
 
-  // ---- 1b. momentum management: decide whether to unwind ----
+  // ---- 1b. stall detection: outside the deadzone, platform stationary, wheel
+  //      already fast. Back off and let the passive unwind restore authority. ----
   if (outside && notMoving && fabsf(omega_w) > STALL_WW) {
     if (stallStartMs == 0) stallStartMs = millis();
-    else if (millis() - stallStartMs > STALL_MS && !desatActive) {
-      desatActive = true;
+    else if (millis() - stallStartMs > STALL_MS && !stallHold) {
+      stallHold = true;
+      stallHoldUntil = millis() + STALL_HOLD_MS;
       printBoth("STALL at " + String(degrees(e), 1) + " deg, ww="
-                + String(omega_w, 1) + " -- unwinding");
+                + String(omega_w, 1) + " -- backing off");
     }
   } else {
     stallStartMs = 0;
   }
-  if (!outside && fabsf(omega_w) > DESAT_ENTER_WW) desatActive = true;
-  if (fabsf(omega_w) < DESAT_EXIT_WW)              desatActive = false;
-  // Abandon the unwind if the platform starts moving -- that means the ramp
-  // rate is above breakaway after all, and continuing would drag the heading.
-  if (desatActive && fabsf(omega_p) > 3.0f * W_MOVING) {
-    desatActive = false;
-    printBoth("desat aborted: platform moved (lower DESAT_ALPHA)");
+  if (stallHold && millis() > stallHoldUntil) {
+    stallHold = false; stallStartMs = 0;
+    printBoth("stall hold released, retrying");
   }
 
   float alpha;
 
-  if (desatActive) {
-    // ---- 2a. unwind the wheel below breakaway; friction holds the heading ----
-    alpha = -DESAT_ALPHA * signf(omega_w);
+  if (stallHold) {
+    // ---- 2a. command nothing; the passive unwind bleeds the wheel down ----
+    alpha = 0.0f;
 
   } else if (outside) {
     // ---- 2b. LQR / PD.  MINUS on error, PLUS on rate -- see header note (a). ----
@@ -461,14 +479,20 @@ void controlUpdate(float dt) {
       ff =  A_FRICTION * signf(alpha);     // STUCK:  push to break free
     alpha += ffFrac * ff;
 
-    // ---- 3b. authority ceiling. The wheel cannot sustain alpha above roughly
-    //      0.84*omega_w (the compensation shortfall consumes the rest), and the
-    //      plant model is only identified to ~26 rad/s. Clamping here stops the
-    //      controller commanding torque the wheel provably cannot deliver.
-    float alphaMax = 0.84f * (WHEEL_SAT_LIMIT - fabsf(omega_w));
-    if (alphaMax < 0.0f) alphaMax = 0.0f;
-    if (alpha >  alphaMax) alpha =  alphaMax;
-    if (alpha < -alphaMax) alpha = -alphaMax;
+    // ---- 3b. authority ceiling, applied ONLY while the platform is stationary.
+    //      A sustained alpha drives the wheel to a steady state of about
+    //      alpha/0.84 rad/s, so alpha = 62 (K_theta at 30 deg error) implies
+    //      74 rad/s -- far past the abort. While the platform is MOVING that
+    //      never matters, because the manoeuvre finishes first, and clamping
+    //      there would just slow large slews. The pathological case is pushing
+    //      hard while stuck: no motion results and the wheel winds up regardless.
+    //      ALPHA_STALL_MAX must exceed A_FRICTION (22.3) or the platform could
+    //      never break free at all; 28 implies a 33 rad/s ceiling, under the 45
+    //      abort with margin.
+    if (notMoving) {
+      if (alpha >  ALPHA_STALL_MAX) alpha =  ALPHA_STALL_MAX;
+      if (alpha < -ALPHA_STALL_MAX) alpha = -ALPHA_STALL_MAX;
+    }
 
   } else {
     // Inside tolerance: command nothing and let stiction hold the platform.
