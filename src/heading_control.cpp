@@ -190,14 +190,27 @@ float ffFrac    = 0.85f;    // trim up until it overshoots, then back off
 // This asymmetry is the whole point: under-compensation leaves a stable
 // residual pole (mildly sluggish), over-compensation leaves an unstable one
 // (exponential runaway). Always err low. Verify with the C command.
-float compFrac  = 0.85f;
+//
+// MEASURED 2026-08-02 by the C sweep (7 trials, both directions):
+//     positive:  pole = 3.00*cf - 2.92   ->  neutral at cf = 0.972
+//     negative:  pole = 3.68*cf - 3.28   ->  neutral at cf = 0.892
+// Note cf = 1.0 is ALREADY UNSTABLE positive-going even with the re-identified
+// A_1/A_2, so the true damping pole is nearer 5.0 than 5.35. Rather than chase
+// A_2 again, the margin lives here where it is visible.
+// 0.80 = lower neutral (0.892) derated ~10%, covering the +/-4% session-to-
+// session drift seen between the 150258 and 151508 runs.
+// Do NOT make this direction-dependent: the measured asymmetry REVERSED sign
+// between those two runs, so a per-direction value would be wrong half the time.
+float compFrac  = 0.80f;
 float deadzone  = 0.035f;   // rad (~2 deg)
 
 // ------------------- safety -------------------
 #define W_MOVING            0.05f    // rad/s, "platform is moving" threshold
 #define WHEEL_SAT_LIMIT     45.0f    // rad/s -- abort above this.
-                                     // 25 while debugging the inner loop;
-                                     // restore to 45 for normal tuning.
+                                     // Keep at 45: a C3 spin-up alone reaches
+                                     // ~26 rad/s, so a lower limit aborts the
+                                     // comp test before it starts. Use C2 if
+                                     // you want a lower-speed check.
 #define CONTROL_PERIOD_US   5000     // 200 Hz control loop
 #define TELEM_PERIOD_MS     100      // 10 Hz streaming telemetry in HOLD
 
