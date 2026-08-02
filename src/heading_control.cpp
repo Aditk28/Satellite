@@ -244,7 +244,7 @@ float deadzone  = 0.035f;   // rad (2.0 deg) -- tuned value, matches captures
 // -10 rad/s^2 came out as -27). If it is ever revisited, it must command VOLTAGE
 // directly from the wheel's hold curve (u_hold = omega_w/K_HOLD, K_HOLD ~ 8.13
 // (rad/s)/V measured at 42 rad/s), never a negative alpha.
-#define ALPHA_STALL_MAX     28.0f    // rad/s^2, cap while platform is stationary
+#define ALPHA_STALL_MAX     40.0f    // rad/s^2, cap while platform is stationary
 #define STALL_WW            30.0f    // rad/s
 #define STALL_MS             600     // ms of continuous stall before backing off
 #define STALL_HOLD_MS       2000     // ms of alpha = 0 before retrying
