@@ -19,7 +19,7 @@
     1. e     = wrap(target - theta)                         heading error
     2. alpha = -K_theta*e + K_omega*omega_p                 LQR / PD
     3. alpha += FF * friction_feedforward                   Coulomb cancel
-    4. u     = (alpha + A_2*omega_w) / A_1                    feedback linearisation
+    4. u     = (alpha + compFrac*A_2*omega_w) / A_1           feedback linearisation
     5. clamp u to +-VOLTAGE_LIMIT, write to motor.target
 
   SIGN WARNINGS -- both of these were gotten wrong at least once during
@@ -47,9 +47,15 @@
   IDENTIFIED CONSTANTS (2026-07-30 calibration runs, 48 step tests + 46
   breakaway trials):
 
-    A_1 = 40.56 rad/s^2 per V   wheel angular accel per volt from rest
-                               = K_dc / tau_w = 7.3 / 0.18
-    A_2 = 5.56  1/s             wheel damping pole = 1/tau_w
+    A_1 = 45.5 rad/s^2 per V   wheel angular accel per volt from rest
+                               = K_dc / tau_w = 8.51 / 0.187   [re-ID 2026-08-02]
+    A_2 = 5.35  1/s            wheel damping pole = 1/tau_w    [re-ID 2026-08-02]
+    compFrac = 0.85            fraction of A_2 actually applied. The
+                               linearisation is only as good as A_2; over-
+                               compensation makes the wheel loop UNSTABLE
+                               while under-compensation is merely sluggish,
+                               so this deliberately sits below 1.0. Verify
+                               with C<V> -- the wheel must coast DOWN.
     a  = 0.19                  J_w/J_p, from regressing platform rate against
                                wheel-speed change over all 48 tests (20% scatter)
     A_FRICTION = 22.3 rad/s^2  wheel accel needed to break the platform free.
@@ -159,8 +165,17 @@ Adafruit_MPU6050 mpu;
 // NAMING NOTE: these are A_1 / A_2, not A1 / A2. On STM32duino, A0-A15 are
 // predefined analog pin macros, so plain A1/A2 collide with the core headers.
 // Same reason the control mode enum is CTRL_* rather than MODE_*.
-static const float A_1          = 40.56f;   // rad/s^2 per V
-static const float A_2          = 5.56f;    // 1/s
+// RE-IDENTIFIED 2026-08-02 from six O(+/-3V) open-loop captures. The original
+// values (A_1 = 40.56, A_2 = 5.56, from the 2026-07-30 step campaign) made the
+// feedback linearisation OVER-compensate: measured DC gain came out 8.51
+// (rad/s)/V against the modelled 7.3, which left a residual pole of
+// +0.89 /s in the wheel loop -- unstable, and the cause of the first
+// closed-loop runaway to wheel saturation.
+//   K'   = 8.51 (rad/s)/V   (2.3% scatter over 6 tests)
+//   tau' = 0.187 s          (spin-up 0.181, decay 0.193)
+//   A_1  = K'/tau' = 45.5   A_2 = 1/tau' = 5.35
+static const float A_1          = 45.5f;    // rad/s^2 per V
+static const float A_2          = 5.35f;    // 1/s
 static const float A_FRICTION  = 22.3f;    // rad/s^2 (wheel) to break platform free
 static const float GYRO_SIGN   = -1.0f;    // aligns gyro with wheel convention
 
@@ -170,16 +185,24 @@ static const float GYRO_SIGN   = -1.0f;    // aligns gyro with wheel convention
 float K_theta   = 19.1f;
 float K_omega   = 14.0f;
 float ffFrac    = 0.85f;    // trim up until it overshoots, then back off
+// Fraction of the modelled A_2 actually applied in the linearisation.
+// 1.0 = trust the model exactly. Below 1.0 deliberately UNDER-compensates.
+// This asymmetry is the whole point: under-compensation leaves a stable
+// residual pole (mildly sluggish), over-compensation leaves an unstable one
+// (exponential runaway). Always err low. Verify with the C command.
+float compFrac  = 0.85f;
 float deadzone  = 0.035f;   // rad (~2 deg)
 
 // ------------------- safety -------------------
 #define W_MOVING            0.05f    // rad/s, "platform is moving" threshold
-#define WHEEL_SAT_LIMIT     45.0f    // rad/s -- abort above this
+#define WHEEL_SAT_LIMIT     25.0f    // rad/s -- abort above this.
+                                     // 25 while debugging the inner loop;
+                                     // restore to 45 for normal tuning.
 #define CONTROL_PERIOD_US   5000     // 200 Hz control loop
 #define TELEM_PERIOD_MS     100      // 10 Hz streaming telemetry in HOLD
 
 // ------------------- state -------------------
-enum CtrlMode { CTRL_IDLE, CTRL_HOLD, CTRL_STEP, CTRL_OPEN };
+enum CtrlMode { CTRL_IDLE, CTRL_HOLD, CTRL_STEP, CTRL_OPEN, CTRL_COMP };
 volatile CtrlMode ctrlMode = CTRL_IDLE;
 
 // Open-loop pulse: apply a fixed voltage for a fixed time with NO feedback.
@@ -254,7 +277,8 @@ void measureGyroBias() {
 
 void printGains() {
   printBoth("K_theta=" + String(K_theta, 2) + "  K_omega=" + String(K_omega, 2)
-            + "  ff=" + String(ffFrac, 2) + "  deadzone=" + String(degrees(deadzone), 2) + "deg");
+            + "  ff=" + String(ffFrac, 2) + "  deadzone=" + String(degrees(deadzone), 2) + "deg"
+            + "  compFrac=" + String(compFrac, 2));
   printBoth("theta=" + String(degrees(theta), 2) + "deg  target=" + String(degrees(target), 2)
             + "deg  omega_p=" + String(omega_p, 3) + "  omega_w=" + String(omega_w, 2)
             + "  mode=" + String(ctrlMode == CTRL_IDLE ? "IDLE" : (ctrlMode == CTRL_HOLD ? "HOLD" : "STEP")));
@@ -324,6 +348,29 @@ void controlUpdate(float dt) {
     return;
   }
 
+  // Compensation-only test (C command). Spin the wheel up open-loop, then
+  // command alpha = 0 with the back-EMF cancellation term still active.
+  // The wheel MUST coast down. If it holds speed the compensation is exactly
+  // neutral (no margin); if it accelerates, compFrac is too high and the
+  // closed loop will run away. This isolates the inner loop from the gains.
+  if (ctrlMode == CTRL_COMP) {
+    if (fabsf(omega_w) > WHEEL_SAT_LIMIT) {
+      stopMotor("wheel saturation " + String(omega_w, 1) + " rad/s");
+      return;
+    }
+    float u;
+    if (millis() - openStartMs < OPEN_PULSE_MS) {
+      u = openVolts;                              // spin-up, open loop
+    } else {
+      u = compFrac * A_2 * omega_w / A_1;         // alpha = 0
+    }
+    if (u >  VOLTAGE_LIMIT) u =  VOLTAGE_LIMIT;
+    if (u < -VOLTAGE_LIMIT) u = -VOLTAGE_LIMIT;
+    motor.target = u;
+    lastU = u; lastAlpha = 0.0f;
+    return;
+  }
+
   // ---- safety: wheel saturation ----
   if (fabsf(omega_w) > WHEEL_SAT_LIMIT) {
     stopMotor("wheel saturation " + String(omega_w, 1) + " rad/s");
@@ -351,7 +398,7 @@ void controlUpdate(float dt) {
   }
 
   // ---- 4. feedback linearisation: cancel back-EMF and the wheel pole ----
-  float u = (alpha + A_2 * omega_w) / A_1;
+  float u = (alpha + compFrac * A_2 * omega_w) / A_1;
 
   // ---- 5. saturate and command ----
   if (u >  VOLTAGE_LIMIT) u =  VOLTAGE_LIMIT;
@@ -401,6 +448,19 @@ void handleLine(String s) {
       theta = 0.0f; target = 0.0f;
       printBoth("heading zeroed here");
       break;
+    case 'C':
+      // Compensation-only test: spin up at V, then alpha = 0. Watch omega_w.
+      openVolts = constrain(v, -3.0f, 3.0f);
+      theta = 0.0f;
+      capN = 0; capturing = true; capStartMs = millis();
+      openStartMs = millis();
+      stepCount++;
+      ctrlMode = CTRL_COMP; controllerEnabled = true;
+      printBoth("COMP test " + String(openVolts, 2) + "V spin-up, compFrac="
+                + String(compFrac, 2) + ", capturing...");
+      printBoth("  expect: wheel coasts DOWN after the pulse. Growth = too high.");
+      break;
+    case 'K': compFrac = constrain(v, 0.0f, 1.2f); printGains(); break;
     case 'P': K_theta = v; printGains(); break;
     case 'D': K_omega = v; printGains(); break;
     case 'F': ffFrac  = constrain(v, 0.0f, 1.5f); printGains(); break;
@@ -483,8 +543,9 @@ void setup() {
 
   printGains();
   printBoth("FIRST: send O1 (open-loop pulse) to verify the gyro sign before closing the loop.");
-  printBoth("Commands: O<V> openloop | T<deg> step+capture | H<deg> hold | Z zero | P/D gains");
-  printBoth("          F<0-1> ff | W<deg> deadzone | G status | B rebias | X stop | R resume");
+  printBoth("Commands: O<V> openloop | C<V> comp-test | T<deg> step+capture | H<deg> hold");
+  printBoth("          Z zero | P/D gains | K<0-1.2> compFrac | F<0-1> ff | W<deg> deadzone");
+  printBoth("          G status | B rebias | X stop | R resume");
   printBoth("Start at K_theta=19.1 K_omega=14.0, then work down the gain table.");
   printBoth("Mode is IDLE -- send H0 or T<deg> to engage.");
 
@@ -521,7 +582,7 @@ void loop() {
         dumpCapture();
         // After an OPEN-LOOP pulse, return to IDLE -- do NOT engage the
         // closed loop, since the whole point was to verify the sign first.
-        bool wasOpen = (ctrlMode == CTRL_OPEN);
+        bool wasOpen = (ctrlMode == CTRL_OPEN || ctrlMode == CTRL_COMP);
         ctrlMode = wasOpen ? CTRL_IDLE : CTRL_HOLD;
         if (wasOpen)
           printBoth("open-loop capture done, back to IDLE. Check: positive volts "
