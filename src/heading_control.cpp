@@ -207,7 +207,18 @@ float ffFrac    = 0.90f;    // trim up until it overshoots, then back off
 // Do NOT make this direction-dependent: the measured asymmetry REVERSED sign
 // between those two runs, so a per-direction value would be wrong half the time.
 float compFrac  = 0.89f;
-float deadzone  = 0.035f;   // rad (2.0 deg) -- tuned value, matches captures
+float deadzone  = 0.035f;   // rad (2.0 deg) COARSE -- used while the wheel is
+                            // still fast and full torque is unavailable
+// FINE deadzone, used only once the wheel has unwound below FINE_WW, where the
+// controller has its full authority back. This is the "reduced-speed, tightened-
+// deadband terminal approach" from Phase 9 of the project plan, and it is what
+// makes sub-degree pointing reachable: a fine correction needs the wheel SLOW,
+// because delivered alpha = commanded - 0.84*omega_w.
+// Must stay ABOVE the achievable Coulomb deadband (1-ffFrac)*A_FRICTION/K_theta,
+// or feedforward never switches off and the wheel winds indefinitely.
+//   ff = 0.90 -> 1.36 deg floor    ff = 0.95 -> 0.68 deg    ff = 0.97 -> 0.41 deg
+float deadzoneFine = 0.0175f;  // rad (1.0 deg)
+#define FINE_WW         5.0f   // rad/s, wheel slow enough for a fine correction
 
 // ------------------- safety -------------------
 #define W_MOVING            0.05f    // rad/s, "platform is moving" threshold
@@ -244,8 +255,10 @@ float deadzone  = 0.035f;   // rad (2.0 deg) -- tuned value, matches captures
 // -10 rad/s^2 came out as -27). If it is ever revisited, it must command VOLTAGE
 // directly from the wheel's hold curve (u_hold = omega_w/K_HOLD, K_HOLD ~ 8.13
 // (rad/s)/V measured at 42 rad/s), never a negative alpha.
-#define ALPHA_STALL_MAX     40.0f    // rad/s^2, cap while platform is stationary
-#define STALL_WW            30.0f    // rad/s
+#define ALPHA_STALL_MAX     55.0f    // rad/s^2, cap while platform is stationary
+#define STALL_WW            25.0f    // rad/s -- was 30; lowered so a stuck
+                                     // platform is caught before the wheel has
+                                     // enough momentum to abort violently
 #define STALL_MS             600     // ms of continuous stall before backing off
 #define STALL_HOLD_MS       2000     // ms of alpha = 0 before retrying
 #define WHEEL_SAT_LIMIT     45.0f    // rad/s -- abort above this.
@@ -336,7 +349,8 @@ void measureGyroBias() {
 
 void printGains() {
   printBoth("K_theta=" + String(K_theta, 2) + "  K_omega=" + String(K_omega, 2)
-            + "  ff=" + String(ffFrac, 2) + "  deadzone=" + String(degrees(deadzone), 2) + "deg"
+            + "  ff=" + String(ffFrac, 2) + "  deadzone=" + String(degrees(deadzone), 2)
+            + "/" + String(degrees(deadzoneFine), 2) + "deg"
             + "  compFrac=" + String(compFrac, 2)
             + (stallHold ? "  [STALL-HOLD]" : ""));
   printBoth("theta=" + String(degrees(theta), 2) + "deg  target=" + String(degrees(target), 2)
@@ -440,7 +454,10 @@ void controlUpdate(float dt) {
 
   // ---- 1. error ----
   float e = wrapPi(target - theta);
-  bool outside   = fabsf(e) > deadzone;
+  // Two-stage tolerance: coarse while the wheel still holds momentum, fine once
+  // it has bled down and full torque is available again.
+  float dz = (fabsf(omega_w) < FINE_WW) ? deadzoneFine : deadzone;
+  bool outside   = fabsf(e) > dz;
   bool notMoving = fabsf(omega_p) < W_MOVING;
 
   // ---- 1b. stall detection: outside the deadzone, platform stationary, wheel
@@ -486,9 +503,19 @@ void controlUpdate(float dt) {
     //      never matters, because the manoeuvre finishes first, and clamping
     //      there would just slow large slews. The pathological case is pushing
     //      hard while stuck: no motion results and the wheel winds up regardless.
-    //      ALPHA_STALL_MAX must exceed A_FRICTION (22.3) or the platform could
-    //      never break free at all; 28 implies a 33 rad/s ceiling, under the 45
-    //      abort with margin.
+    //      ALPHA_STALL_MAX must exceed A_FRICTION (22.3) with REAL margin or the
+    //      platform may never break free at all. 28 was tried and FAILED
+    //      intermittently (test06, 2026-08-02 165048): 28 gives a*28 = 4.2 rad/s^2
+    //      at a = 0.15, essentially equal to the 4.24 breakaway, so whether the
+    //      platform moved was a coin flip on stiction. It sat at alpha = 28.0 for
+    //      1.8 s, never moved, and wound the wheel to 44.5 into the abort.
+    //      40 was ALSO too low (2026-08-02 170424): a terminal correction needs
+    //      delivered alpha of ~28, but delivered = commanded - 0.84*omega_w, so
+    //      arriving at 20 rad/s needs commanded 45. Steps that arrived below
+    //      ~15 rad/s landed (0.31 deg); those arriving above ~17 stalled 2-9 deg
+    //      short. 55 covers arrival up to ~32 rad/s. The implied steady wheel
+    //      speed is past the abort, but only reached if the platform stays stuck
+    //      for seconds -- which is what the stall hold below catches.
     if (notMoving) {
       if (alpha >  ALPHA_STALL_MAX) alpha =  ALPHA_STALL_MAX;
       if (alpha < -ALPHA_STALL_MAX) alpha = -ALPHA_STALL_MAX;
@@ -567,6 +594,7 @@ void handleLine(String s) {
     case 'D': K_omega = v; printGains(); break;
     case 'F': ffFrac  = constrain(v, 0.0f, 1.5f); printGains(); break;
     case 'W': deadzone = radians(fabsf(v)); printGains(); break;
+    case 'N': deadzoneFine = radians(fabsf(v)); printGains(); break;
     case 'G': printGains(); break;
     case 'B':
       ctrlMode = CTRL_IDLE; motor.target = 0.0f;
@@ -646,7 +674,8 @@ void setup() {
   printGains();
   printBoth("FIRST: send O1 (open-loop pulse) to verify the gyro sign before closing the loop.");
   printBoth("Commands: O<V> openloop | C<V> comp-test | T<deg> step+capture | H<deg> hold");
-  printBoth("          Z zero | P/D gains | K<0-1.2> compFrac | F<0-1> ff | W<deg> deadzone");
+  printBoth("          Z zero | P/D gains | K<0-1.2> compFrac | F<0-1> ff");
+  printBoth("          W<deg> coarse deadzone | N<deg> fine deadzone");
   printBoth("          G status | B rebias | X stop | R resume");
   printBoth("Start at K_theta=19.1 K_omega=14.0, then work down the gain table.");
   printBoth("Mode is IDLE -- send H0 or T<deg> to engage.");
