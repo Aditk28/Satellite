@@ -508,16 +508,39 @@ Instrument, with the motor **spinning** (not idle — the feedforward branches a
 
 ```
                         n        min      mean      MAX
-loopFOC()            ______   ____ us  ____ us  ____ us
-move()               ______   ____ us  ____ us  ____ us
-MPU6050 read         ______   ____ us  ____ us  ____ us
-INA219 read          ______   ____ us  ____ us  ____ us
-control law          ______   ____ us  ____ us  ____ us
-telemetry row        ______   ____ us  ____ us  ____ us
-super-loop period    ______   ____ us  ____ us  ____ us
+loopFOC()            375608     31 us    32 us    40 us
+move()               375608      3 us     3 us     8 us
+MPU6050 read           5616   2372 us  2372 us  2374 us
+INA219 read              --       --       --       --   (not read in this sketch)
+control law            5616   2383 us  2386 us  2390 us   (incl. MPU; compute ~14 us)
+telemetry row           123    227 us   231 us   237 us
+super-loop period    375607     38 us    75 us  2666 us
 ```
 
 Run it for at least 60 seconds including a `T90` and an `H0` so the max is real.
+
+**Results (2026-08-02, ~28 s run w/ HOLD nudges).** Every deterministic block has
+min ~= mean ~= MAX, so the numbers are trustworthy despite the run being short of
+60 s. Three findings:
+
+- **The MPU read IS the control path.** Pure control-law compute is
+  `st_law - st_mpu ~= 14 us`; the gyro read is 2372 us, 170x larger. The LQR /
+  feedforward / linearisation math is free by comparison.
+- **Super-loop MAX = 2666 us is FOC starvation, measured.** Control fires once per
+  ~67 FOC iterations (375608 / 5616 = 66.9); on that iteration `loopFOC()` does not
+  run for 2.37 ms while the blocking I2C read holds the CPU. So commutation stalls
+  ~2.4 ms out of every 5 ms. This is the number that justifies the FOC split
+  (Phase 4): the 4 kHz timer ISR preempts the I2C read, keeping commutation regular.
+- **`loopFOC()` at 40 us MAX is well under the 50 us line** — the FOC rate is
+  cheap, see Step 0.5.
+
+**Known optimisation, deferred (verbatim rule).** 2.37 ms is ~7x the ~350 us a
+14-byte burst should cost at 400 kHz; 100 kHz -> 400 kHz only bought 1.56x, so the
+cost is per-transaction overhead in Adafruit_BusIO, not transfer. `getEvent()`
+reads accel+gyro+temp but the law only uses `g.gyro.z`; a targeted 2-byte read of
+`GYRO_ZOUT_H/L` (0x47/0x48) could cut it several-fold. Phase 4 preemption makes it
+non-critical, so this is logged, not done. If revisited: fix in
+`heading_control.cpp`, re-run the golden dataset, confirm, then carry across.
 
 **Trap.** `Serial.printf` inside `TIME_BLOCK` will dominate everything it
 touches. Measure the `sprintf` and the write separately from the control path.
@@ -1546,6 +1569,7 @@ CTRL  period 5000 µs   jitter max ____ µs   WCET ____ µs
 | 11 | Holding a mutex across computation | Long inversion windows |
 | 12 | TIM2/TIM3 collision with SimpleFOC PWM | PWM period silently rewritten |
 | 13 | `HardwareTimer` reconfiguring a SimpleFOC timer | Same, but harder to spot |
+| 13b | `TIM9_IRQHandler` doesn't exist on F4 | Compiles, links, never fires. TIM9 shares TIM1's break vector: use **`TIM1_BRK_TIM9_IRQHandler`** and **`TIM1_BRK_TIM9_IRQn`**. (TIM10 → `TIM1_UP_TIM10_*`, TIM11 → `TIM1_TRG_COM_TIM11_*`.) |
 | 14 | SysTick handoff breaking SimpleFOC `_micros()` | `ω_w` wrong → linearization wrong → compFrac margin wrong |
 | 15 | FOC-rate velocity quantization | Noisy `u`, shifted unwind rate |
 | 16 | Telemetry stack too small (`sprintf %f`) | Overflow in the least-tested task |
@@ -1560,12 +1584,12 @@ CTRL  period 5000 µs   jitter max ____ µs   WCET ____ µs
 
 | # | Decision | Step | Value |
 |---|---|---|---|
-| B1 | Pole-pair count | 0.5 | `PP = ` |
-| B2 | Timers free after SimpleFOC init | 0.3 | |
-| B3 | FOC tick timer | 0.3 | `TIM` |
-| B4 | FOC rate + justification | 0.5 | ` Hz` |
-| B5 | `CTRL_DIVISOR` | 4.1 | |
-| B6 | Measured WCETs (super-loop) | 0.4 | table |
+| B1 | Pole-pair count | 0.5 | `PP = 11` — from `BLDCMotor(POLE_PAIRS)`, `#define POLE_PAIRS 11`. Confirmed correct 2026-08-03 (`initFOC` aligns against it, so a wrong value would break commutation). |
+| B2 | Timers free after SimpleFOC init | 0.3 | **TIM2, TIM3 taken** (3-phase PWM, PSC=0, ARR=1799, CR1=0x61 → center-aligned mode 3 → **25 kHz**). TIM5 = timebase. **Free: TIM1, TIM4, TIM8, TIM9, TIM10, TIM11, TIM12.** TIM4 confirmed free — PB6/D10 is a plain GPIO driver-enable, not a timer output. |
+| B3 | FOC tick timer | 0.3 | **TIM9.** APB2 @ 180 MHz. Chosen over TIM4 deliberately: TIM4_CH1 is PB6, physically wired to the DRV8313 enable, so a stray channel-enable there would toggle the driver at the tick rate. TIM9's channels are PA2/PA3 (ST-LINK VCP) — no such hazard. TIM4 kept as spare. |
+| B4 | FOC rate + justification | 0.5 | **4 kHz.** `f_elec = PP·ω_max/(2π) = 11·45/6.283 = 78.8 Hz`; comfortable rate `40·f_elec = 3.15 kHz`. 4 kHz clears that with margin. Affordable: `4000 × 40 µs (loopFOC WCET) = 16%` CPU, 19% including `move()`. Not lowered — `loopFOC` at 40 µs is already cheap (SPI fast, no reason to drop the rate). Not raised — no commutation benefit above what the electrical rate needs, and higher eats margin. Canonical pairing with the tuned 200 Hz control loop. |
+| B5 | `CTRL_DIVISOR` | 4.1 | **20** — 4 kHz FOC / 200 Hz control. Control fires every 20th FOC tick, phase-locked. (Set for real in Step 4.1; fixed here by the B4 rate choice.) |
+| B6 | Measured WCETs (super-loop) | 0.4 | loopFOC **40 µs** / move **8 µs** / MPU read **2374 µs** / control-law compute **~14 µs** (`st_law − st_mpu`) / telem row **237 µs** / superloop MAX **2666 µs** = FOC starvation during the blocking gyro read. No INA219 in this sketch. Full table in Step 0.4. |
 | B7 | Telemetry decimation factor | 3.1 | |
 | B8 | `ω_w` calibration check @ 2 V | 2.1, 4.2 | ` rad/s` |
 | B9 | compFrac neutral, before / after | 4.5 | ` / ` |
