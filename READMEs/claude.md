@@ -328,6 +328,32 @@ re-raise it.
 
   after the character. Drain until the link is quiet for 400 ms.
 
+- `STM32FreeRTOSConfig.h` (our full FreeRTOS override) MUST live in `include/`
+
+  AND `platformio.ini` build_flags MUST include `-Iinclude`. include/ alone only
+
+  reaches project TUs; the FreeRTOS *kernel* TUs (port.c, tasks.c…) need the
+
+  global `-Iinclude` or they silently use `FreeRTOSConfig_Default.h` (configASSERT
+
+  = `for(;;)` hang). Split-brain symptom: thread-context assert works (project TU)
+
+  but ISR/kernel assert hangs with no LED (kernel TU). Verify a temporary
+
+  `#pragma message` fires for port.c/tasks.c, not just faults.cpp (13 TUs, not 2).
+
+  Do NOT use `${platformio.include_dir}` in build_flags — mangles on Windows; use
+
+  relative `-Iinclude`. Cost real time in Step 1.3.
+
+- STM32duino core defines most `TIMx_IRQHandler` symbols (strong) in
+
+  `HardwareTimer.cpp` — defining your own collides at link. Use the HardwareTimer
+
+  API + `attachInterrupt`, or a timer whose vector the core leaves free (TIM9 via
+
+  `TIM1_BRK_TIM9_IRQHandler`).
+
 ## 9. Analysis pipeline
 
 ```

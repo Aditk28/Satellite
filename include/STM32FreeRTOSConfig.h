@@ -2,12 +2,18 @@
 /* ============================================================================
    STM32FreeRTOSConfig.h  —  the kernel contract (Step 1.2)
    ----------------------------------------------------------------------------
-   FILENAME IS LOad-BEARING. The STM32duino FreeRTOS library ships a wrapper
-   FreeRTOSConfig.h that does:  #if __has_include("STM32FreeRTOSConfig.h")
-   include it (and SKIP the library defaults) #else use FreeRTOSConfig_Default.h.
-   So this file, named exactly STM32FreeRTOSConfig.h, is the FULL override — we
-   are responsible for every macro the kernel needs. Anything we leave unset
-   still gets a sane default from FreeRTOS.h's own #ifndef block.
+   LOCATION IS LOad-BEARING. This lives in include/, NOT src/. The library's
+   wrapper FreeRTOSConfig.h (in .pio/libdeps/.../src/) does
+   `#if __has_include("STM32FreeRTOSConfig.h")` to decide whether to take our
+   full override or fall back to FreeRTOSConfig_Default.h. That __has_include
+   searches the wrapper's own directory and the -I include path. PlatformIO puts
+   the project include/ dir on that path but NOT src/, so a copy in src/ is
+   invisible to the kernel build and silently ignored — you get the library
+   defaults (whose configASSERT is a bare for(;;) hang: no rtAssertFail, no LED,
+   no black box). Keep this file in include/.
+
+   FILENAME is also load-bearing: it must be exactly STM32FreeRTOSConfig.h (the
+   name the wrapper probes), not FreeRTOSConfig.h.
 
    HEAP: selected by the -D configMEMMANG_HEAP_NB=3 build flag (heap_3 = a
    thread-safe wrapper around newlib malloc/free). Under heap_3, configTOTAL_
@@ -17,9 +23,9 @@
 
    SYSTICK: on STM32duino the Arduino core owns SysTick at 1 kHz and calls a weak
    osSystickHandler(); the FreeRTOS library overrides that to drive the kernel
-   tick. So (a) configTICK_RATE_HZ MUST be 1000 to match the core, and (b) we do
-   NOT alias xPortSysTickHandler -> SysTick_Handler (the core already defines
-   SysTick_Handler; aliasing it here double-defines it).
+   tick, guarded by INCLUDE_xTaskGetSchedulerState (which we set to 1). So
+   (a) configTICK_RATE_HZ MUST be 1000 to match the core, and (b) we do NOT alias
+   xPortSysTickHandler -> SysTick_Handler (the core already defines it).
    ============================================================================ */
 
 #if defined(__ICCARM__) || defined(__CC_ARM) || defined(__GNUC__)
@@ -104,7 +110,7 @@ void     rtAssertFail(const char* file, int line);
 #define INCLUDE_vTaskSuspend                      1
 #define INCLUDE_vTaskDelayUntil                   1
 #define INCLUDE_vTaskDelay                        1
-#define INCLUDE_xTaskGetSchedulerState            1
+#define INCLUDE_xTaskGetSchedulerState            1   /* guards the pre-scheduler SysTick */
 #define INCLUDE_uxTaskGetStackHighWaterMark       1   /* G-command stack check (Step 2.1) */
 #define INCLUDE_xTaskGetIdleTaskHandle            1
 #define INCLUDE_eTaskGetState                     1

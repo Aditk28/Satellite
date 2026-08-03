@@ -758,6 +758,24 @@ STM32duino-specific decisions worth remembering:
   library's wrapper `FreeRTOSConfig.h` does `#if __has_include("STM32FreeRTOSConfig.h")`
   → full override (skips `FreeRTOSConfig_Default.h`). Naming it `FreeRTOSConfig.h`
   would be silently ignored and you'd run the library defaults.
+- **It must live in `include/` AND `platformio.ini` must add `-Iinclude` to
+  `build_flags`** (fixed 2026-08-03, Step 1.3). Two-part trap:
+  - PlatformIO gives the project `src/` dir to *project* TUs only, so a config in
+    `src/` is invisible even to your own `#include`s from the kernel side — it must
+    be in `include/`.
+  - But `include/` is on the path for *project* TUs only too. The FreeRTOS
+    **library/kernel** TUs (`port.c`, `tasks.c`, …) do NOT get it unless you force
+    it globally with `-Iinclude` in `build_flags`. Without the flag you get a
+    SPLIT-BRAIN: project files (`faults.cpp`, the sketch) use your config while the
+    kernel silently uses `FreeRTOSConfig_Default.h` — whose `configASSERT` is a
+    bare `for(;;)` hang. Symptom that cost us the most time: a thread-context
+    `configASSERT` blinked the LED and latched the black box (project TU, our
+    config), but the priority-0 ISR froze with NO LED and NO record (kernel TU in
+    `port.c`, default config). It is also a latent corruption risk — kernel and app
+    disagreeing on TCB layout (`configNUM_THREAD_LOCAL_STORAGE_POINTERS`, etc.).
+  - **Verify** with a temporary `#pragma message("...")` in the config + a clean
+    build: it must fire for the kernel TUs (`port.c`, `tasks.c`, `queue.c`, `heap.c`,
+    …), not just `faults.cpp`/the sketch. We saw 13 TUs once fixed, 2 before.
 - **Own the hooks via `_BLINK=0`.** The library defines `vApplicationMallocFailedHook`
   / `vApplicationStackOverflowHook` **strong** (not weak), but only when
   `configUSE_MALLOC_FAILED_HOOK_BLINK` / `configCHECK_FOR_STACK_OVERFLOW_BLINK`
@@ -842,6 +860,32 @@ You want 3 (which on a 4-bit implementation means 4 preempt bits, 0 subpriority)
 or lower numerically. If bits are allocated to subpriority, "priority 5" won't
 preempt the way you think and `BASEPRI` masking becomes wrong. Fix with
 `HAL_NVIC_SetPriorityGrouping(NVIC_PRIORITYGROUP_4)`.
+
+**Result (2026-08-03) — PASSED, via a throwaway `p1test` env/sketch.** Harness:
+`src/p1_test.cpp` (owns setup/loop under `[env:p1test]`), a TIM7 interrupt via the
+HardwareTimer API (the core owns `TIM7_IRQHandler`, so a raw handler collides —
+Step 1.5 uses TIM9 raw instead), NVIC priority forced to `TEST_IRQ_PRIO` after
+`resume()`.
+- **Part 1** (`TEST_IRQ_PRIO = 0`, verified NVIC priority reads back 0): the ISR's
+  `vTaskNotifyGiveFromISR` trips `configASSERT` inside `vPortValidateInterruptPriority`
+  → `rtAssertFail` → LD2 single-pulse blink; reset shows
+  `previous boot died: ASSERT at port.c:756`. Kernel assert + `.noinit` black box
+  both proven; **no linker fragment needed** (orphan `.noinit` survives warm reset).
+- **Part 2** (`TEST_IRQ_PRIO = 5`): no assert, `notification N` streams at 4 Hz,
+  a clean reset reports `clean boot`.
+- **Part 3**: `PRIGROUP = 3` already (STM32duino default is group 4). No change.
+
+**The debugging that mattered:** the priority-0 assert first appeared to do
+nothing (froze, no LED, `clean boot`) while a *thread-context* `configASSERT`
+worked. Root cause was the split-brain config (see Step 1.2 result) — the kernel's
+`port.c` was compiled against `FreeRTOSConfig_Default.h` (silent `for(;;)` assert)
+until `-Iinclude` put our config on the kernel's include path. The isolation
+sequence that found it: (1) prove the machinery at prio 5 (notifications stream),
+(2) prove the safe-stop path from thread context (LED + black box), (3) read the
+ISR priority back (was correctly 0), (4) discover only 2 of 13 TUs saw our config.
+
+**Full IRQ-priority audit** (SysTick/PendSV 15, FOC tick 5, USART 6) is deferred
+to where those interrupts actually exist — 1.5 and Phase 6.
 
 ---
 
