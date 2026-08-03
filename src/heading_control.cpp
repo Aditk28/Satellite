@@ -176,7 +176,14 @@ Adafruit_MPU6050 mpu;
 //   A_1  = K'/tau' = 45.5   A_2 = 1/tau' = 5.35
 static const float A_1          = 45.5f;    // rad/s^2 per V
 static const float A_2          = 5.35f;    // 1/s
-static const float A_FRICTION  = 22.3f;    // rad/s^2 (wheel) to break platform free
+// RUNTIME TUNABLE (command A). Was a fixed 22.3, computed as 4.24/0.19 -- but
+// `a` is nearer 0.15, which makes the true break-free figure 4.24/0.15 = 28.3.
+// Running 22.3 left feedforward ~25% light: large errors had enough PD to cover
+// the gap, small ones did not, and a correction from rest at 5 deg error cleared
+// breakaway by only 10% -- a coin flip on stiction, and the cause of the
+// intermittent -90/-180 stalls. Tune with A<val> rather than measuring `a`:
+// raise until small corrections close reliably, lower if it overshoots.
+float A_FRICTION  = 28.3f;    // rad/s^2 (wheel) to break platform free
 static const float GYRO_SIGN   = -1.0f;    // aligns gyro with wheel convention
 
 // ------------------- runtime-tunable gains -------------------
@@ -217,7 +224,14 @@ float deadzone  = 0.035f;   // rad (2.0 deg) COARSE -- used while the wheel is
 // Must stay ABOVE the achievable Coulomb deadband (1-ffFrac)*A_FRICTION/K_theta,
 // or feedforward never switches off and the wheel winds indefinitely.
 //   ff = 0.90 -> 1.36 deg floor    ff = 0.95 -> 0.68 deg    ff = 0.97 -> 0.41 deg
-float deadzoneFine = 0.0175f;  // rad (1.0 deg)
+// 2.0 deg. Was 1.0 and that was a BUG: at ffFrac = 0.90 and K_theta = 119.3 the
+// floor is (1-0.90)*22.3/119.3 = 1.07 deg nominal, ~1.36 deg using the true
+// friction figure -- so 1.0 deg was UNREACHABLE. The controller kept pushing,
+// feedforward never switched off, and the wheel wound back up into a stall.
+// At 2.0 deg both stages are equal, i.e. a single 2 deg tolerance, which is the
+// configuration that produced the clean 15-step envelope (1.20 deg mean error).
+// To go tighter you must raise ffFrac FIRST -- see the floor table above.
+float deadzoneFine = 0.035f;
 #define FINE_WW         5.0f   // rad/s, wheel slow enough for a fine correction
 
 // ------------------- safety -------------------
@@ -290,6 +304,9 @@ float lastAlpha  = 0.0f;
 bool  stallHold = false;
 unsigned long stallStartMs = 0;
 unsigned long stallHoldUntil = 0;
+int   stallCount = 0;         // consecutive stalls against the same target
+bool  parked = false;         // gave up retrying; hold until a new target
+#define MAX_STALL_RETRIES 3
 float lastU      = 0.0f;
 bool  controllerEnabled = true;
 
@@ -324,7 +341,7 @@ void stopMotor(const String &why) {
   controllerEnabled = false;
   ctrlMode = CTRL_IDLE;
   capturing = false;
-  stallHold = false; stallStartMs = 0;
+  stallHold = false; stallStartMs = 0; parked = false; stallCount = 0;
   motor.target = 0.0f;
   motor.loopFOC();
   motor.move();
@@ -347,12 +364,28 @@ void measureGyroBias() {
   printBoth("[GYRO] bias = " + String(gyroBias, 4) + " dps");
 }
 
+// The smallest heading error the controller can actually close, set by the
+// friction that feedforward does not cancel. Any deadzone below this can never
+// be reached: the controller pushes forever and the wheel winds up.
+float deadbandFloorDeg() {
+  return degrees((1.0f - ffFrac) * A_FRICTION / K_theta);
+}
+
 void printGains() {
   printBoth("K_theta=" + String(K_theta, 2) + "  K_omega=" + String(K_omega, 2)
             + "  ff=" + String(ffFrac, 2) + "  deadzone=" + String(degrees(deadzone), 2)
             + "/" + String(degrees(deadzoneFine), 2) + "deg"
             + "  compFrac=" + String(compFrac, 2)
-            + (stallHold ? "  [STALL-HOLD]" : ""));
+            + (stallHold ? "  [STALL-HOLD]" : "")
+            + (parked ? "  [PARKED]" : ""));
+  printBoth("A_FRICTION=" + String(A_FRICTION, 1)
+            + "  ff*A_F=" + String(ffFrac * A_FRICTION, 1)
+            + "  (break-free from rest needs about 28)");
+  float floorDeg = deadbandFloorDeg();
+  printBoth("deadband floor=" + String(floorDeg, 2) + "deg"
+            + (degrees(deadzoneFine) < floorDeg
+               ? "  <-- WARNING: fine deadzone is BELOW the floor, raise N or F"
+               : "  (both deadzones clear it)"));
   printBoth("theta=" + String(degrees(theta), 2) + "deg  target=" + String(degrees(target), 2)
             + "deg  omega_p=" + String(omega_p, 3) + "  omega_w=" + String(omega_w, 2)
             + "  mode=" + String(ctrlMode == CTRL_IDLE ? "IDLE" : (ctrlMode == CTRL_HOLD ? "HOLD" : "STEP")));
@@ -464,11 +497,21 @@ void controlUpdate(float dt) {
   //      already fast. Back off and let the passive unwind restore authority. ----
   if (outside && notMoving && fabsf(omega_w) > STALL_WW) {
     if (stallStartMs == 0) stallStartMs = millis();
-    else if (millis() - stallStartMs > STALL_MS && !stallHold) {
+    else if (millis() - stallStartMs > STALL_MS && !stallHold && !parked) {
       stallHold = true;
       stallHoldUntil = millis() + STALL_HOLD_MS;
-      printBoth("STALL at " + String(degrees(e), 1) + " deg, ww="
-                + String(omega_w, 1) + " -- backing off");
+      stallCount++;
+      if (stallCount > MAX_STALL_RETRIES) {
+        // Retrying is not working; without this the loop runs forever.
+        parked = true;
+        printBoth("PARKED at " + String(degrees(e), 1) + " deg after "
+                  + String(MAX_STALL_RETRIES) + " stalls -- raise A, or accept."
+                  " Send a new target to resume.");
+      } else {
+        printBoth("STALL at " + String(degrees(e), 1) + " deg, ww="
+                  + String(omega_w, 1) + " -- backing off ("
+                  + String(stallCount) + "/" + String(MAX_STALL_RETRIES) + ")");
+      }
     }
   } else {
     stallStartMs = 0;
@@ -480,7 +523,7 @@ void controlUpdate(float dt) {
 
   float alpha;
 
-  if (stallHold) {
+  if (stallHold || parked) {
     // ---- 2a. command nothing; the passive unwind bleeds the wheel down ----
     alpha = 0.0f;
 
@@ -562,6 +605,7 @@ void handleLine(String s) {
       printBoth("  expect: wheel POSITIVE, theta NEGATIVE (for positive volts)");
       break;
     case 'T':
+      parked = false; stallCount = 0; stallHold = false; stallStartMs = 0;
       target = wrapPi(radians(v));
       capN = 0; capturing = true; capStartMs = millis();
       stepCount++;
@@ -569,12 +613,14 @@ void handleLine(String s) {
       printBoth("STEP -> " + String(v, 1) + " deg, capturing...");
       break;
     case 'H':
+      parked = false; stallCount = 0; stallHold = false; stallStartMs = 0;
       target = wrapPi(radians(v));
       ctrlMode = CTRL_HOLD; controllerEnabled = true;
       printBoth("HOLD -> " + String(v, 1) + " deg");
       break;
     case 'Z':
       theta = 0.0f; target = 0.0f;
+      parked = false; stallCount = 0; stallHold = false; stallStartMs = 0;
       printBoth("heading zeroed here");
       break;
     case 'C':
@@ -589,12 +635,20 @@ void handleLine(String s) {
                 + String(compFrac, 2) + ", capturing...");
       printBoth("  expect: wheel coasts DOWN after the pulse. Growth = too high.");
       break;
+    case 'A': A_FRICTION = constrain(v, 0.0f, 60.0f); printGains(); break;
     case 'K': compFrac = constrain(v, 0.0f, 1.2f); printGains(); break;
     case 'P': K_theta = v; printGains(); break;
     case 'D': K_omega = v; printGains(); break;
     case 'F': ffFrac  = constrain(v, 0.0f, 1.5f); printGains(); break;
     case 'W': deadzone = radians(fabsf(v)); printGains(); break;
-    case 'N': deadzoneFine = radians(fabsf(v)); printGains(); break;
+    case 'N':
+      deadzoneFine = radians(fabsf(v));
+      if (degrees(deadzoneFine) < deadbandFloorDeg())
+        printBoth("WARNING: " + String(v, 2) + " deg is below the "
+                  + String(deadbandFloorDeg(), 2)
+                  + " deg floor -- raise F first or this will stall");
+      printGains();
+      break;
     case 'G': printGains(); break;
     case 'B':
       ctrlMode = CTRL_IDLE; motor.target = 0.0f;
@@ -675,7 +729,7 @@ void setup() {
   printBoth("FIRST: send O1 (open-loop pulse) to verify the gyro sign before closing the loop.");
   printBoth("Commands: O<V> openloop | C<V> comp-test | T<deg> step+capture | H<deg> hold");
   printBoth("          Z zero | P/D gains | K<0-1.2> compFrac | F<0-1> ff");
-  printBoth("          W<deg> coarse deadzone | N<deg> fine deadzone");
+  printBoth("          W<deg> coarse dz | N<deg> fine dz | A<val> friction magnitude");
   printBoth("          G status | B rebias | X stop | R resume");
   printBoth("Start at K_theta=19.1 K_omega=14.0, then work down the gain table.");
   printBoth("Mode is IDLE -- send H0 or T<deg> to engage.");

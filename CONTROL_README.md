@@ -1,70 +1,54 @@
-# Reaction Wheel Attitude Control — Complete Reference
+# Reaction Wheel Attitude Control
 
-Everything about the rotation control subsystem: system identification, model
-derivation, structural findings, control design, firmware, analysis tooling,
-and the full history of what was measured and what went wrong.
+Closed-loop heading control of a free-floating platform using a single reaction
+wheel. System identification, control design, firmware, tuning procedure, and
+measured performance.
 
-**Status as of this document:** the plant is fully identified, the controller
-is written and flashed, and the first closed-loop test has not yet been run.
-Translation (fans) is not started.
+**Status:** working, tuning incomplete. Closed loop validated across a ±30° to
+±180° envelope at a mean final error of 1.20° and 1.6 s settling, but the
+terminal approach is **inconsistent** — roughly half of large negative slews
+stall a few degrees short and need a retry. Cause is understood and documented
+in §7 and §17; the fix needs a friction recalibration that has been deliberately
+deferred. Translation (fans) not started.
+
+**Why deferred:** adding the fan subsystem changes the platform's mass,
+inertia, and friction, so every constant here has to be re-identified anyway.
+Tuning twice is wasted work — the plan is to finish the RTOS merge, build
+translation, then run one full identification and tuning campaign across all
+three axes at once.
 
 ---
 
-## Table of contents
+## Contents
 
-1. [Scope and status](#1-scope-and-status)
-2. [The plant](#2-the-plant)
-3. [Symbol reference](#3-symbol-reference)
-4. [Identified constants](#4-identified-constants)
-5. [Model derivation](#5-model-derivation)
-6. [Discovery 1 — the system is not fully controllable](#6-discovery-1--the-system-is-not-fully-controllable)
-7. [Discovery 2 — friction exceeds the maneuver](#7-discovery-2--friction-exceeds-the-maneuver)
-8. [Friction in depth](#8-friction-in-depth)
-9. [The control law](#9-the-control-law)
-10. [LQR](#10-lqr)
+1. [The plant](#1-the-plant)
+2. [Measured performance, and where it is inconsistent](#2-measured-performance)
+3. [Identified constants](#3-identified-constants)
+4. [Model derivation](#4-model-derivation)
+5. [Discovery 1 — the system is not fully controllable](#5-discovery-1--the-system-is-not-fully-controllable)
+6. [Discovery 2 — friction exceeds the maneuver](#6-discovery-2--friction-exceeds-the-maneuver)
+7. [Discovery 3 — the linearization must under-compensate](#7-discovery-3--the-linearization-must-under-compensate)
+8. [The control law](#8-the-control-law)
+9. [Gain selection and LQR](#9-gain-selection-and-lqr)
+10. [Momentum management](#10-momentum-management)
 11. [The estimator](#11-the-estimator)
-12. [Calibration campaign](#12-calibration-campaign)
-13. [Data formats](#13-data-formats)
-14. [Firmware](#14-firmware)
-15. [Analysis pipeline](#15-analysis-pipeline)
-16. [Tuning procedure](#16-tuning-procedure)
-17. [Bugs and gotchas](#17-bugs-and-gotchas)
-18. [Open items](#18-open-items)
-19. [Translation subsystem — future](#19-translation-subsystem--future)
+12. [Firmware and commands](#12-firmware-and-commands)
+13. [Tuning procedure](#13-tuning-procedure)
+14. [Calibration history](#14-calibration-history)
+15. [Data formats and analysis pipeline](#15-data-formats-and-analysis-pipeline)
+16. [Bugs and gotchas](#16-bugs-and-gotchas)
+17. [Open items](#17-open-items)
+18. [Translation subsystem — future](#18-translation-subsystem--future)
 
 ---
 
-## 1. Scope and status
+## 1. The plant
 
-### Done
-
-- Reaction wheel driven in torque/voltage mode via SimpleFOC + MT6701 encoder
-- Five calibration campaigns, ~110 logged trials
-- Full plant identification: motor electrical, wheel dynamics, momentum
-  coupling, friction character and magnitude, sensor biases and sign conventions
-- Two structural properties discovered that invalidate the naive control approach
-- Control law designed: feedback linearization + LQR/PD + Coulomb feedforward
-- Firmware written with runtime-tunable gains and an open-loop sign-check mode
-- Analysis pipeline: capture → filter → plot → animated replay
-
-### Not done
-
-- First closed-loop run (controller flashed, untested)
-- Gain tuning on hardware
-- Vision (AprilTag) and Kalman filter — currently gyro-only heading
-- RTOS integration (still a super-loop)
-- Momentum desaturation routine
-- Everything translation-related
-
----
-
-## 2. The plant
-
-A platform rotates freely on three ball transfer units. Bolted to it is a BLDC
-gimbal motor whose rotor carries a flywheel. There is no external actuator.
+A platform rides on three ball transfer units. Bolted to it is a BLDC gimbal
+motor whose rotor carries a flywheel. There is no external actuator.
 
 The platform turns itself by trading angular momentum with the wheel: when the
-motor pushes the wheel one way, Newton's third law pushes the platform the
+motor accelerates the wheel one way, Newton's third law pushes the platform the
 other. This is how spacecraft point themselves.
 
 **The control problem:** given a target heading, compute a motor voltage such
@@ -80,110 +64,133 @@ that the platform reaches that heading and stays there.
 | SimpleFOC Mini (DRV8313) | 3-phase gate driver, no onboard MCU |
 | MPU6050 | platform angular rate (gyro Z) |
 | INA219 | bus voltage and current on the motor supply |
-| HC-05 | wireless telemetry and command |
+| HC-05 | wireless telemetry and command, 115200 baud |
 
 The driver is a bare gate driver, so the Nucleo runs the FOC loop itself
-(SimpleFOC library, STM32duino core under PlatformIO).
+(SimpleFOC library, STM32duino core under PlatformIO). Torque/voltage mode —
+true current-sensed FOC is not possible without added hardware, but voltage-mode
+torque control is adequate at this torque/speed scale.
 
 ---
 
-## 3. Symbol reference
+## 2. Measured performance
 
-### State
+Full envelope, 2026-08-02, `Z` before every step (run `165048`, 14 valid tests):
 
-| symbol | meaning | units | source |
-|---|---|---|---|
-| `θ_p` | platform heading | rad | integrated gyro |
-| `ω_p` | platform angular rate | rad/s | MPU6050 gyro Z |
-| `ω_w` | wheel angular rate | rad/s | `motor.shaft_velocity` |
-| `θ_w` | wheel angle | rad | `sensor.getAngle()` |
-
-### Control
-
-| symbol | meaning | units |
+| slew | final error (+) | final error (−) |
 |---|---|---|
-| `α_cmd` | commanded wheel angular acceleration | rad/s² |
-| `U_q` | q-axis voltage — what gets written to `motor.target` | V |
-| `e` | heading error, `θ_target − θ_p`, wrapped to ±π | rad |
+| 30° | 0.42° | 0.77° |
+| 60° | 1.93° | 1.75° |
+| 90° | 0.62° | 1.14° |
+| 120° | 1.95° / 1.00° | 0.93° |
+| 150° | 1.88° | 0.61° |
+| 180° | 1.76° | 0.73° / 1.28° |
 
-### Motor electrical
+- **Mean final error 1.20°, worst 1.95°** — every step inside the 2° deadzone
+- **Settling to ±2°: mean 1.57 s, worst 4.05 s**
+- **Rise time 0.37–0.51 s, flat across all slew sizes** (see below)
+- **Peak wheel speed 9–42 rad/s**, scaling with slew size; wheel returns to
+  approximately zero on its own after every step
+- **Peak `U_q` 1.9–9.4 V** of a 10 V limit
+- Direction asymmetry in final error: 1.31° positive vs 1.05° negative —
+  negligible. Apparent asymmetry in earlier batches was an artifact of not
+  zeroing heading between tests.
 
-| symbol | meaning | units |
-|---|---|---|
-| `I_q` | q-axis current (torque-producing) | A |
-| `R` | winding resistance | Ω |
-| `K_v` | back-EMF constant | V/(rad/s) |
-| `K_t` | torque constant (= `K_v` numerically in SI) | N·m/A |
-| `τ` | motor torque | N·m |
+### Where it is inconsistent
 
-**On the "q-axis":** FOC transforms the three phase currents into two
-components — `d` (radial, produces no torque) and `q` (tangential, produces all
-of it). SimpleFOC drives `d` to zero and modulates `q`. So `U_q` is the useful
-voltage and `I_q` the useful current.
+The envelope figures above are the runs that completed. They are not the whole
+picture:
 
-### Plant parameters
+- **Roughly half of large negative slews (−90°, −180°) stall 3–6° short.** The
+  stall detector catches it and retries, and the retry usually lands, but not
+  always — one observed session cycled stall → retry → stall until stopped
+  manually.
+- **The cause is `A_FRICTION` being too small**, not the gains. See §7. A
+  correction from rest at 5° error was clearing the breakaway threshold by only
+  about 10%, which makes success a coin flip on stiction. Raising `A_FRICTION`
+  from 22.3 toward 28.3 improves it but has not been swept properly.
+- **Small errors are the hard case, not large ones.** At 90° of error the PD term
+  alone dwarfs friction. At 5° it contributes almost nothing and feedforward has
+  to do all the work, which is exactly where its magnitude error shows.
 
-| symbol | meaning | units |
-|---|---|---|
-| `J_w`, `J_p` | wheel and platform moments of inertia | kg·m² |
-| `a` | `J_w/J_p`, momentum coupling ratio | — |
-| `A_1` | wheel angular accel per volt from rest | (rad/s²)/V |
-| `A_2` | wheel damping pole, `1/τ_w` | 1/s |
-| `τ_w` | wheel time constant | s |
-| `T_c` | Coulomb friction torque | N·m |
+Everything above ~10° of error is reliable. The last few degrees are not.
 
-### Controller
+**Rise time being flat from 30° to 180° is the most informative number here.**
+A linear system's rise time grows with step size. This one's does not, because
+the response is dominated by Coulomb feedforward and the deadzone rather than by
+the PD law — `alpha` is exactly zero for roughly 83% of a typical capture. The
+controller is better described as "break stiction, coast, stop" than as a
+second-order system, and the second-order design is what sets the coast rate.
 
-| symbol | meaning |
-|---|---|
-| `K_θ` | heading error gain |
-| `K_ω` | rate gain |
-| `ω_n` | closed-loop natural frequency, rad/s |
-| `ζ` | damping ratio (0.7 throughout) |
+Overshoot runs 2–7%, implying ζ ≈ 0.56 rather than the designed 0.7. Left
+alone: 12% overshoot settling in 1.2 s with sub-degree error is a good operating
+point.
 
 ---
 
-## 4. Identified constants
+## 3. Identified constants
 
-Everything the controller needs, and where each number came from.
+Everything the controller uses, and where each number came from.
 
 | constant | value | units | provenance |
 |---|---|---|---|
-| `R` | 0.788 | Ω | least-squares over 24 from-rest tests, using INA219-derived `I_q` |
-| `K_v` | 0.113 | V/(rad/s) | same regression |
-| `K` (DC gain) | 7.3 | (rad/s)/V | steady-state wheel speed vs command |
-| `τ_w` | 0.18 | s | 63% rise time of wheel step response |
-| **`A_1`** | **40.56** | (rad/s²)/V | `K/τ_w` — used by firmware |
-| **`A_2`** | **5.56** | 1/s | `1/τ_w` — used by firmware |
-| **`a = J_w/J_p`** | **0.19** | — | regression of platform rate vs wheel-speed change, 48 tests, 20% scatter |
+| **`A_1`** | **45.5** | (rad/s²)/V | `K'/τ'` from six ±3 V open-loop captures |
+| **`A_2`** | **5.35** | 1/s | `1/τ'`, same captures |
+| `K'` | 8.51 | (rad/s)/V | wheel plateau ÷ command, 2.3% scatter over 6 tests |
+| `τ'` | 0.187 | s | spin-up 0.181, free decay 0.193 |
+| **`a = J_w/J_p`** | **0.19** *(nominal)* | — | regression of platform rate vs wheel-speed change, 48 tests, 20% scatter. **Evidence says the true value is 0.15–0.17** — see note below |
+| **`A_FRICTION`** | **28.3** *(runtime tunable, `A<val>`)* | rad/s² | `4.24/a`. Was fixed at 22.3 using `a` = 0.19; raised to 28.3 for `a` = 0.15. **Not swept — the main known tuning gap** |
 | platform Coulomb friction | 4.24 | rad/s² | breakaway sweep, 0.55 V step |
-| **`A_FRICTION`** | **22.3** | rad/s² | `4.24/0.19` — wheel-accel equivalent, used by firmware |
+| **`compFrac`** | **0.89** | — | fraction of `A_2` actually applied; measured neutral point 0.892 |
+| `deadzone` / `deadzoneFine` | 2.0° / 2.0° | deg | equal, i.e. a single 2° tolerance. Fine was 1.0° and that was below the reachable floor — see §10 |
+| residual wheel pole at `compFrac` | −0.84 | 1/s | from the stall condition, §7 |
 | motor deadband | 0.35 | V | staircase run; below this the wheel does not sustain rotation |
-| gyro bias | 0.42–0.46 | dps | at-rest phase-A windows; re-measured every boot |
+| `K_HOLD` | 8.13 | (rad/s)/V | wheel speed sustained per volt at 42 rad/s |
+| gyro bias | 0.42–0.46 | dps | at-rest windows; re-measured every boot |
 | **`GYRO_SIGN`** | **−1** | — | gyro and encoder use opposite conventions |
-| max authority | 77 | rad/s² | `a·A_1·10 V` |
+| `R`, `K_v` | 0.788 Ω, 0.113 V/(rad/s) | | least-squares over 24 from-rest tests. **Not used by the controller** — kept because absolute torque units need them |
+
+### On `a`, and why it is not being chased
+
+`a` is the only plant parameter in the gain formulas, and it is the least
+certain number in the project. Every estimate from motion data is biased low by
+Coulomb friction, which eats platform acceleration:
+
+| window | `a` estimate |
+|---|---|
+| 0.01–0.08 s | 0.159 |
+| 0.01–0.13 s | 0.151 |
+| 0.02–0.20 s | 0.140 |
+| 0.05–0.30 s | 0.122 |
+
+Extrapolating toward t → 0 gives roughly 0.16–0.17. A geometric measurement
+(`½mR²`) would settle it but has not been done.
+
+**This is deliberately left alone**, and `A_FRICTION` is tuned empirically
+instead (command `A<val>`). Nothing downstream depends on knowing `a` precisely,
+because the gains were tuned on hardware rather than computed from it. What `a`
+uncertainty does explain, and what matters to keep in mind:
+
+- `A_FRICTION` was originally computed as `4.24/0.19 = 22.3`. If `a` is 0.15 the
+  true figure is 28.3, so feedforward was running **~25% light**. Large errors
+  had enough PD to cover the gap; small ones did not. This is the direct cause of
+  the intermittent terminal stalls in §2. The code only ever uses the product
+  `ffFrac × A_FRICTION`, so either can absorb the correction — but the constant
+  was wrong, not the fraction.
+- Two authority-clamp values (`ALPHA_STALL_MAX` = 28, then 40) were sized against
+  `a = 0.19` and both failed on hardware. See §16.
 
 ### Why `A_1` and `A_2` rather than `J_w`
 
-`A_1` and `A_2` are measured end-to-end from input to output, so they are
-immune to convention questions — SimpleFOC's voltage scaling, phase-vs-line
-resistance, modulation factors. Trying to back out an absolute `J_w` gives
-~0.0035 kg·m², far larger than an HDD platter should be, which signals an
-unaccounted convention factor somewhere.
-
-**This does not matter.** Nothing in the controller uses `J_w` alone. Only the
-ratio `a` and the end-to-end gains appear.
-
-### `R` and `K_v` are not used by the controller
-
-They were expensive to obtain (the whole INA219 detour) and the firmware never
-touches them. They are physically interesting, needed for absolute torque
-units, and would be required for any model-based work in SI — but the control
-law runs entirely on `A_1`, `A_2`, `A_FRICTION`, and `GYRO_SIGN`.
+They are measured end-to-end from input to output, so they are immune to
+convention questions — SimpleFOC's voltage scaling, phase-vs-line resistance,
+modulation factors. Backing out an absolute `J_w` gives ~0.0035 kg·m², far larger
+than an HDD platter should be, which signals an unaccounted convention factor.
+Nothing in the controller uses `J_w` alone, so it does not matter.
 
 ---
 
-## 5. Model derivation
+## 4. Model derivation
 
 ### Step 1 — voltage to current
 
@@ -193,19 +200,16 @@ A motor is a resistor and a generator in one package:
 I_q = (U_q − K_v·ω_w) / R
 ```
 
-Inductance is neglected: the electrical time constant `L/R` is microseconds,
-against a 180 ms mechanical time constant. Current is effectively instantaneous.
-
-**The intuition is in the back-EMF term.** At standstill, 1 V pushes
-`1/0.788 = 1.27 A`. As the wheel speeds up it generates `0.113·ω_w` volts
-against you. At `ω_w = 8.85 rad/s` back-EMF equals your 1 V, current hits zero,
-torque hits zero. That is why wheel speed plateaus — and the measured 7.3
-rad/s per volt sits slightly below 8.85 because friction takes a cut.
+At standstill 1 V pushes `1/0.788 = 1.27 A`. As the wheel speeds up it generates
+`0.113·ω_w` volts against you; current and torque fall to zero at
+`ω_w = 8.85 rad/s`. That is why wheel speed plateaus, and why the measured 8.51
+rad/s per volt sits below 8.85 — friction takes a cut. Inductance is neglected:
+`L/R` is microseconds against a 187 ms mechanical time constant.
 
 ### Step 2 — current to torque
 
 ```
-τ = K_t · I_q
+τ = K_t·I_q
 ```
 
 ### Step 3 — torque splits between two bodies
@@ -219,37 +223,43 @@ The minus sign is the entire mechanism.
 
 ### Step 4 — combined wheel dynamics
 
+Chaining the three gives a first-order lag — a push term minus a drag term:
+
 ```
-ω̇_w = A_1·U_q − A_2·ω_w = 40.56·U_q − 5.56·ω_w
+ω̇_w = A_1·U_q − A_2·ω_w = 45.5·U_q − 5.35·ω_w
 ```
+
+`A_1 = K_t/(R·J_w)` and `A_2 = K_t·K_v/(R·J_w)` in principle, but both were
+measured directly: steady state gives `A_1/A_2 = K' = 8.51`, and the 63% rise
+time gives `1/A_2 = τ' = 0.187 s`.
 
 ### Step 5 — full state space
 
-With `x = [θ_p, ω_p, ω_w]` and input `U_q`, friction dropped:
+With `x = [θ_p, ω_p, ω_w]` and input `U_q`, friction dropped. Every entry is
+`a`, `A_1`, `A_2`, or a 1 — the matrix contains no new information, but it
+permits questions the scalar equations cannot answer:
 
 ```
       ⎡0   1      0   ⎤        ⎡  0  ⎤
-A  =  ⎢0  −c   1.056  ⎥   B =  ⎢−7.71⎥
-      ⎣0   0   −5.56  ⎦        ⎣40.56⎦
+A  =  ⎢0  −c   1.016  ⎥   B =  ⎢−8.65⎥
+      ⎣0   0   −5.35  ⎦        ⎣45.5 ⎦
 ```
 
-This formulation is what revealed the first structural problem.
+The first question asked of it returned a bad answer.
 
 ---
 
-## 6. Discovery 1 — the system is not fully controllable
+## 5. Discovery 1 — the system is not fully controllable
 
 ### The evidence
 
 Controllability matrix `[B, AB, A²B]` returns **rank 2 of 3**, determinant
-exactly zero — not a numerical artifact. PBH test localizes it to the λ = 0
-mode. The left eigenvector identifies the untouchable combination:
+exactly zero — not a numerical artifact. PBH localizes it to the λ = 0 mode. The
+left eigenvector identifies the untouchable combination:
 
 ```
-c·θ_p + ω_p + 0.19·ω_w = constant
+c·θ_p + ω_p + a·ω_w = constant          (verified: wᵀB = −2.3×10⁻¹⁶)
 ```
-
-Verified: `wᵀB = −2.3×10⁻¹⁶`. The input genuinely cannot affect it.
 
 ### What it means
 
@@ -258,95 +268,75 @@ momentum between wheel and platform, never change the total. This is precisely
 why real spacecraft carry magnetorquers or thrusters — a reaction wheel cannot
 desaturate itself.
 
-**Consequence:** from rest to rest, `c·θ_final = c·θ_initial`. Under pure
-viscous friction the platform *cannot hold a new heading with the wheel
-stopped*. It can only park at an offset while the wheel keeps spinning — 1 V
-holds about 20° with the wheel at 7.3 rad/s.
+**Consequence:** from rest to rest under pure viscous friction, the platform
+*cannot hold a new heading with the wheel stopped*. It can only park at an offset
+while the wheel keeps spinning — 1 V holds about 20°. Adding an integrator does
+not fix it (rank 3 of 4) and the LQR solve fails with "no finite solution."
 
-Adding an integrator does not fix it (rank 3 of 4) and the LQR solve fails
-outright with a "no finite solution" error.
-
-### The experiment that showed it first
-
-The voltage staircase measured exactly this before it was derived: platform
-peak rate stayed flat at **1.0–2.2 dps from 0.35 V to 0.80 V** while wheel
-speed climbed **1.7 → 6.4 rad/s**. Constant voltage produced no sustained
-rotation. The theory came after the data.
+The voltage staircase measured this before it was derived: platform peak rate
+stayed flat at **1.0–2.2 dps from 0.35 V to 0.80 V** while wheel speed climbed
+**1.7 → 6.4 rad/s**. Constant voltage produced no sustained rotation.
 
 ### The fix — feedback linearization
 
-Platform torque depends on wheel *acceleration*, and `ω_w` is measured. So
-invert the wheel equation:
+The platform does not care about voltage. It cares about wheel *acceleration*,
+and `ω_w` is measured. So stop treating voltage as the input, treat
+`α = ω̇_w` as the input, and solve the wheel equation backwards:
 
 ```
-U_q = (α_cmd + 5.56·ω_w) / 40.56
+U_q = (α + A_2·ω_w) / A_1
 ```
 
-The `5.56·ω_w` term pre-cancels back-EMF; whatever remains produces exactly the
-commanded acceleration. The plant becomes:
+The `A_2·ω_w` term pre-cancels back-EMF at whatever speed the wheel happens to
+be at; whatever remains produces the commanded acceleration. The wheel state
+disappears from the model — absorbed into the input transformation — leaving:
 
 ```
-θ̈_p = −0.19·α_cmd
+θ̈_p = −a·α
 ```
 
-A double integrator — fully controllable, and the best-understood plant in
-control theory.
+A double integrator. Two states, rank 2 of 2, **controllable**, and the
+best-understood plant in control theory.
 
 ---
 
-## 7. Discovery 2 — friction exceeds the maneuver
+## 6. Discovery 2 — friction exceeds the maneuver
 
 Converting everything to platform angular acceleration:
 
 | quantity | value |
 |---|---|
-| max authority (10 V) | 77 rad/s² |
+| max authority (10 V) | 86 rad/s² |
 | **Coulomb friction** | **4.24 rad/s²** |
 | 90° slew in 2 s requires | 1.57 rad/s² |
 
-**Friction is nearly three times the maneuver itself.** Not a small correction —
-the dominant term.
+**Friction is nearly three times the maneuver itself.** Not a correction — the
+dominant term.
 
 ### The deadband this creates
 
-The controller commands platform acceleration `a·K_θ·e`. Motion only occurs
-above 4.24 rad/s², so there is a deadband in heading error:
+The controller commands platform acceleration `a·K_θ·e`. Motion only occurs above
+4.24 rad/s², so there is a deadband in heading error:
 
 ```
-|e| > 4.24 / (0.19·K_θ)
+|e| > 4.24 / (a·K_θ)
 ```
 
-| `K_θ` | settle time | deadband |
-|---|---|---|
-| 3.16 | 7.2 s | 404° |
-| 14.1 | 3.5 s | 90° |
-| 43.0 | 2.0 s | 30° |
-| 100 | 1.3 s | 13° |
+| `K_θ` | deadband |
+|---|---|
+| 19.1 | 67° |
+| 43.0 | 30° |
+| 119.3 | 11° |
 
-**Pure feedback cannot point this platform at any sane gain.** Reaching a 2°
-deadband by gain alone would need `K_θ ≈ 640`, wildly unstable.
+**Pure feedback cannot point this platform at any sane gain.** Reaching 2° by
+gain alone would need `K_θ ≈ 640`, wildly unstable.
 
-### Why this matters more than it sounds
-
-Without knowing this, the failure mode during tuning is: raise P, nothing
-happens, raise it more, nothing, keep going, hit instability before ever
-achieving pointing. That is not resolvable by more tuning. You would have to
-independently invent Coulomb feedforward, realize it needs two opposite-signed
-branches, and guess its magnitude.
-
----
-
-## 8. Friction in depth
+**This was reproduced exactly on hardware.** With feedforward disabled at
+`K_θ = 19.1`, a hand nudge stalled at 28.16° with `alpha = 9.39`, i.e. a
+commanded platform acceleration of 1.78 rad/s² against a 4.24 breakaway. The
+predicted deadband was 67°; the observed stall sat comfortably inside it.
 
 ### Viscous vs Coulomb
-
-- **Viscous:** `τ = b·ω`. Scales with speed. Move slowly, feel almost nothing.
-  Like moving through honey.
-- **Coulomb:** `τ = T_c·sign(ω)`. Constant magnitude opposing motion,
-  independent of speed. Like dragging a box across concrete — the hard part is
-  starting.
-
-### Which one this rig has
 
 Fitting both models to all 48 tests:
 
@@ -358,24 +348,21 @@ Fitting both models to all 48 tests:
 
 **Coulomb wins in 43 of 48 tests.** Physically sensible — rolling resistance in
 ball bearings is closer to constant drag than rate-proportional. The viscous
-coefficient also came out with **84% scatter** (4.05 ± 3.39), the signature of
-fitting the wrong model form.
+coefficient came out with **84% scatter** (4.05 ± 3.39), the signature of fitting
+the wrong model form.
 
 ### Feedforward — the fix
 
 ```c
-if (fabsf(e) > deadzone) {
-    float ff;
-    if (fabsf(ω_p) > W_MOVING)
-        ff = −A_FRICTION * sign(ω_p);   // MOVING: cancel friction opposing motion
-    else
-        ff =  A_FRICTION * sign(α);     // STUCK:  push to break free
-    α += FF_FRACTION * ff;
+if (|e| > deadzone) {
+    ff = (|ω_p| > W_MOVING) ? −A_FRICTION·sign(ω_p)   // MOVING: cancel friction
+                            : +A_FRICTION·sign(α);    // STUCK:  push to break free
+    α += ffFrac · ff;
 }
 ```
 
-**The two branches have opposite signs.** Derivation: we want the closed loop
-to behave as though friction were absent, `θ̈ = −a·α_lqr`. With friction present:
+**The two branches have opposite signs.** Derivation: we want the closed loop to
+behave as though friction were absent, `θ̈ = −a·α_lqr`. With friction present:
 
 ```
 −a·(α_lqr + α_ff) − A_f·sign(ω_p) = −a·α_lqr
@@ -383,42 +370,130 @@ to behave as though friction were absent, `θ̈ = −a·α_lqr`. With friction p
 ```
 
 When stuck there is no velocity to oppose; instead push whichever way the
-controller wants, so the sign follows `α`.
+controller wants, so the sign follows `α`. Getting the moving branch backwards is
+**worse than no feedforward at all** — simulated final error 48° versus 27° with
+none, versus 0.7° correct.
 
-Getting the moving branch backwards is **worse than no feedforward at all** —
-simulated final error 48° versus 27° with none, versus 0.7° correct.
+### The magnitude is the weak point
 
-### Achievable accuracy
+The *structure* of the feedforward is right and well tested. Its *magnitude* is
+not well calibrated, and that is the project's main outstanding tuning gap.
 
-| feedforward accuracy | deadband at `K_θ` = 43 |
+Break-free from rest needs the delivered wheel acceleration to exceed
+`4.24/a` — about **28 rad/s²** at `a` = 0.15. What the controller actually
+supplies at small error is:
+
+```
+ffFrac × A_FRICTION + K_θ·|e|
+```
+
+At `ff = 0.90`, `A_FRICTION = 22.3`, and a 5° error that is
+`20.1 + 10.4 = 30.5` — clearing 28 by 9%. Stiction varies by more than 9% with
+contact point and dwell, so whether it moves is effectively random. Raising
+`A_FRICTION` to 28.3 gives `25.5 + 10.4 = 35.9`, a 28% margin.
+
+**Symptoms of each direction of error:**
+
+| symptom | meaning |
 |---|---|
-| none | 29.8° |
-| 80% | 6.0° |
-| 95% | 1.5° |
+| Parks short, does not move, wheel winds up | `ffFrac × A_FRICTION` too **low** |
+| Overshoots then creeps back | too **high** — the MOVING branch is over-cancelling friction |
 
-This single number dominates your final pointing accuracy. Realistically
-80–95% is achievable; Coulomb friction is not perfectly constant (it varies
-with contact point, dwell time, temperature), which is why breakaway repeats
-scattered.
+Both knobs (`A<val>` and `F<val>`) act on the same product. Tune one and leave
+the other alone.
 
 ### Friction is also what makes reorientation possible
 
-The conservation law says that under *pure viscous* friction the platform
-returns to its original heading whenever the wheel stops. You could never
-permanently reorient.
-
-**Coulomb friction breaks that conservation law.** It lets the platform stick
-at a new heading with zero stored momentum. Spin the wheel up (platform
-rotates), spin it down (friction absorbs momentum asymmetrically), platform
-stays where it got to.
-
-So friction simultaneously limits your precision and enables the machine to
-work at all. On a real satellite there is no friction, which is exactly why
-they need separate desaturation hardware.
+Under *pure viscous* friction the conservation law says the platform returns to
+its original heading whenever the wheel stops — you could never permanently
+reorient. **Coulomb friction breaks that conservation law.** It lets the platform
+stick at a new heading with zero stored momentum. So friction simultaneously
+limits precision and enables the machine to work at all. On a real satellite
+there is no friction, which is exactly why they need separate desaturation
+hardware.
 
 ---
 
-## 9. The control law
+## 7. Discovery 3 — the linearization must under-compensate
+
+The linearization is only as good as `A_2`, and the failure is **asymmetric**:
+
+```
+real plant:    ω̇_w = A₁′·U_q − A₂′·ω_w
+commanded:     U_q = (α + compFrac·A_2·ω_w) / A_1
+result:        ω̇_w = (A₁′/A₁)·α  +  [ (A₁′/A₁)·compFrac·A_2 − A₂′ ]·ω_w
+                                     └──── this must be ≤ 0 ────┘
+```
+
+**Over-compensate and that residual pole goes positive: voltage drives speed,
+speed demands more voltage through the compensation term, exponential runaway.
+Under-compensate and it is merely a stable lag.** Always err low.
+
+### How this was found
+
+The first closed-loop run diverged to wheel saturation. At `ω_w = −22.2` the
+controller commanded `α = +2.04` (braking) and the wheel delivered `−24`. Fitting
+the residual pole gave **+0.89 /s**, an unstable 1.13 s growth — which matched the
+observed runaway once the controller's opposing effort was accounted for.
+
+Cause: the original `A_1 = 40.56`, `A_2 = 5.56` implied a DC gain of 7.3, against
+a re-measured **8.51**. A 16% gain error was enough to flip the pole's sign.
+
+### `compFrac`, and how it was measured
+
+The `C<V>` command spins the wheel open-loop, then commands `α = 0` with the
+compensation still active. The wheel must coast down; if it holds speed the
+compensation is exactly neutral, if it accelerates it is too high.
+
+Sweeping `compFrac` over 7 trials in both directions gave straight lines:
+
+```
+positive ω_w:  pole = 3.00·cf − 2.92    →   neutral at cf = 0.972
+negative ω_w:  pole = 3.68·cf − 3.28    →   neutral at cf = 0.892
+```
+
+`cf = 1.0` was **already unstable** positive-going even with corrected constants,
+so the true damping pole is nearer 5.0 than 5.35. Rather than chase `A_2` again,
+the margin lives in `compFrac` where it is visible.
+
+### Choosing the value
+
+`compFrac = 0.80` was tried first and was too conservative. Under-compensation is
+subtracted from *every* commanded α, so a sustained α decays with the residual
+pole — at 0.80 that was 1.9 s, and slews ran out of torque mid-maneuver. **0.89**
+sits at the lower measured neutral and gives roughly a 4 s torque hold.
+
+### What under-compensation costs, quantitatively
+
+With `compFrac = 0.89`, residual pole ≈ **−0.84 /s**, so a sustained α drives the
+wheel to a steady state rather than accelerating forever:
+
+```
+ω_w,steady ≈ α / 0.84
+```
+
+This is the single most useful relation in the file. It sets:
+
+- **How long torque lasts.** Roughly 4 s before an α stops producing acceleration.
+- **Delivered vs commanded α.** `delivered = commanded − 0.84·ω_w`. A terminal
+  correction needs ~28 delivered; arriving at 20 rad/s therefore needs 45
+  commanded. Steps arriving below ~15 rad/s landed at 0.31°; those arriving above
+  ~17 stalled 2–9° short until the clamp was raised.
+- **Passive desaturation.** See §10.
+
+### Direction asymmetry is drift, not a property
+
+Three measurements disagree on which direction is faster: the O-tests said
+positive by 3.8%, the C-sweep said negative by 7.5%, the original 4 V campaign
+said negative by 7.2%. Magnitude is consistently a few percent; sign is not
+stable. Most likely thermal.
+
+**Do not build direction-dependent compensation.** A per-direction value would be
+wrong half the time. One conservative value covers the drift.
+
+---
+
+## 8. The control law
 
 Runs at 200 Hz (`CONTROL_PERIOD_US = 5000`) in `heading_control.cpp`.
 
@@ -430,29 +505,28 @@ float w_w = motor.shaft_velocity;                            // rad/s, wheel
 // 2. ESTIMATE heading
 theta = wrapPi(theta + w_p * dt);
 
-// 3. ERROR
-float e = wrapPi(target − theta);
+// 3. ERROR, with two-stage tolerance (see §10)
+float dz = (|w_w| < FINE_WW) ? deadzoneFine : deadzone;
+float e  = wrapPi(target − theta);
+bool outside = |e| > dz;
 
 // 4. LQR / PD → desired WHEEL ACCELERATION
 float alpha = −K_theta * e + K_omega * w_p;
 
-// 5. COULOMB FEEDFORWARD, gated by deadzone
-if (fabsf(e) > deadzone) {
-    float ff = (fabsf(w_p) > W_MOVING) ? −A_FRICTION*signf(w_p)
-                                       :  A_FRICTION*signf(alpha);
-    alpha += ffFrac * ff;
-} else {
-    alpha = 0.0f;      // inside tolerance: stop, let stiction hold
-}
+// 5. COULOMB FEEDFORWARD (§6)
+alpha += ffFrac * ff;
 
-// 6. FEEDBACK LINEARISATION → voltage
-float u = (alpha + A_2 * w_w) / A_1;
+// 6. AUTHORITY CLAMP, only while the platform is stationary
+if (notMoving) alpha = constrain(alpha, ±ALPHA_STALL_MAX);
 
-// 7. SATURATE + COMMAND
+// 7. FEEDBACK LINEARISATION → voltage
+float u = (alpha + compFrac * A_2 * w_w) / A_1;
+
+// 8. SATURATE + COMMAND
 motor.target = constrainf(u, −VOLTAGE_LIMIT, VOLTAGE_LIMIT);
 
-// 8. SUPERVISE
-if (fabsf(w_w) > WHEEL_SAT_LIMIT) stopMotor();
+// 9. SUPERVISE
+if (|w_w| > WHEEL_SAT_LIMIT) stopMotor();
 ```
 
 ### Sign warning (a) — the LQR line
@@ -466,118 +540,193 @@ Derivation:
 
 ```
 plant:  θ̈ = −a·α                (minus: wheel one way, platform the other)
-error:  e = θ_target − θ_p,  ë = −θ̈ = +a·α
-want:   ë = −2ζω_n·ė − ω_n²·e,  and  ė = −ω_p
-⟹      a·α = 2ζω_n·ω_p − ω_n²·e
-⟹      α = −(ω_n²/a)·e + (2ζω_n/a)·ω_p
+error:  e = θ_target − θ_p,  so  ė = −ω_p  and  ë = −θ̈
+⟹      ë + a·K_ω·ė + a·K_θ·e = 0
 ```
 
-The rate term enters with a **plus**. Writing `−(K_θ·e + K_ω·ω)` is unstable —
-in simulation it diverged, ending 34° short of a 90° target with `α` blowing
-past 600 rad/s².
+**The plus stops being strange once you see `ω_p = −ė`.** In error coordinates it
+is an ordinary damping term; it only looks inverted because the gyro reports the
+platform's rate and the error's rate is its negative. Writing
+`−(K_θ·e + K_ω·ω)` puts negative damping in that equation — in simulation it
+diverged, ending 34° short of a 90° target with `α` past 600 rad/s².
 
 ### Sign warning (b) — the feedforward branches
 
-Covered in §8. Moving branch negative, stuck branch positive.
+Covered in §6. Moving branch negative, stuck branch positive.
+
+### The authority clamp
+
+A sustained α drives the wheel toward `α/0.84`, so `α = 62` (which `K_θ = 119.3`
+produces at 30° error) implies 74 rad/s — far past the abort. But this only
+matters while the platform is **stationary**: when it is moving the maneuver
+finishes first, and clamping there just slows large slews. The pathological case
+is pushing hard while stuck, where no motion results and the wheel winds anyway.
+
+`ALPHA_STALL_MAX` must exceed the true breakaway with real margin. Two values
+were tried and failed — see §16.
+
+---
+
+## 9. Gain selection and LQR
+
+### Why a matrix formulation gives you the gains
+
+For the 2-state plant `[θ_err, ω_p]`, `u = −Kx` written out is one gain on error
+and one on rate. **That is the definition of PD** — the architecture is forced by
+the state dimension. LQR's contribution is choosing the two numbers.
+
+Matching the closed-loop equation `ë + a·K_ω·ė + a·K_θ·e = 0` against the
+standard second-order form `ë + 2ζω_n·ė + ω_n²·e = 0`:
+
+```
+K_θ = ω_n² / a          K_ω = 2ζ·ω_n / a          ω_n = 5.714 / t_settle
+```
+
+**You tune in units of "how fast should this settle," not in units of "119.3."**
+
+### LQR vs pole placement
+
+LQR minimizes `J = ∫(xᵀQx + uᵀRu)dt`, giving `K = R⁻¹BᵀP` where `P` solves the
+Algebraic Riccati Equation. Solved offline in one line
+(`scipy.linalg.solve_continuous_are`) — **never on the STM32**; compute once,
+paste two numbers into firmware.
+
+On this plant a weighting sweep lands at ζ ≈ 0.71 regardless of `Q`, a known
+signature of double integrators. Given that, pole placement is more direct and is
+what the table below uses.
+
+### Gain table (ζ = 0.7, `a` = 0.19 nominal)
+
+| settle | `ω_n` | `K_θ` | `K_ω` |
+|---|---|---|---|
+| 3.0 s | 1.90 | 19.1 | 14.0 |
+| 2.0 s | 2.86 | 43.0 | 21.1 |
+| 1.5 s | 3.81 | 76.4 | 28.1 |
+| **1.2 s** | **4.76** | **119.3** | **35.1** | ← in use
+
+**Work DOWN the table, not up.** Counterintuitive if you are used to creeping up
+cautiously, but slow gains keep the feedforward active longer, which winds the
+wheel up more — so faster gains are better on *both* accuracy and saturation.
+Simulated 90° slew: 3.0 s gains → 6.30° error / 72.9 rad/s; 1.5 s gains →
+0.03° / 22.4 rad/s. **Confirmed on hardware:** at `K_θ = 19.1` a nudge recovery
+stalled at 15.6°; at 119.3 the same recovery lands within 2°.
+
+The theoretical ceiling is `ω_n ≈ 4.8` (the wheel pole sits at `A_2`, above which
+the linearization stops cancelling cleanly). The 1.2 s row sits at 4.76 and
+behaves — plausibly because the corrected `A_2 = 5.35` and partial compensation
+moved the effective pole.
+
+### Honest scope
+
+For a 2-state system this **is** a PD controller; LQR is a principled way to
+choose PD gains, not a different architecture. Its real value arrives with the
+translation fans (MIMO, where hand-tuning a dozen gains is miserable) and when
+`ω_w` enters the cost function so momentum management falls out of the
+optimization automatically — instead of out of a compensation margin, which is
+what currently happens.
+
+---
+
+## 10. Momentum management
+
+Every slew banks wheel speed, and Coulomb friction holds the platform at its new
+heading, so the momentum does not return on its own. A reaction wheel cannot
+desaturate itself (§5).
+
+### Passive desaturation — the mechanism in use
+
+Inside the deadzone `α = 0`, so the commanded voltage is
+`compFrac·A_2·ω_w/A_1 = 0.105·ω_w`, while merely *holding* speed needs
+`ω_w/K_HOLD = 0.123·ω_w`. The shortfall bleeds the wheel down:
+
+```
+ω̇_w = −0.84·ω_w          (a 1.2 s exponential)
+```
+
+**The important property is that it is self-limiting.** Reaction torque during
+the unwind is `a·0.84·ω_w = 0.16·ω_w` rad/s² on the platform, which stays under
+the 4.24 breakaway for any `ω_w` below 26.5 rad/s. The wheel comes home, friction
+holds the heading, and there is no logic and no tuning.
+
+Observed: every step in the envelope run ended with `ω_w ≈ 0`, except those where
+the 6 s capture ended first — a repeat of the same command from the same state
+reached −1.34 rad/s given more time.
+
+Above 26.5 rad/s the unwind torque does exceed breakaway, so a fast-ending slew
+may drag the heading slightly on the way down. Not observed to matter.
+
+### An active ramp was written and removed
+
+Commanding `α = −10` to brake gives `u = (−10 + 0.89·5.35·20)/45.5 = 1.87 V` at
+20 rad/s against a 2.46 V hold voltage — so the wheel decelerated at **27 rad/s²,
+not 10**. That is 5.1 rad/s² on the platform, above breakaway: the platform broke
+free, the heading drifted, the controller fought back, and the wheel wound up.
+
+**The compensation shortfall that starves a positive α ADDS to a negative one.**
+Never command braking torque through the linearization at speed. If this is
+revisited it must command voltage directly from the hold curve
+(`u_hold = ω_w/K_HOLD`), with a P term on wheel speed so it tolerates error in
+`K_HOLD`.
+
+### Stall recovery
+
+Passive unwind cannot reach one case: parked **outside** the deadzone with the
+wheel already fast, where the wheel cannot deliver the commanded α and pushing
+harder only winds toward the abort. Detection is `|e| > dz` AND platform
+stationary AND `|ω_w| > STALL_WW` for `STALL_MS`. Response is `α = 0` for 2 s —
+the same state as being inside the deadzone — letting the passive unwind restore
+authority, then retry.
+
+**Retries are capped at `MAX_STALL_RETRIES` = 3.** Without a cap the controller
+cycles stall → unwind → retry → stall indefinitely, which was observed in
+practice: the unwind restores authority, but if `ffFrac × A_FRICTION` is below
+breakaway the retry fails for the same reason as the original attempt, forever.
+After three, it prints `PARKED at <e> deg` and holds until a new target, `Z`, or
+`X`. A `PARKED` message means the friction magnitude is too low, not that the
+gains are wrong.
+
+### Two-stage deadzone — the terminal approach
+
+A fine correction needs the wheel **slow**, because
+`delivered α = commanded − 0.84·ω_w`. So the tolerance is speed-gated:
+
+```c
+dz = (|ω_w| < FINE_WW) ? deadzoneFine : deadzone;
+```
+
+The slew runs against the coarse 2° tolerance, parks, the wheel unwinds, and as
+it drops below 5 rad/s the tolerance tightens to 1° — at which point the
+controller re-engages with full authority available and creeps in. This is the
+"reduced-speed, tightened-deadband final approach" from Phase 9 of the project
+plan, and it is what makes sub-degree pointing reachable.
+
+`deadzoneFine` must stay **above** the achievable Coulomb deadband
+`(1 − ffFrac)·A_FRICTION/K_θ`, or feedforward never switches off and the wheel
+winds indefinitely. **This was shipped wrong once:** the fine deadzone defaulted
+to 1.0° while the floor at `ff = 0.90`, `K_θ = 119.3` was 1.07–1.36°, making it
+unreachable and producing exactly the stall it was meant to avoid. Both deadzones
+are now 2.0°. `G` prints the floor every time and warns if either is below it:
+
+```
+deadband floor=1.07deg  (both deadzones clear it)
+```
+
+| `ffFrac` | deadband floor | safe fine deadzone |
+|---|---|---|
+| 0.90 | 1.36° | 2° |
+| 0.95 | 0.68° | 1° |
+| 0.97 | 0.41° | 0.75° |
 
 ### The deadzone is not optional
 
-With feedforward always active, it never switches off once the platform has
-stopped and keeps accelerating the wheel:
+With feedforward always active it never switches off once the platform has
+stopped, and keeps accelerating the wheel:
 
 | deadzone | final error | wheel peak |
 |---|---|---|
 | none | 0.68° | **72.9 rad/s** |
 | 1° | 0.57° | 31.7 rad/s |
 | 2° | 1.53° | 29.9 rad/s |
-| 3° | 2.51° | 28.9 rad/s |
-
----
-
-## 10. LQR
-
-### What problem it solves
-
-You want `u = −Kx`, but which `K`? High gains respond fast but saturate
-actuators and amplify noise. PID resolves this by hand-tuning. LQR resolves it
-by optimization.
-
-### The mechanism
-
-Declare what you care about via a cost:
-
-```
-J = ∫ (xᵀQx + uᵀRu) dt
-```
-
-`Q` penalizes state error, `R` penalizes effort. The minimizing gain is
-`K = R⁻¹BᵀP`, where `P` solves the Algebraic Riccati Equation:
-
-```
-AᵀP + PA − PBR⁻¹BᵀP + Q = 0
-```
-
-A matrix quadratic, solved offline in one line
-(`scipy.linalg.solve_continuous_are`). **Never solved on the STM32** — compute
-once, paste two numbers into firmware.
-
-### Weighting sweep on this plant
-
-Plant is `A = [[0,1],[0,0]]`, `B = [[0],[−0.19]]`, state `[θ_err, ω_p]`.
-
-| `q_θ` | `K_θ` | `K_ω` | ζ | settle | peak `U_q` at 90° |
-|---|---|---|---|---|---|
-| 1 | 1.00 | 3.32 | 0.72 | 12.7 s | 0.04 V |
-| 10 | 3.16 | 5.81 | 0.71 | 7.2 s | 0.12 V |
-| 50 | 7.07 | 8.66 | 0.71 | 4.9 s | 0.27 V |
-| 200 | 14.14 | 12.22 | 0.71 | 3.5 s | 0.55 V |
-| 1000 | 31.62 | 18.26 | 0.71 | 2.3 s | 1.22 V |
-
-ζ lands at 0.71 regardless of weighting — LQR's characteristic behavior on a
-double integrator.
-
-### Recommended gains via pole placement
-
-More direct than guessing `Q`. For damping ζ = 0.7:
-
-```
-ω_n = 5.714 / t_settle
-K_θ = ω_n² / 0.19
-K_ω = 1.4·ω_n / 0.19
-```
-
-| settle | `ω_n` | `K_θ` | `K_ω` | predicted deadband (80% FF) |
-|---|---|---|---|---|
-| 3.0 s | 1.90 | **19.1** | **14.0** | 13.4° |
-| 2.0 s | 2.86 | **43.0** | **21.1** | 6.0° |
-| 1.5 s | 3.81 | **76.4** | **28.1** | 3.4° |
-| 1.2 s | 4.76 | **119.3** | **35.1** | 2.1° |
-
-**The ceiling is ω_n ≈ 4.8.** The wheel pole sits at `A_2` = 5.56 rad/s; above
-that the feedback linearization stops cancelling it cleanly.
-
-### Faster gains are better on *both* axes
-
-Counterintuitive if you are used to creeping up cautiously. Simulated 90° slew
-with a 2° deadzone:
-
-| gains | final error | wheel peak |
-|---|---|---|
-| 3.0 s | 6.30° | 72.9 rad/s |
-| 2.0 s | 1.53° | 29.9 rad/s |
-| 1.5 s | **0.03°** | **22.4 rad/s** |
-
-Slow gains keep the feedforward active longer, which winds the wheel up more.
-So work **down** the table.
-
-### Honest scope
-
-For a 2-state system, `u = −K_θ·e + K_ω·ω` **is a PD controller**. LQR here is
-a principled way to choose PD gains, not a different architecture.
-
-Its real value arrives with the translation fans (MIMO, where hand-tuning a
-dozen gains is miserable) and when `ω_w` enters the cost function so momentum
-management falls out of the optimization automatically.
 
 ---
 
@@ -590,303 +739,233 @@ management falls out of the optimization automatically.
 | MPU6050 gyro | fast (hundreds of Hz) | measures *rate*; bias integrates into drift |
 | AprilTag camera | absolute, drift-free | slow (~30 Hz), latent, drops out |
 
-They fail in complementary ways, which is when fusion helps.
+They fail in complementary ways, which is when fusion helps. **Currently
+gyro-only** — vision is not built.
 
-### Gyro bias
+**Gyro bias** is measured at every boot from a 200-sample at-rest average.
+Historically 0.42–0.46 dps, stable to ±0.014 dps across a sweep. Uncorrected that
+is **25° per minute of pure fiction**; after removal, drift is about
+**0.8°/min** — fine for 30-second tests, and the hard floor on absolute accuracy
+until vision exists.
 
-Measured at every boot from a 200-sample at-rest average. Historically
-0.42–0.46 dps, stable to ±0.014 dps across a whole sweep. Uncorrected that is
-**25° per minute of pure fiction**. After removal, drift is about **0.8°/min** —
-fine for 30-second tests before vision exists.
-
-### Complementary filter (start here)
-
+**Complementary filter** (start here):
 ```c
 theta = 0.98f*(theta + w_p*dt) + 0.02f*theta_vision;
 ```
 
-Trust the gyro short-term, let vision slowly pull out drift.
-
-### Kalman filter (upgrade)
-
-State `[θ_p, ω_p, b_gyro]`. Predict with the gyro, correct with vision.
-Estimating bias **as a state** makes it self-calibrating against thermal drift
-rather than relying on a startup measurement.
+**Kalman filter** (upgrade): state `[θ_p, ω_p, b_gyro]`. Predict with the gyro,
+correct with vision. Estimating bias **as a state** makes it self-calibrating
+against thermal drift rather than relying on a startup measurement.
 
 ### The wheel encoder cannot give you heading
 
-In principle momentum conservation gives `θ_p = −0.19·θ_w`, and on a
-frictionless spacecraft that would work. **It fails here because friction is an
-external torque and it is large.** With friction at 4.24 rad/s² against
-maneuvers of ~1.57 rad/s², the conservation assumption is broken worse than it
-is satisfied. An encoder-derived heading would be badly wrong within one slew.
+In principle momentum conservation gives `θ_p = −a·θ_w`, and on a frictionless
+spacecraft that would work. **It fails here because friction is an external
+torque and it is large** — 4.24 rad/s² against maneuvers of ~1.57. An
+encoder-derived heading would be badly wrong within one slew.
 
 What the encoder *is* for: `ω_w` for feedback linearization (mandatory),
-saturation monitoring, and improving the Kalman prediction step since commanded
-torque is known.
+saturation monitoring, and improving the Kalman prediction step.
 
 ---
 
-## 12. Calibration campaign
-
-Five runs. Two of them failed at their stated purpose and produced the most
-valuable findings anyway.
-
-### Run 1 — 2026-07-29 11:29:29 (9 tests)
-
-First sweep. Velocity-only logging: `t_us, targetV, vel_raw, vel_filtered, gyroZ_dps`.
-
-**Findings:**
-- ~320 Hz realized log rate, jitter under 100 µs
-- All 9 tests ended on `platform_settled`
-- Peak wheel velocity scaled near-linearly: 7.76 / 8.32 / 8.30 / 7.66 rad/s per
-  volt across 1.0–4.0 V
-- Gyro bias +0.42 dps, spread 0.008 dps across five at-rest tests
-- τ declined monotonically with voltage: 196.7 → 190.6 → 184.2 → 177.9 ms
-  (Coulomb friction signature)
-- `vel_raw` and `vel_filtered` are near-perfect mirrors (correlation −0.97 to
-  −0.997) — SimpleFOC applies the `initFOC()` direction correction only to
-  `shaft_velocity`
-- Wheel and gyro **positively** correlated (+0.33 to +0.84) → opposite sign
-  conventions
-
-**Structural limitation found:** velocity-only data cannot separate `R`, `K_t`,
-`K_v`, and friction. At steady state `U_q = ω·(R·b/K_t + K_v)` — one number
-from four unknowns.
-
-### Run 2 — 2026-07-30 11:24:00 (48 tests) — the main dataset
-
-16 conditions × 3 repeats. Added INA219 current/voltage and measured wheel angle.
-
-**Firmware changes that made it work:**
-- Phase A gated on settle (min hold AND wheel steady AND platform settled)
-- Repeats as the *outer* loop so drift spreads across conditions
-- Sign-interleaved condition order
-- Split log rate: phase A ~168 Hz, phase B ~224 Hz
-
-**Results:**
-- 48/48 `platform_settled`, 48/48 `phaseA_clean=yes` — the settle gating
-  completely solved the contaminated-initial-condition problem
-- No buffer overruns (peak 894 of 2400 samples)
-- INA219 range 0–722 mA, bus 12.03 → 11.32 V under load; idle −6 mA confirms
-  it is on the motor supply, not total system draw
-- Repeatability: 0.16–4.6% CV on steady-state wheel velocity
-
-**The headline result — `R` and `K_v` separate:**
-
-```
-Iq ≈ V_bus·I_bus / U_q          (power balance, since Ud ≈ 0 in voltage mode)
-U_q = R·Iq + K_v·ω              (one equation, two unknowns, per test)
-⟹  R = 0.788 Ω, K_v = 0.113 V/(rad/s), RMS residual 4.9%
-```
-
-**Also found:**
-- ±4 V asymmetry is real: negative direction 7.2% faster, **7σ separation**.
-  At 1.0–2.5 V it is only 0.7–1.8σ (noise). So asymmetry grows with command.
-- A single slope through the origin has residuals up to ±9.8%. Bus sag
-  correction only improves it to 8.8%, so sag is not the explanation.
-- τ noisier this run (156–215 ms); the clean monotonic decline did not reproduce
-
-### Run 3 — 2026-07-30 11:34:50 (6 tests)
-
-3.0 V → −2.0 V reversals. Investigated a discrepancy: the platform visibly spun
-near 360° but firmware printed ~220°.
-
-**Resolution: net ≠ total.** The firmware integrates *signed* rate over the
-whole capture including phase A. In a reversal the platform swings one way
-during spin-up, then back during reversal, and those partially cancel.
-
-For test03: phase A **+83.6°**, phase B **−302.6°**, net **−219.0°**, total path
-386.2°. Net/total ratio 0.32–0.57 across the six tests — bracketing the "about
-2/3" observed.
-
-**Ruled out first:** gyro saturation (peaks 144–350 dps against a ±500 dps
-range) and undersampling (168/224 Hz against a 21 Hz DLPF).
-
-### Run 4 — 2026-07-30 12:20:30 (staircase) — failed at its purpose
-
-0.05 V treads up to 1.20 V, 800 ms dwell, intended to find platform breakaway.
-
-**Two failures:**
-
-1. **Buffer overrun.** 50 treads × 800 ms at 168 Hz needs ~6,700 samples against
-   a 2,400 cap. Stopped at 0.85 V, never descended.
-
-2. **The test cannot measure what it was designed for.** Reaction torque is
-   proportional to wheel *acceleration*. At constant voltage the wheel
-   accelerates briefly then plateaus, so each tread delivers a torque impulse
-   set by the **step size** (constant 0.05 V), not by absolute voltage.
-   Climbing the staircase applies the identical impulse at every rung.
-
-   Confirmed directly: platform peak rate flat at **1.0–2.2 dps** from 0.35 V to
-   0.80 V while wheel speed climbed **1.7 → 6.4 rad/s**.
-
-**What it found anyway — the motor deadband.** The wheel does not turn below
-~0.35 V (0.001–0.056 rad/s, i.e. noise), then jumps to 1.72 rad/s. Below that
-command the controller has **no authority at all** — a genuine limit-cycle risk
-for any integral term.
-
-Also: low-voltage slope 10.25 rad/s/V vs 7.3 at high voltage, with a −1.71
-offset — more Coulomb evidence.
-
-### Run 5 — 2026-07-30 19:26:35 (46 of 48 breakaway trials)
-
-Sweeps **step size** from rest — the quantity that actually scales platform
-torque. Each trial: settle at 0 V, step to S, fixed 1500 ms observation window,
-return, dump.
-
-**Result: platform breakaway ≈ 0.55 V.**
-
-| step | net displacement | net/peak ratio |
-|---|---|---|
-| ≤ 0.50 V | 0.005–0.15° | ~0.05 |
-| **0.55 V** | **1.53°** | **0.26** |
-| 0.60 V | 2.46° | 0.22 |
-| 1.20 V | 22.6° | 0.56 |
-
-**Use net displacement, not peak rate.** The firmware's threshold detector
-reported 0.40 V using peak rate, which is misleading: ball transfer units have
-compliance, so a torque impulse can deflect the platform elastically and let it
-spring back. Peak rate sees that wiggle as motion. Net displacement is flat
-below 0.50 V then jumps — and the net/peak ratio jumps 5× at the same point.
-Two independent signatures agreeing.
-
-`4.24 rad/s² = 0.19 × 40.56 × 0.55`
-
-**Caveats:** two trials missing (0.35 V and 0.75 V, both rep 2). Rep 1 ran
-systematically higher than rep 2 across most of the range — cause not
-established. Cable twist was ruled out (the rig is fully wireless); most likely
-motor thermal drift or the platform ending rep 1 at a different position on a
-not-perfectly-level surface. Two repeats is thin for a stochastic quantity like
-stiction.
-
----
-
-## 13. Data formats
-
-### Raw calibration CSV (current firmware)
-
-```
-# test 7/48: step 0 -> +4.0V [rep 1/3]
-# mode=... from=0.00V to=4.00V rep=1 phaseB_start_sample=480 phaseA_clean=yes gyro_bias_dps=0.4611 stop_reason=platform_settled
-t_us,targetV,wheel_vel,wheel_angle_rad,gyroZ_dps,current_mA,busV
-```
-
-Metadata is free-form `key=value`. **Parsers must not pattern-match the whole
-line** — see §17.
-
-| field | units | notes |
-|---|---|---|
-| `t_us` | µs | `micros()`, not zeroed |
-| `targetV` | V | commanded `U_q` |
-| `wheel_vel` | rad/s | `motor.shaft_velocity`, direction-corrected |
-| `wheel_angle_rad` | rad | `sensor.getAngle()`, absolute, **sign inverted vs velocity** |
-| `gyroZ_dps` | dps | raw, bias NOT removed |
-| `current_mA` | mA | motor supply, ~−6 mA zero offset |
-| `busV` | V | motor supply |
-
-Older format (run 1) used `vel_raw, vel_filtered` and no current/angle columns.
-`filter_calibration.py` handles both.
-
-### Filtered CSV
-
-```
-t_s,phase,targetV,wheel_vel,wheel_angle_rad,wheel_accel,gyro_dps_raw,gyro_dps,platform_deg,current_mA,busV,power_mW,iq_est_A
-```
-
-| added field | meaning |
-|---|---|
-| `t_s` | seconds from test start |
-| `phase` | `A` (pre-step hold) or `B` (transient) |
-| `wheel_angle_rad` | zeroed per test, sign corrected |
-| `wheel_accel` | `d(wheel_vel)/dt` — sets reaction torque |
-| `gyro_dps` | bias removed, sign flipped |
-| `platform_deg` | integrated `gyro_dps` |
-| `iq_est_A` | `busV·current/targetV`; **NaN** where \|targetV\| < 0.15 |
-
-### Heading controller capture
-
-```
-t_us,target_deg,theta_deg,omega_p,omega_w,alpha,u
-```
-
-`omega_p` rad/s, `omega_w` rad/s, `alpha` rad/s² commanded, `u` volts.
-
-### Summary files
-
-- `summary.csv` — one row per test
-- `repeatability.csv` — mean/std across repeats per condition
-- `breakaway_summary.csv` — per step size, with motor and platform thresholds
-
----
-
-## 14. Firmware
+## 12. Firmware and commands
 
 Only one sketch can be in `src/` at a time (PlatformIO builds one
 `setup()`/`loop()`). Inactive ones live in `unflashed_files/`.
-`MagneticSensorMT6701SSI.h/.cpp` stay in `src/` always — every sketch needs them.
+`MagneticSensorMT6701SSI.h/.cpp` stay in `src/` always.
 
-### `full.cpp` — open-loop bring-up
+| file | purpose |
+|---|---|
+| `heading_control.cpp` | **the controller** — 200 Hz loop, runtime-tunable gains, capture and dump |
+| `calibration.cpp` | system ID: `MODE_STEP` (run 2), `MODE_STAIRCASE` (superseded, kept for motor deadband), `MODE_BREAKAWAY` (run 5) |
+| `full.cpp` | earliest open-loop bring-up, superseded |
 
-Torque/voltage mode with SimpleFOC Commander over USB or HC-05. `M<volts>` sets
-target. Burst capture on `B`. Used for the earliest sanity checks.
-
-**Known bug, not fixed:** the gyro integration lives inside the
-`PRINT_INTERVAL_MS` block (10 s), so `zAngleDeg` integrates with `dt ≈ 10` and
-blows up. Left alone deliberately since the file was superseded.
-
-### `calibration.cpp` — system ID, three modes
-
-```c
-#define SWEEP_MODE  MODE_STEP | MODE_STAIRCASE | MODE_BREAKAWAY
-```
-
-| mode | purpose | status |
-|---|---|---|
-| `MODE_STEP` | step/reversal system ID | produced run 2 |
-| `MODE_STAIRCASE` | voltage-level staircase | **superseded** — cannot measure platform breakaway (§12 run 4). Kept for motor deadband. |
-| `MODE_BREAKAWAY` | step-size sweep | produced run 5 |
-
-Key parameters: `TEST_SEQUENCE[]`, `N_REPEATS`, `LOG_DECIM_A/B`,
-`MAX_LOG_SAMPLES`, `GYRO_SETTLE_DPS`, `SETTLE_DEBOUNCE_N`, `MIN_CAPTURE_MS`,
-`BREAK_MIN_V/MAX_V/STEP_V`.
-
-Safety: any serial byte aborts. `WAIT_FOR_START_SIGNAL` gates the start.
-
-### `heading_control.cpp` — the controller
-
-200 Hz control loop, runtime-tunable gains, capture and dump in the same CSV
-framing as `calibration.cpp`.
-
-**Commands** (115200, newline-terminated, USB or HC-05):
+### Commands (115200, newline-terminated, USB or HC-05)
 
 | send | does |
 |---|---|
-| `O1` | **letter O.** Open-loop 1 V pulse, 800 ms, no feedback — the sign check |
-| `T90` | step target to 90° and capture |
-| `H0` | hold heading at 0° with slow telemetry |
-| `Z` | zero the heading estimate here |
-| `P43` | set `K_θ` |
-| `D21.1` | set `K_ω` |
-| `F0.9` | set feedforward fraction |
-| `W2` | set deadzone, degrees |
-| `G` | print gains and state |
-| `B` | re-measure gyro bias (platform must be still) |
-| `X` / `R` | stop / resume |
+| `O<V>` | **letter O.** Open-loop pulse, 800 ms, no feedback — the sign check |
+| `C<V>` | Compensation test: spin up open-loop, then `α = 0` — the `compFrac` check |
+| `T<deg>` | Step to target and capture |
+| `H<deg>` | Hold heading with slow telemetry |
+| `Z` | Zero the heading estimate here |
+| `P<val>` / `D<val>` | Set `K_θ` / `K_ω` |
+| `K<val>` | Set `compFrac` |
+| `A<val>` | Set `A_FRICTION`, the feedforward magnitude |
+| `F<val>` | Set feedforward fraction |
+| `W<deg>` / `N<deg>` | Set coarse / fine deadzone |
+| `G` | Print gains, state, the deadband floor, and `ffFrac × A_FRICTION` |
+| `B` | Re-measure gyro bias (platform must be still) |
+| `X` / `R` | Stop / resume |
 
 **Any unrecognised input stops the motor.** Deliberate — a confused operator
 should not leave a flywheel spinning.
 
-Safety: aborts above `WHEEL_SAT_LIMIT` = 45 rad/s.
+Safety: hard abort above `WHEEL_SAT_LIMIT` = 45 rad/s. This dumps the wheel
+instantly, which spins the platform (roughly 42 rad/s² against a 4.24 breakaway).
+Accepted behaviour; with the current clamp it should not be reached.
 
-### Build
+**Build:** PlatformIO, STM32duino core, Nucleo-F446RE. SimpleFOC 2.4.0, Adafruit
+MPU6050 / INA219 / Unified Sensor / BusIO, Wire, SPI.
 
-PlatformIO, STM32duino core, Nucleo-F446RE. Libraries: SimpleFOC 2.4.0,
-Adafruit MPU6050 / INA219 / Unified Sensor / BusIO, Wire, SPI.
+### Current tuned values
+
+```
+A_1 = 45.5    A_2 = 5.35    a = 0.19 nominal (true ~0.15)
+GYRO_SIGN = −1              compFrac = 0.89
+K_θ = 119.3   K_ω = 35.1    ffFrac = 0.90    A_FRICTION = 28.3  (needs sweeping)
+deadzone = 2.0°             deadzoneFine = 2.0°       FINE_WW = 5 rad/s
+ALPHA_STALL_MAX = 55        STALL_WW = 25             WHEEL_SAT_LIMIT = 45
+MAX_STALL_RETRIES = 3
+```
+
+Also in the repo: `live_monitor.py`, a self-contained serial bridge and browser
+instrument panel for watching heading, wheel speed, and momentum live. Useful for
+filming and for watching a stall happen in real time.
 
 ---
 
-## 15. Analysis pipeline
+## 13. Tuning procedure
+
+Keep a finger on `X` throughout. **`Z` before every `T`** — heading carries over
+between tests otherwise, which silently turns a `T-60` into a 120° slew.
+
+### Pre-flight
+
+1. **Confirm the right binary.** Boot text should list `O<V> openloop`.
+2. **Gyro bias** 0.35–0.55 dps with the platform dead still. Outside that, re-run `B`.
+3. **Estimator sanity.** `G` a few times over 30 s: drift under ~0.5°/min. Rotate
+   ~90° by hand, `G` again: should read about ±90.
+4. **Sign check — `O1`. Do not skip.**
+
+   | `omega_w` | `theta_deg` | verdict |
+   |---|---|---|
+   | positive | **negative** | correct |
+   | positive | positive | flip `GYRO_SIGN` to `+1.0f`, reflash |
+
+   The open-loop pulse is bounded either way. Closed loop with the sign inverted
+   drives error larger until the wheel abort catches it.
+
+5. **Compensation check — `C3` and `C-3`.** The wheel must coast DOWN after the
+   pulse. Flat means neutral with no margin; growth means `compFrac` too high.
+   Sweep with `K<val>` to find the neutral point in each direction, then set
+   `compFrac` at or just below the lower one.
+
+### Then
+
+6. **First closed loop.** Start at the 3.0 s row with `F0`, `Z`, `H0`. Nudge by
+   hand — it should push back and settle at a large offset (that is the friction
+   deadband, expected). If it accelerates away, `X` immediately.
+7. **Enable feedforward** at `F0.85` and repeat the nudge. Should return closer.
+8. **Gain progression: work DOWN the table**, re-running `T90` each time. Stop and
+   back off one row on ringing, audible buzz (lower `D` only), or the wheel
+   climbing toward 45 rad/s.
+9. **Friction magnitude (`A`), then feedforward trim (`F`).** These act on the
+   same product `ffFrac × A_FRICTION`, so sweep one. Break-free from rest needs
+   about 28 delivered. Parks short and the wheel winds → raise; overshoots then
+   creeps back → lower. **Test at small errors, not large ones** — a 90° slew
+   will succeed with a badly wrong value because PD covers the shortfall. Command
+   a 5° correction from rest and repeat it ten times; that is the case that
+   discriminates. This sweep has not been done properly and is the main reason
+   the terminal approach is inconsistent.
+10. **Deadzone (`W`, `N`).** Trades accuracy against wheel windup. `N` must stay
+    above the floor in §10's table. Never zero.
+11. **Record.** Final `G`, a clean `T90`, a `T-90`, an `H0` nudge run. Then update
+    the constants at the top of the source so tuned values survive a power cycle.
+
+### Expected, not faults
+
+- **1–2° final error** — the Coulomb deadband, a measured property. Docking
+  magnets tolerate several degrees, which is why they beat a mechanical latch.
+- **Wheel at 20–40 rad/s immediately after a large slew**, unwinding over a few
+  seconds.
+- **~0.8°/min heading drift** — gyro-only integration. Vision fixes this.
+
+---
+
+## 14. Calibration history
+
+Eight runs, ~150 logged trials. Several failed at their stated purpose and
+produced the most valuable findings anyway.
+
+### Run 1 — 07-29 (9 tests) — first sweep
+
+Velocity-only logging. Found: ~320 Hz log rate; peak wheel velocity scaling
+near-linear at 7.7–8.3 rad/s per volt; gyro bias +0.42 dps; τ declining
+monotonically with voltage (a Coulomb signature); wheel and gyro **positively**
+correlated → opposite sign conventions.
+
+**Structural limitation found:** velocity-only data cannot separate `R`, `K_t`,
+`K_v` and friction — at steady state `U_q = ω·(R·b/K_t + K_v)`, one number from
+four unknowns.
+
+### Run 2 — 07-30 (48 tests) — the main dataset
+
+16 conditions × 3 repeats, with INA219 current/voltage and wheel angle added.
+Firmware changes that made it work: phase A gated on settle, repeats as the outer
+loop, sign-interleaved condition order.
+
+48/48 settled, 48/48 clean phase A, no buffer overruns. **`R` and `K_v` separate**
+via power balance (`Iq ≈ V_bus·I_bus/U_q`, since `U_d ≈ 0` in voltage mode) →
+`R = 0.788 Ω`, `K_v = 0.113`, RMS residual 4.9%. Also: ±4 V direction asymmetry
+real at 7σ, noise at ≤2.5 V; single-slope residuals up to ±9.8%, not explained by
+bus sag.
+
+### Run 3 — 07-30 (6 tests) — net vs total rotation
+
+Investigated the platform visibly spinning ~360° while firmware printed ~220°.
+**Resolution: net ≠ total.** The firmware integrates *signed* rate over the whole
+capture; in a reversal the swings partially cancel. Test 3: phase A +83.6°, phase
+B −302.6°, net −219.0°, total path 386.2°.
+
+### Run 4 — 07-30 (staircase) — failed at its purpose
+
+Intended to find platform breakaway by climbing voltage. Two failures: a buffer
+overrun (needed ~6,700 samples against a 2,400 cap), and — more fundamentally —
+**the test cannot measure what it was designed for.** Reaction torque is
+proportional to wheel *acceleration*; at constant voltage the wheel plateaus, so
+each tread delivers a torque impulse set by the **step size** (constant 0.05 V),
+not by absolute voltage. Confirmed: platform peak rate flat at 1.0–2.2 dps from
+0.35 to 0.80 V while wheel speed climbed 1.7 → 6.4 rad/s.
+
+**What it found anyway — the motor deadband.** The wheel does not turn below
+~0.35 V, then jumps to 1.72 rad/s. Below that the controller has no authority at
+all — a limit-cycle risk for any integral term.
+
+### Run 5 — 07-30 (46 breakaway trials)
+
+Sweeps **step size** from rest — the quantity that actually scales platform
+torque. **Result: platform breakaway ≈ 0.55 V** → `0.19 × 40.56 × 0.55 = 4.24
+rad/s²`.
+
+**Use net displacement, not peak rate.** The firmware's threshold detector
+reported 0.40 V using peak rate, which is misleading: ball transfer units have
+compliance, so a torque impulse can deflect the platform elastically and let it
+spring back. Net displacement is flat below 0.50 V then jumps, and the net/peak
+ratio jumps 5× at the same point — two independent signatures agreeing.
+
+*Caveat: only two repeats, with rep 1 systematically higher than rep 2, cause
+unestablished. Thin for a stochastic quantity like stiction.*
+
+### Run 6 — 08-02 `150258` (6 O-tests) — re-identification
+
+Triggered by the first closed-loop run diverging. `K' = 8.51 ± 0.19` against a
+modelled 7.3 (**+16%**); `τ' = 0.187` against 0.18. → `A_1 = 45.5`, `A_2 = 5.35`.
+Also confirmed `GYRO_SIGN` correct in all six.
+
+### Run 7 — 08-02 `151508` (7 C-tests) — `compFrac` sweep
+
+Straight lines in both directions, neutral at 0.972 (+) and 0.892 (−). See §7.
+
+### Run 8 — 08-02 `165048` / `170424` — closed-loop envelope
+
+15 steps from ±30° to ±180°. Results in §2. One intermittent failure traced to
+`ALPHA_STALL_MAX`, see §16.
+
+---
+
+## 15. Data formats and analysis pipeline
 
 ```
 capture_calibration.py  →  calibration_run_<timestamp>/       (raw)
@@ -895,115 +974,50 @@ plot_calibration.py     →  <run>/filtered/plots/*.png
 make_replay.py          →  <run>/filtered/replay.html
 ```
 
-`py -m pip install numpy pandas matplotlib pyserial` (on Windows `pip` alone
-often is not on PATH).
+`py -m pip install numpy pandas matplotlib pyserial` (on Windows `pip` alone often
+is not on PATH).
 
-### `capture_calibration.py`
+### Heading controller capture
 
-Serial terminal + automatic CSV capture. Two-way: typed input is forwarded to
-the board. Detects capture blocks by the CSV header line (`t_us,`) rather than
-parsing metadata — see §17.
+```
+t_us,target_deg,theta_deg,omega_p,omega_w,alpha,u
+```
 
-### `filter_calibration.py`
+`omega_p`, `omega_w` in rad/s; `alpha` in rad/s² commanded; `u` in volts. Logged
+at the full 200 Hz control rate. **Not the same as the HOLD telemetry stream**,
+which is the same six fields at 10 Hz and is far too coarse to fit a 0.19 s time
+constant against.
 
-Three corrections:
+### Raw calibration CSV
 
-1. **Gyro bias** — measured from at-rest phase-A windows of `from=0.00V` tests
-   only. Tests that spin up first are excluded (their phase A contains real
-   motion). Cross-checked against the firmware's own startup value.
-2. **Gyro sign flip** — so wheel and platform share a convention.
-3. **Wheel angle sign + zeroing** — auto-detected per test by regressing
-   `d(angle)/dt` against `wheel_vel`; flips when the slope is negative.
+```
+# test 7/48: step 0 -> +4.0V [rep 1/3]
+# mode=... phaseB_start_sample=480 phaseA_clean=yes gyro_bias_dps=0.4611 stop_reason=platform_settled
+t_us,targetV,wheel_vel,wheel_angle_rad,gyroZ_dps,current_mA,busV
+```
 
-Derived columns and summaries per §13. Flags `phaseA_clean=no` tests explicitly.
+Metadata is free-form `key=value`. **Parsers must not pattern-match the whole
+line** — see §16. `t_us` is `micros()`, not zeroed. `gyroZ_dps` is raw, bias not
+removed. `wheel_angle_rad` is **sign inverted vs velocity**. `current_mA` carries
+a ~−6 mA zero offset.
 
-### `plot_calibration.py`
+### Filtered CSV
 
-Per-test 4-panel figures, `repeats_*.png` overlays, `overview_steps.png`,
-`overview_scaling.png` (with error bars across repeats), `staircase_*.png` with
-breakaway/re-stick marked. `--no-per-test` skips the slow part.
+Adds `t_s`, `phase` (A pre-step / B transient), `wheel_accel` (sets reaction
+torque), `gyro_dps` (bias removed, sign flipped), `platform_deg`, `power_mW`,
+`iq_est_A` (NaN where |targetV| < 0.15).
 
-### `make_replay.py`
+`filter_calibration.py` applies three corrections: gyro bias from at-rest phase-A
+windows of `from=0.00V` tests only; gyro sign flip; wheel angle sign auto-detected
+per test by regressing `d(angle)/dt` against `wheel_vel`.
 
-Standalone HTML: top-down platform and wheel turning from recorded data, plus
-telemetry readouts, momentum bar, and scrubbable traces. Frame budget adapts to
-test count. Skips staircase files (no step to replay).
-
-**Momentum bars are relative within each body, not a conserved total** — `J_w`
-and `J_p` are not known absolutely, so the two channels cannot share units.
-
-### `use_plain_ar.py`
-
-Build workaround, see §17.
+`make_replay.py` builds a standalone HTML replay. **Momentum bars are relative
+within each body, not a conserved total** — `J_w` and `J_p` are not known
+absolutely.
 
 ---
 
-## 16. Tuning procedure
-
-Keep a finger on `X` throughout.
-
-**Step 0 — boot.** Platform completely still. Bias should read 0.35–0.55 dps.
-Confirm the startup text lists `O<V> openloop` (otherwise an old binary is
-flashed).
-
-**Step 1 — check the estimate.** `G` a few times over 30 s: drift under
-~0.5°/min. Rotate ~90° by hand, `G` again: should read about ±90.
-
-**Step 2 — verify the gyro sign. Do not skip.**
-
-```
-O1
-```
-
-| `omega_w` | `theta_deg` | meaning |
-|---|---|---|
-| positive | **negative** | correct |
-| positive | positive | flip `GYRO_SIGN` to `+1.0f`, reflash |
-
-With the sign inverted the closed loop drives error *larger* and the platform
-accelerates until the wheel abort catches it. The open-loop pulse is bounded
-either way.
-
-**Step 3 — first closed loop.**
-
-```
-Z
-H0
-```
-
-Nudge by hand. It should push back. If it accelerates away, `X` immediately —
-sign problem.
-
-**Step 4 — step response.** `T90`, then plot rise time, overshoot, settling,
-final error, and end-of-run `omega_w`.
-
-**Step 5 — gain progression.** Work **down** the table (§10), re-running `T90`
-each time. Stop on: ringing (back off a row), audible buzz (lower `D` only),
-wheel climbing toward 45 rad/s, or `ω_n` approaching 4.8.
-
-**Step 6 — feedforward trim.** `F`, from 0.85. Parks short → raise; overshoots
-then creeps back → lower. Realistic best 0.85–0.95.
-
-**Step 7 — deadzone.** `W`, trades accuracy against wheel windup (§9). Never
-zero.
-
-**Step 8 — record.** Final `G`, a clean `T90`, a `T-90` (checks the measured
-7.2% direction asymmetry), and an `H0` nudge run. Then update the constants at
-the top of the source so tuned values survive a power cycle.
-
-### Expected, not faults
-
-- **A few degrees of final error** — the Coulomb deadband, a measured property.
-  Docking magnets tolerate several degrees, which is why they beat a mechanical
-  latch.
-- **20–30 rad/s left in the wheel after each slew** — Coulomb friction holds the
-  platform at its new heading, so momentum stays banked. Three or four slews in
-  one direction approaches saturation.
-- **~0.8°/min heading drift** — gyro-only integration. Vision fixes this.
-
----
-
-## 17. Bugs and gotchas
+## 16. Bugs and gotchas
 
 Everything that cost real time.
 
@@ -1013,52 +1027,63 @@ Everything that cost real time.
    Mounting artifact, not physics. `GYRO_SIGN = −1`.
 2. **`sensor.getAngle()` vs `motor.shaft_velocity`.** The encoder reports raw
    direction; `shaft_velocity` has the `initFOC()` alignment correction applied.
-   Measured `d(angle)/dt` vs `wheel_vel` slope: **−0.98 across every test.** Test
-   1 ended with velocity +8.01 rad/s and angle −5.76 rad — physically
-   impossible. `filter_calibration.py` auto-detects and corrects. Logging
-   `motor.shaft_angle` instead would fix it at the source.
-3. **The LQR rate term and the two feedforward branches** — §9.
+   Measured slope: **−0.98 across every test.** Logging `motor.shaft_angle`
+   instead would fix it at the source.
+3. **The LQR rate term and the two feedforward branches** — §8, §6.
+
+### Not zeroing heading between tests
+
+`theta` carries over, so a `T-60` immediately after a `T60` is a **120° slew**.
+This silently corrupted an entire envelope batch and looked like a direction
+asymmetry. Always `Z` first.
+
+### The authority clamp was sized against the wrong `a`
+
+`ALPHA_STALL_MAX` failed twice for the same reason — both values were computed
+using `a = 0.19` when the effective value is nearer 0.15.
+
+| value | result |
+|---|---|
+| 28 | `a·28 = 4.2` vs a 4.24 breakaway. Whether the platform moved was a **coin flip on stiction**. It sat at `alpha = 28.0` for 1.8 s, never moved, wound the wheel to 44.5, hit the abort |
+| 40 | Slews landed, but terminal corrections needed `28 + 0.84·ω_w` commanded — arriving above ~17 rad/s stalled 2–9° short |
+| **55** | Covers arrival up to ~32 rad/s. Works |
+
+Any constant derived from `a` deserves the same scrutiny.
+
+### Braking through the linearization
+
+§10. A commanded −10 rad/s² was delivered as −27, above breakaway. The
+compensation shortfall adds to a negative α.
 
 ### `A1`/`A2` collide with Arduino macros
 
-`A0`–`A15` are predefined analog pin macros on STM32duino. Use `A_1`/`A_2`.
-Same reason the mode enum is `CTRL_*` rather than `MODE_*`.
+`A0`–`A15` are predefined analog pin macros on STM32duino. Use `A_1`/`A_2`. Same
+reason the mode enum is `CTRL_*`.
 
 ### Device Guard blocks `arm-none-eabi-gcc-ar.exe`
 
-WDAC blocks specific binaries by reputation. `g++.exe` ran fine from the same
-folder — `gcc-ar` is a rarely-invoked LTO wrapper with no reputation.
-
-**Fix:** substitute plain `arm-none-eabi-ar` via `use_plain_ar.py`, registered
-**without** the `pre:` prefix:
+WDAC blocks specific binaries by reputation. Fix: substitute plain
+`arm-none-eabi-ar` via `use_plain_ar.py`, registered **without** the `pre:`
+prefix:
 
 ```ini
 extra_scripts = use_plain_ar.py     ; correct
 extra_scripts = pre:use_plain_ar.py ; runs too early, platform overwrites AR
 ```
 
-You lose only the LTO plugin, which this project does not use.
-
 ### Serial prompts vs abort-on-any-byte
 
 A typed character's trailing Enter arrives a few ms *after* the character. A
-prompt that drains once and returns immediately misses it — the byte lands
-moments later and `checkAbort()` reads it as an abort, killing the sweep the
-keypress just resumed.
-
-**Fix:** `waitForKeypress()` drains until the link has been quiet for
-`START_FLUSH_MS` (400 ms). Always use it for prompts; never hand-roll
-wait-then-drain-once.
+prompt that drains once and returns immediately misses it — the byte lands moments
+later and `checkAbort()` reads it as an abort. Fix: `waitForKeypress()` drains
+until the link has been quiet for 400 ms.
 
 ### Metadata regex broke capture silently
 
-`capture_calibration.py` originally matched the metadata line exactly
-(`from=...V to=...V hold=...ms stop_reason=...`). When repeats and phase flags
-were added, the match failed, the state machine stalled in `AWAIT_META`, and
-**a full sweep was lost** — no files written, no error.
-
-**Fix:** treat metadata as opaque, detect the CSV header (`t_us,`) instead, add
-a stall guard and an exit summary.
+`capture_calibration.py` originally matched the metadata line exactly. When
+repeats and phase flags were added the match failed, the state machine stalled,
+and **a full sweep was lost** — no files, no error. Fix: treat metadata as opaque,
+detect the CSV header (`t_us,`) instead, add a stall guard.
 
 ### Buffer sizing
 
@@ -1068,84 +1093,104 @@ structural fix, not just a bigger number.
 
 ### INA219 reading `inf`
 
-`begin()` returning true only confirms an I2C ack, not that calibration
-registers are set. Call `setCalibration_32V_2A()` explicitly. Also carries a
-~−6 mA zero offset worth subtracting.
+`begin()` returning true only confirms an I2C ack, not that calibration registers
+are set. Call `setCalibration_32V_2A()` explicitly.
 
 ### I2C speed dominates the loop
 
-At the default 100 kHz each logged sample cost ~3.7 ms (MPU6050 + two INA219
-reads) against a ~27 kHz bare FOC loop — why phase B logged at 224 Hz rather
-than the 320 Hz its decimation implied. `Wire.setClock(400000)` in all current
-firmware.
+At the default 100 kHz each logged sample cost ~3.7 ms against a ~27 kHz bare FOC
+loop. `Wire.setClock(400000)` in all current firmware.
 
 ### TIM2/TIM3 are taken — matters for the RTOS merge
 
 Motor PWM uses TIM2_CH1 (PA5) and TIM3_CH1/CH2 (PA6/PA7). The proven RTOS
-skeleton in `unflashed_files/rtos_tester.cpp` uses `HardwareTimer(TIM2)` for its
-1 kHz tick — `setOverflow()` rewrites TIM2's ARR, the same register that sets
-the PWM period. **Use TIM4, TIM5, or TIM9 for the control-loop timer.**
+skeleton uses `HardwareTimer(TIM2)` for its 1 kHz tick — `setOverflow()` rewrites
+TIM2's ARR, the same register that sets the PWM period. **Use TIM4, TIM5, or
+TIM9 for the control-loop timer.**
 
-### Net rotation is not total rotation
+### Angle wrapping in analysis
 
-§12 run 3. The printed figure is signed net over the whole capture including
-phase A. Integrate `|gyro|` if you want distance travelled.
-
-### Peak rate is a bad breakaway detector
-
-§12 run 5. Ball-transfer compliance lets the platform deflect and spring back.
-Use net displacement.
+A `T180` that lands at −178.24° is 1.76° from target, not 358°. Wrap before
+computing error or a good result reads as a catastrophic one.
 
 ---
 
-## 18. Open items
-
-### Immediate
-
-1. **Run the closed loop.** `O1` sign check, then `H0`, then `T90`. This is the
-   next action.
-2. **Tune** per §16.
-3. **Persist tuned gains** into the source.
+## 17. Open items
 
 ### Near-term
 
-4. **`motor.shaft_angle`** instead of `sensor.getAngle()` — fixes the angle sign
+0. **Friction magnitude sweep — the one real tuning gap.** `A_FRICTION` was
+   raised from 22.3 to 28.3 by calculation, never swept on hardware. Until it is,
+   small-error corrections clear breakaway by a margin comparable to stiction's
+   own variability, and the terminal approach stays a coin flip. The test is
+   repeated 5° corrections from rest, not large slews. **Deliberately deferred to
+   the combined retune** (see below) rather than done now.
+1. **RTOS merge.** Currently a super-loop. Target: Control Loop task
+   (timer/semaphore, 500 Hz–1 kHz), Safety/Watchdog (10–20 Hz), Comms
+   (event-driven). Remember the TIM2 conflict.
+2. **Vision.** AprilTag on the Pi, UART protocol, complementary filter, then
+   Kalman. This is what removes the 0.8°/min drift and makes heading *accurate*
+   rather than merely precise.
+3. **`motor.shaft_angle`** instead of `sensor.getAngle()` — fixes the angle sign
    at the source.
-5. **Vision:** AprilTag on the Pi, UART protocol, complementary filter, then
-   Kalman.
-6. **RTOS merge** — remember the TIM2 conflict.
-7. **Desaturation.** Each slew banks 20–30 rad/s. The fix is to ramp the wheel
-   down slowly enough that reaction torque stays below breakaway, so friction
-   holds the platform while the wheel unwinds. The ramp-rate experiment that
-   sizes this was deferred and never run.
+4. **Persist tuned gains** after each session; serial-set values do not survive a
+   power cycle.
 
 ### Known unknowns
 
-- **`J_p` absolute** — only the ratio is known. Measure geometrically
-  (`½mR²` or a pendulum test), *not* from momentum conservation, since friction
-  corrupts that ledger.
-- **Direction asymmetry** — real at 4 V (7.2%, 7σ), noise at ≤2.5 V. Unmodelled.
-- **Low-voltage nonlinearity** — single-slope residuals ±9.8%; two-parameter
-  R/K_v fit is 4.9% RMS but worst at 1.0 V (+10%). Coulomb friction is the
-  likely cause.
-- **Breakaway repeatability** — only 2 repeats, rep 1 systematically higher than
-  rep 2, cause unestablished.
+- **`a` absolute** — 0.19 nominal, evidence says 0.15–0.17. Deliberately not
+  chased (§3); `A_FRICTION` is tuned empirically instead. Any future constant
+  derived from `a` needs checking — two have already failed (§16).
+- **`J_p` absolute** — only the ratio is known. Would need a geometric or
+  pendulum measurement, *not* momentum conservation, since friction corrupts that
+  ledger.
+- **Direction asymmetry** — a few percent, sign not stable across sessions.
+  Likely thermal. Covered by margin rather than modelled.
+- **Low-voltage nonlinearity** — single-slope residuals ±9.8%; the two-parameter
+  R/K_v fit is 4.9% RMS but worst at 1.0 V (+10%). Coulomb friction is the likely
+  cause.
+- **Breakaway repeatability** — only 2 repeats, rep 1 systematically higher.
+
+### Deferred to the combined retune
+
+Adding the fan subsystem changes platform mass, inertia, and friction, so `a`,
+`A_FRICTION`, `A_1`, `A_2`, and every gain derived from them must be
+re-identified regardless. Tuning the rotation axis to perfection first would be
+work thrown away. The plan is therefore: finish the RTOS merge, add vision, build
+the translation hardware, then run **one** identification and tuning campaign
+across x, y, and θ together.
+
+Carried into that campaign:
+
+| item | what to do |
+|---|---|
+| `a` absolute | Measure geometrically (`½mR²`) once the final chassis exists. It sets the gain formulas and `A_FRICTION`, and every constant sized against the wrong value has failed at least once (§16) |
+| `A_FRICTION` | Sweep on hardware with repeated small corrections, per §13 step 9 |
+| Coarse/fine deadzone | Re-derive the floor from the new `ffFrac × A_FRICTION` |
+| `compFrac` | Re-run the `C` sweep; the wheel is unchanged but the platform inertia is not |
+| Gains | Re-run the descent through the table with the new `a` |
+| `ω_w` in the LQR cost | Momentum management currently falls out of a compensation margin rather than the design. With three axes to weight anyway, this is the moment to do it properly |
+
+**Do not carry forward:** the assumption that `a` = 0.19, or any constant derived
+from it.
 
 ### Deliberately not done
 
-- **MPC.** Simulated slews use 18% of voltage with zero saturated timesteps.
-  With inactive constraints MPC converges to exactly the LQR solution, so it
-  would cost significant complexity for identical behaviour. It becomes
-  worthwhile for terminal docking (terminal state constraints), momentum limits
-  as hard constraints, and the unidirectional fan allocation problem. Best
-  placed on the Pi at 10–50 Hz feeding setpoints to this loop, replacing the
-  trajectory generator rather than the controller.
+- **MPC.** Simulated slews use 18% of voltage with zero saturated timesteps. With
+  inactive constraints MPC converges to exactly the LQR solution, so it would cost
+  significant complexity for identical behaviour. It becomes worthwhile for
+  terminal docking (terminal state constraints), momentum limits as hard
+  constraints, and the unidirectional fan allocation problem. Best placed on the
+  Pi at 10–50 Hz feeding setpoints to this loop, replacing the trajectory
+  generator rather than the controller.
+- **Active desaturation ramp.** Passive unwind covers the operating range and is
+  self-limiting; the active version is easy to get dangerously wrong (§10).
 
 ---
 
-## 19. Translation subsystem — future
+## 18. Translation subsystem — future
 
-Not started. Notes carried forward.
+Not started.
 
 ### None of the rotation constants transfer
 
@@ -1154,42 +1199,37 @@ curves, platform mass, translational breakaway force, table-tilt disturbance.
 
 **What transfers is the method:** measure the deadband before tuning, check
 controllability before designing, test Coulomb vs viscous rather than assuming,
-verify signs open-loop first.
+verify signs open-loop first, and re-identify when the closed loop disagrees with
+the model.
 
 ### Architecture
 
-Because translation is architecturally decoupled from rotation, the clean
-approach is a rotation transform (world → body frame using `θ`) then **three
-independent double integrators** — x, y, θ — each with its own PD. Three tuning
-problems, not one 18-dimensional one.
+Because translation is architecturally decoupled from rotation, the clean approach
+is a rotation transform (world → body frame using `θ`) then **three independent
+double integrators** — x, y, θ — each with its own PD. Three tuning problems, not
+one 18-dimensional one.
 
 ### Differences from rotation
 
 - **Fans are unidirectional.** Allocation is constrained (thrust ≥ 0). Opposing
-  pairs need idle bias for bidirectional authority, which costs power
-  continuously — but also keeps motors above the sensorless commutation floor.
+  pairs need idle bias for bidirectional authority, which costs power continuously
+  — but also keeps motors above the sensorless commutation floor.
 - **No actuator feedback.** ESCs are open-loop from the MCU: no encoder, no RPM,
-  no thrust. Back-EMF is used *inside* the ESC for commutation only. The only
-  feedback is platform position from vision. Contrast the wheel, where the
-  MT6701 made feedback linearization possible.
+  no thrust. The only feedback is platform position from vision. Contrast the
+  wheel, where the MT6701 made feedback linearization possible — **none of the
+  §5/§7 machinery has an analogue here.**
 - **Square-law nonlinearity.** Thrust ∝ RPM², RPM ≈ linear in throttle, so
-  `throttle = sqrt(F_desired/F_max)`. The fan analogue of feedback
-  linearization, but static.
-- **Table tilt hits translation far harder than rotation.** The plan's 0.3°
-  figure is a translational disturbance. Level the table first.
+  `throttle = sqrt(F_desired/F_max)`. The fan analogue of feedback linearization,
+  but static.
+- **Table tilt hits translation far harder than rotation.** The 0.3° figure from
+  the project plan is a translational disturbance. Level the table first.
 - **Prop reaction torque acts about a horizontal axis** (props spin in vertical
   planes), so it is a tipping moment, not yaw. Thrust-line offset from the CoM
   *does* produce yaw, which the reaction wheel must reject.
 
 ### Inferred translational friction
 
-Both frictions share the same μ:
-
-```
-T_c = μ·m·g·r_b      F_c = μ·m·g      ⟹  F_c = T_c/r_b = J_p·α_break/r_b
-```
-
-For an 8-inch disc (R ≈ 0.102 m), `J_p = ½mR²`, ball radius 70–90 mm:
+Both frictions share the same μ: `F_c = T_c/r_b = J_p·α_break/r_b`.
 
 | mass | friction |
 |---|---|
@@ -1200,19 +1240,19 @@ For an 8-inch disc (R ≈ 0.102 m), `J_p = ½mR²`, ball radius 70–90 mm:
 Plus 6–20 gf for acceleration → **roughly 50–100 gf from one fan** on a cardinal
 push (only one fan works for N/S/E/W; a diagonal splits across two).
 
-**Caveat:** rotation makes each ball roll along a circular arc, so the contact
-also spins about the vertical axis. Pure translation is straight rolling with no
-scrub, so these numbers likely *overstate* the translational case.
+*Caveat: rotation makes each ball roll along a circular arc, so the contact also
+spins about the vertical axis. Pure translation is straight rolling with no scrub,
+so these numbers likely overstate the translational case.*
 
-**Verify directly:** tie a string to the platform, run it over the table edge,
-add weight until it moves. Five minutes, replaces the widest uncertainty in the
+**Verify directly:** tie a string to the platform, run it over the table edge, add
+weight until it moves. Five minutes, replaces the widest uncertainty in the
 sizing.
 
 ### Parts selected
 
 | item | choice | note |
 |---|---|---|
-| motors | FEICHAO 2204 2300KV ×4 | ~$30; 420 gf claim corroborated by an EMAX MT2204 bench test (455 gf on 5×4.5 at 3S) |
+| motors | FEICHAO 2204 2300KV ×4 | ~$30; 420 gf claim corroborated by an EMAX MT2204 bench test |
 | ESC | 4-in-1, 2–6S, PWM/DSHOT | channel matching matters because fan control is open-loop |
 | props | **4-inch preferred** | 5-inch needs 52 mm standoff and must mount within 38 mm of centre to stay inside an 8-inch disc |
 
@@ -1220,9 +1260,9 @@ Prop geometry, 8-inch disc (102 mm radius):
 
 | prop | half-span | max mount radius | standoff above disc |
 |---|---|---|---|
-| 5in | 63.5 mm | 38 mm | 52 mm |
-| 4in | 50.8 mm | 51 mm | 39 mm |
-| 3in | 38.1 mm | 64 mm | 26 mm |
+| 5 in | 63.5 mm | 38 mm | 52 mm |
+| 4 in | 50.8 mm | 51 mm | 39 mm |
+| 3 in | 38.1 mm | 64 mm | 26 mm |
 
 Also needed: a dedicated **5 V / 5 A** buck for the Pi — ESC BECs (~2 A) and
 typical LM2596 modules cannot supply a Pi 5 under OpenCV load.
@@ -1232,16 +1272,25 @@ typical LM2596 modules cannot supply a Pi 5 under OpenCV load.
 ## Appendix — quick reference
 
 ```
-A_1        = 40.56 rad/s²/V      wheel accel per volt
-A_2        = 5.56  1/s           wheel damping pole
-a          = 0.19                J_w/J_p
-A_FRICTION = 22.3  rad/s²        Coulomb feedforward magnitude
+A_1        = 45.5  rad/s²/V      wheel accel per volt
+A_2        = 5.35  1/s           wheel damping pole
+a          = 0.19                J_w/J_p nominal (true value likely 0.15-0.17)
+A_FRICTION = 28.3  rad/s²        Coulomb feedforward magnitude (tune with A)
+compFrac   = 0.89                fraction of A_2 applied; MUST be < neutral
 GYRO_SIGN  = −1
 
-feedback linearisation:  U_q = (α_cmd + 5.56·ω_w) / 40.56
-control law:             α = −K_θ·e + K_ω·ω_p     (minus, PLUS)
-feedforward moving:      α += −22.3·sign(ω_p)     (negative)
-feedforward stuck:       α += +22.3·sign(α)       (positive)
-gains:                   K_θ = ω_n²/0.19,  K_ω = 1.4·ω_n/0.19
-                         ω_n = 5.714/t_settle,  ceiling ω_n ≈ 4.8
+feedback linearisation:  U_q = (α + 0.89·5.35·ω_w) / 45.5
+control law:             α = −K_θ·e + K_ω·ω_p        (minus, PLUS)
+feedforward moving:      α += −ff·A_F·sign(ω_p)      (negative)
+feedforward stuck:       α += +ff·A_F·sign(α)        (positive)
+gains:                   K_θ = ω_n²/a,  K_ω = 1.4·ω_n/a,  ω_n = 5.714/t_settle
+
+delivered α  = commanded − 0.84·ω_w      ← why terminal corrections need a slow wheel
+ω_w,steady   ≈ α / 0.84                  ← why a sustained α stops producing torque
+passive unwind: ω̇_w = −0.84·ω_w, self-limiting below ω_w = 26.5
+
+break-free from rest needs   ff·A_FRICTION + K_θ·|e|  >  ~28
+   -> at small |e| the feedforward magnitude is doing ALL the work,
+      which is why the last few degrees are the unreliable part
+deadband floor = (1−ff)·A_FRICTION/K_θ   -> deadzones must exceed it
 ```
