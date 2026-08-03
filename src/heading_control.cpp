@@ -139,6 +139,8 @@
 #include <Wire.h>
 #include <Adafruit_MPU6050.h>
 #include <Adafruit_Sensor.h>
+#include "timebase.h"
+#include "hw_timers.h"
 
 // ------------------------- hardware -------------------------
 #define POLE_PAIRS      11
@@ -684,7 +686,12 @@ void pollSerial() {
 // =====================================================================
 void setup() {
   Serial.begin(115200);
-  delay(1000);
+  while (!Serial && millis() < 3000) {}
+  us_init();
+
+  timers_dumpAll("BEFORE SimpleFOC init");
+
+  // ... existing SPI/encoder/driver/motor init, initFOC(), Wire, MPU6050, INA219
 
   pinMode(HC05_EN_PIN, OUTPUT);
   digitalWrite(HC05_EN_PIN, LOW);
@@ -718,6 +725,11 @@ void setup() {
   motor.init();
   motor.initFOC();
   motor.target = 0.0f;
+
+  timers_dumpAll("AFTER SimpleFOC init");
+  Serial.print("TIM2 CR1=0x"); Serial.println(TIM2->CR1, HEX);
+
+  // ... rest of your existing setup
 
   printBoth("");
   printBoth("=== Heading controller ===");
