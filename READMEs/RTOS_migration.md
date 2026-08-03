@@ -68,6 +68,153 @@ assume you're comfortable with C and ARM assembly; they're terse on purpose.
 
 ---
 
+## Codebase layout and build mechanics
+
+### The PlatformIO one-sketch rule
+
+PlatformIO compiles **every** `.cpp` in `src/` and links them together. The
+constraint isn't "one file" — it's that exactly one translation unit may define
+`setup()` and `loop()`, because the Arduino core's `main()` calls them and two
+definitions collide at link time.
+
+So: additional `.cpp` and `.h` files in `src/` are fine and normal. Only
+alternate *sketches* have to live in `unflashed_files/`.
+
+`MagneticSensorMT6701SSI.h/.cpp` stay in `src/` permanently — every sketch needs
+them. Same will be true of the infrastructure files below.
+
+### Target file layout
+
+Build this up as you go. Everything except the active sketch is infrastructure
+that survives all seven phases and that `calibration.cpp` will also want.
+
+```
+src/
+  rtos_main.cpp              THE ACTIVE SKETCH — owns setup()/loop()
+  MagneticSensorMT6701SSI.h/.cpp
+
+  timebase.h  timebase.cpp   Step 0.2 — TIM5 free-running µs counter
+  timing_stats.h             Step 0.4 — min/max/mean accumulator (header-only)
+  hw_timers.h  hw_timers.cpp Step 0.3 / 1.5 — timer audit + FOC tick timer
+  trace.h  trace.cpp         Step 1.4 — scheduler tracer ring buffer
+  faults.h  faults.cpp       Step 1.2 — safeStop, noinit black box, hooks
+
+  control_law.h  .cpp        Phase 2 — the §9 control law, lifted verbatim
+  sensors.h  .cpp            Phase 2 → 5 — MPU6050 + INA219 reads
+  telemetry.h  .cpp          Phase 3 — CSV formatting, stream buffer drain
+  commands.h  .cpp           Phase 6 — Commander wiring, parse, dispatch
+  tasks.h  tasks.cpp         Phase 2 onward — task bodies and creation
+
+  FreeRTOSConfig.h           Step 1.2
+
+unflashed_files/
+  heading_control.cpp        the working super-loop — KEEP, do not delete
+  calibration.cpp
+  full.cpp
+  rtos_tester.cpp            superseded by Phase 1; keep for reference
+
+baseline/
+  heading_control_baseline.cpp
+  golden/                    run-8 captures
+
+tools/
+  capture_calibration.py  filter_calibration.py  plot_calibration.py
+  make_replay.py  plot_trace.py    (new, Step 1.4)
+```
+
+### Building from scratch rather than editing in place
+
+Writing `rtos_main.cpp` new and porting pieces across is the cleaner path, and
+it's what this guide assumes from here. But it gives up one safety property, and
+you should give it back deliberately:
+
+**Editing in place** guarantees that at Phase 2 the *only* difference from the
+working firmware is the environment. If behavior changes, it's FreeRTOS.
+
+**Writing from scratch** means Phase 2 differs from the baseline in the
+environment *and* in however you retyped or reorganized the application code.
+Two variables, and the guide's whole regression method assumes one.
+
+**Give it back like this:** for Phase 2, port the control law and sensor code
+**verbatim** — copy-paste, don't retype, don't clean up, don't rename, don't
+"improve while I'm in here." Resist it completely. Keep the exact same constants,
+the same ordering, the same branch structure, even oddities you'd rather fix.
+The reorganizing happens in Phases 3–6, one subsystem per phase, each with its
+own verification.
+
+If you find a genuine bug in the old code while porting, don't fix it in
+`rtos_main.cpp`. Fix it in `heading_control.cpp` first, re-run the golden
+dataset, confirm the change, *then* carry it across. Otherwise you've changed
+the reference and the comparison is meaningless.
+
+### Switching between sketches
+
+Only one file in `src/` may have `setup()`/`loop()`. To flash the old super-loop
+for a comparison run:
+
+```
+mv src/rtos_main.cpp unflashed_files/
+mv unflashed_files/heading_control.cpp src/
+```
+
+You will do this often — every phase exit compares against the baseline. Two
+shell scripts or a small `Makefile` target are worth the five minutes:
+
+```bash
+# tools/use.sh — usage: ./tools/use.sh rtos_main
+mkdir -p unflashed_files
+for f in src/*.cpp; do
+  b=$(basename "$f" .cpp)
+  case "$b" in
+    MagneticSensorMT6701SSI|timebase|timing_stats|hw_timers|trace|faults| \
+    control_law|sensors|telemetry|commands|tasks) continue ;;
+  esac
+  [ "$b" != "$1" ] && mv "$f" unflashed_files/
+done
+[ -f "unflashed_files/$1.cpp" ] && mv "unflashed_files/$1.cpp" src/
+```
+
+Alternatively use PlatformIO `build_src_filter` per environment, which avoids
+moving files at all:
+```ini
+[env:rtos]
+build_src_filter = +<*> -<heading_control.cpp> -<calibration.cpp> -<full.cpp>
+[env:superloop]
+build_src_filter = +<*> -<rtos_main.cpp> -<calibration.cpp> -<full.cpp>
+```
+Then `pio run -e rtos -t upload` or `-e superloop`. Cleaner, and it means both
+builds stay compilable at all times — which catches "I broke the old sketch
+while refactoring" immediately rather than three phases later.
+
+### Header discipline
+
+Every new header gets `#pragma once`. Infrastructure headers should include only
+what they need — `timebase.h` needs `<Arduino.h>` for the CMSIS register
+definitions and nothing else. Keep SimpleFOC out of the infrastructure headers
+entirely; it drags in a lot and you want `trace.h` includable from
+`FreeRTOSConfig.h`-adjacent code.
+
+**One real gotcha:** `FreeRTOSConfig.h` is included by kernel C sources, so
+anything it references (the `traceTASK_SWITCHED_IN` hooks, `rtAssertFail`) must
+be declared with `extern "C"` and must be plain C-compatible. Put those
+declarations in a small `trace_c.h` with an `#ifdef __cplusplus` guard rather
+than pulling a C++ header into the kernel build.
+
+### Files touched by phase
+
+| Phase | Creates | Modifies |
+|---|---|---|
+| 0 | `timebase.*`, `timing_stats.h`, `hw_timers.*` | `heading_control.cpp` (instrumentation only) |
+| 1 | `FreeRTOSConfig.h`, `trace.*`, `trace_c.h`, `faults.*`, `plot_trace.py` | `platformio.ini` |
+| 2 | `rtos_main.cpp`, `tasks.*`, `control_law.*`, `sensors.*` | — |
+| 3 | `telemetry.*` | `tasks.*`, `control_law.*` |
+| 4 | — | `tasks.*`, `hw_timers.*`, `control_law.*` |
+| 5 | — | `tasks.*`, `sensors.*`, `faults.*` |
+| 6 | `commands.*` | `tasks.*`, `telemetry.*` |
+| 7 | — | all, plus `CONTROL_README.md` |
+
+---
+
 ## Phase map
 
 | Phase | Name | Days | Tag |
@@ -146,32 +293,90 @@ That last line is the compFrac margin check. It's the one you'll repeat most.
 measurement instrument must not depend on the thing you're changing. TIM5 on the
 F446 is 32-bit; at 1 MHz it wraps every 71.6 minutes.
 
-**Do.**
+**Do.** Two new files in `src/`. This is infrastructure — it outlives every
+phase, so it does not go inline in a sketch.
+
+`src/timebase.h`
 ```c
-static void us_init(void) {
-  __HAL_RCC_TIM5_CLK_ENABLE();
-  TIM5->PSC = (getTimerClkFreq(TIM5) / 1000000UL) - 1;
-  TIM5->ARR = 0xFFFFFFFFUL;
-  TIM5->EGR = TIM_EGR_UG;
-  TIM5->CR1 = TIM_CR1_CEN;
-}
+#pragma once
+#include <Arduino.h>
+
+/* Free-running 32-bit microsecond counter on TIM5.
+   Independent of SysTick, so it survives the FreeRTOS handoff.
+   Wraps every ~71.6 minutes; unsigned subtraction handles the wrap. */
+void us_init(void);
+
 static inline uint32_t us_now(void) { return TIM5->CNT; }
+
+/* Elapsed microseconds since `t0`, correct across one wrap. */
+static inline uint32_t us_since(uint32_t t0) { return TIM5->CNT - t0; }
 ```
 
-Unsigned subtraction handles wrap correctly: `dt = us_now() - t_prev` is right
-even across the rollover, as long as you keep everything `uint32_t` and the
-interval is under 71 minutes.
+`src/timebase.cpp`
+```c
+#include "timebase.h"
+
+void us_init(void) {
+  __HAL_RCC_TIM5_CLK_ENABLE();
+  TIM5->CR1 = 0;                                       /* stop before config */
+  TIM5->PSC = (uint32_t)(getTimerClkFreq(TIM5) / 1000000UL) - 1;
+  TIM5->ARR = 0xFFFFFFFFUL;
+  TIM5->EGR = TIM_EGR_UG;                              /* latch PSC/ARR now  */
+  TIM5->SR  = 0;                                       /* clear the UG flag  */
+  TIM5->DIER = 0;                                      /* no interrupts      */
+  TIM5->CR1 = TIM_CR1_CEN;
+}
+```
+
+Then in your sketch:
+```c
+#include "timebase.h"
+...
+void setup() {
+  Serial.begin(115200);
+  us_init();              /* before anything you intend to time */
+  ...
+}
+```
+
+Why `us_since` exists rather than writing `us_now() - t0` inline: unsigned
+subtraction is correct across the wrap, but only if both operands stay
+`uint32_t`. Wrapping it in a function means you can't accidentally promote one
+side to `int` or `unsigned long long` in an expression and silently break the
+rollover behavior.
 
 **Verify (no scope needed).** Compare against a known-good reference:
 ```c
-uint32_t a = us_now(); delay(1000); uint32_t b = us_now();
-Serial.printf("1000ms measured as %lu us\n", b - a);
+uint32_t a = us_now();
+delay(1000);
+Serial.printf("1000 ms measured as %lu us\n", us_since(a));
 ```
-Expect 1,000,000 ± a few hundred. If you get ~500,000 or ~2,000,000, the
-prescaler is wrong — APB1 timers on the F446 run at **2×** the APB1 bus clock,
-which is the classic off-by-2 here. Don't hardcode 89; derive it.
+Expect 1,000,000 ± a few hundred.
 
-**Trap.** Confirm TIM5 isn't claimed by SimpleFOC — Step 0.3.
+| Reading | Meaning |
+|---|---|
+| ~1,000,000 | correct |
+| ~500,000 | prescaler is 2× too large — you assumed the APB1 *bus* clock |
+| ~2,000,000 | prescaler 2× too small |
+| 0 or frozen | `CEN` not set, or the TIM5 clock isn't enabled |
+| wildly unstable | TIM5 is being reconfigured by something else — Step 0.3 |
+
+APB1 timers on the F446 run at **2× the APB1 bus clock** when the APB1 prescaler
+is anything other than 1. That's what `getTimerClkFreq` accounts for. Don't
+hardcode 89.
+
+**Trap 1.** `getTimerClkFreq` lives in the STM32duino core's `HardwareTimer.h`.
+If it doesn't resolve, add `#include <HardwareTimer.h>` to `timebase.cpp`, or
+fall back to `HAL_RCC_GetPCLK1Freq() * 2`.
+
+**Trap 2.** Confirm TIM5 isn't claimed by SimpleFOC before trusting any of this
+— that's Step 0.3, and if TIM5 is taken, come back here and pick another 32-bit
+timer (on the F446 the only other one is TIM2, which is definitely taken).
+
+**Trap 3.** Call `us_init()` *after* `Serial.begin()` but *before*
+`driver.init()`. If SimpleFOC does touch TIM5, initializing yours second means
+you'd overwrite its config rather than the reverse — which is a louder, easier
+failure to spot than a silently wrong PWM period.
 
 ---
 
@@ -181,22 +386,60 @@ which is the classic off-by-2 here. Don't hardcode 89; derive it.
 **PB6 = TIM4_CH1**, and if SimpleFOC configured it as a timer output rather than
 a plain GPIO enable, TIM4 is taken too. Find out rather than guess.
 
-**Do.** At the end of `setup()`, after `driver.init()` and `motor.initFOC()`:
+**Do.** New files, `src/hw_timers.h` / `src/hw_timers.cpp`. Step 1.5 will add
+the FOC tick timer to the same pair, so give it a home now.
 
+`src/hw_timers.h`
 ```c
-static void dumpTimer(const char* n, TIM_TypeDef* t) {
-  Serial.printf("%-5s CEN=%lu ARR=%lu PSC=%lu CCER=%04lX CCMR1=%04lX\n",
-    n, (t->CR1 & 1), t->ARR, t->PSC, t->CCER, t->CCMR1);
-}
-dumpTimer("TIM2", TIM2); dumpTimer("TIM3", TIM3); dumpTimer("TIM4", TIM4);
-dumpTimer("TIM5", TIM5); dumpTimer("TIM9", TIM9); dumpTimer("TIM11", TIM11);
+#pragma once
+#include <Arduino.h>
+
+void timers_dumpAll(void);          /* Step 0.3 — audit */
+/* void focTick_init(uint32_t hz); */  /* Step 1.5 — added later */
 ```
 
-A timer with `CEN=1` and non-zero `CCER` is driving an output and is off limits.
+`src/hw_timers.cpp`
+```c
+#include "hw_timers.h"
+
+static void dumpTimer(const char* n, TIM_TypeDef* t) {
+  Serial.printf("%-6s CEN=%lu ARR=%-6lu PSC=%-6lu CCER=%04lX CCMR1=%04lX DIER=%04lX\n",
+    n, (unsigned long)(t->CR1 & TIM_CR1_CEN), (unsigned long)t->ARR,
+    (unsigned long)t->PSC, (unsigned long)t->CCER,
+    (unsigned long)t->CCMR1, (unsigned long)t->DIER);
+}
+
+void timers_dumpAll(void) {
+  Serial.println(F("--- timer audit ---"));
+  dumpTimer("TIM1",  TIM1);   dumpTimer("TIM2",  TIM2);
+  dumpTimer("TIM3",  TIM3);   dumpTimer("TIM4",  TIM4);
+  dumpTimer("TIM5",  TIM5);   dumpTimer("TIM8",  TIM8);
+  dumpTimer("TIM9",  TIM9);   dumpTimer("TIM10", TIM10);
+  dumpTimer("TIM11", TIM11);  dumpTimer("TIM12", TIM12);
+  Serial.println(F("-------------------"));
+}
+```
+
+Call `timers_dumpAll()` at the **end** of `setup()`, after `driver.init()` and
+`motor.initFOC()` — before those, nothing is configured and the dump is
+meaningless.
+
+**Reading the dump:**
+
+| Pattern | Meaning |
+|---|---|
+| `CEN=0`, everything zero | free |
+| `CEN=1`, `CCER≠0` | driving an output — off limits |
+| `CEN=1`, `CCER=0`, `DIER≠0` | someone's using it for interrupts only |
+| `CEN=1`, `CCER=0`, `DIER=0` | running but unused — suspicious, investigate |
 
 **Verify.** Fill in Appendix B. Expect TIM2/TIM3 taken. Choose the FOC tick
-timer from what's free, preferring **TIM9** (16-bit, APB2, nothing else wants it),
-then TIM11, then TIM4 only if confirmed free.
+timer from what's free, preferring **TIM9** (16-bit, APB2, nothing else wants
+it), then TIM11, then TIM4 only if confirmed free.
+
+**Trap.** Reading a timer's registers with its peripheral clock disabled returns
+garbage or hard-faults on some parts. If a dump line looks nonsensical, that's
+usually a disabled clock — which itself means the timer is free.
 
 ---
 
@@ -206,18 +449,47 @@ then TIM11, then TIM4 only if confirmed free.
 that averages 200 µs but occasionally takes 4 ms will miss deadlines, and the
 average won't tell you. You need **max**.
 
-**Do.** Add a small stats accumulator and a `M` command that dumps it:
+**Do.** New header-only file `src/timing_stats.h`. Header-only because it's all
+`static inline` — no `.cpp` needed, and the compiler can fold `TIME_BLOCK` down
+to a couple of instructions.
 
 ```c
+#pragma once
+#include "timebase.h"
+
 typedef struct { uint32_t n, mn, mx; uint64_t sum; } stat_t;
+
+static inline void stat_reset(stat_t* s) { s->n = 0; s->mn = 0; s->mx = 0; s->sum = 0; }
+
 static inline void stat_add(stat_t* s, uint32_t v) {
   if (!s->n || v < s->mn) s->mn = v;
-  if (v > s->mx) s->mx = v;
+  if (v > s->mx)          s->mx = v;
   s->sum += v; s->n++;
 }
-#define TIME_BLOCK(st, code) do { uint32_t _a = us_now(); code; \
-                                  stat_add(&(st), us_now() - _a); } while (0)
+
+static inline void stat_print(const char* name, const stat_t* s) {
+  if (!s->n) { Serial.printf("%-18s (no samples)\n", name); return; }
+  Serial.printf("%-18s n=%-8lu min=%-7lu mean=%-7lu MAX=%lu\n",
+    name, (unsigned long)s->n, (unsigned long)s->mn,
+    (unsigned long)(s->sum / s->n), (unsigned long)s->mx);
+}
+
+/* Time a block and fold the result into a stat_t.
+   Usage: TIME_BLOCK(st_foc, { motor.loopFOC(); });                    */
+#define TIME_BLOCK(st, code) do { uint32_t _a = us_now(); \
+                                  code; \
+                                  stat_add(&(st), us_since(_a)); } while (0)
 ```
+
+Then in the sketch, one `stat_t` per block you're measuring, plus an `M` command
+that calls `stat_print` for each and a `M!` (or similar) that resets them all.
+
+```c
+static stat_t st_foc, st_move, st_mpu, st_ina, st_law, st_telem, st_period;
+```
+
+Instrument, with the motor **spinning** (not idle — the feedforward branches and
+`sign()` paths only execute under motion):
 
 Instrument, with the motor **spinning** (not idle — the feedforward branches and
 `sign()` paths only execute under motion):
@@ -390,13 +662,47 @@ corruption.
 #define traceTASK_SWITCHED_OUT()  traceOut()
 ```
 
-Implement three failure hooks. **All three must kill the motor first:**
+Implement three failure hooks in new files `src/faults.h` / `src/faults.cpp`.
+**All three must kill the motor first.**
 
+`src/faults.h`
 ```c
-extern "C" void vApplicationStackOverflowHook(TaskHandle_t t, char* name);
-extern "C" void vApplicationMallocFailedHook(void);
-extern "C" void rtAssertFail(const char* file, int line);
+#pragma once
+#include <stdint.h>
+
+typedef enum {
+  FAULT_NONE = 0, FAULT_ASSERT, FAULT_STACK_OVERFLOW, FAULT_MALLOC,
+  FAULT_SCHEDULER_RETURNED, FAULT_WHEEL_SAT, FAULT_UNDERVOLT,
+  FAULT_OVERCURRENT, FAULT_HEARTBEAT, FAULT_I2C_TIMEOUT
+} fault_t;
+
+void faults_safeStop(fault_t r);   /* the ONE stop path — used by everything */
+void faults_reportLastBoot(void);  /* prints the .noinit record at startup   */
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+void rtAssertFail(const char* file, int line);
+#ifdef __cplusplus
+}
+#endif
 ```
+
+`rtAssertFail` needs `extern "C"` because `FreeRTOSConfig.h` is included by the
+kernel's C sources — a C++-mangled symbol won't link.
+
+The black box:
+```c
+typedef struct { uint32_t magic; fault_t reason; int line; char file[24]; }
+  fault_record_t;
+__attribute__((section(".noinit"))) static fault_record_t g_fault;
+```
+`.noinit` survives a reset because the startup code doesn't zero it. Guard with
+a magic value so you don't read garbage on a cold power-up. Print it at the top
+of `setup()` — with no debugger attached, this is how you find out what happened.
+
+Every stop path does the same three things in the same order: disable the driver,
+zero the target, latch the reason. Then blink a distinctive LED pattern forever.
 
 Each should: `motor.target = 0; motor.disable(); driver.disable();` then store
 `file`/`line` in a `__attribute__((section(".noinit")))` struct with a magic
@@ -463,6 +769,36 @@ highest-leverage thing in the guide given your tooling.
 and you capture the exact scheduler timeline — which task ran, when, for how
 long, including idle. This is precisely what SEGGER SystemView does; you're
 building a minimal version of it.
+
+**Files.** Three, because of the C/C++ boundary:
+
+- `src/trace_c.h` — the ID enum and the two hook function declarations, plain C,
+  `extern "C"` guarded. This is what `FreeRTOSConfig.h` pulls in.
+- `src/trace.h` — the C++ API (`trace_start`, `trace_stop`, `trace_dump`,
+  `traceRec`).
+- `src/trace.cpp` — the buffer and implementation.
+
+`src/trace_c.h`
+```c
+#pragma once
+#include <stdint.h>
+
+enum { TRACE_ID_IDLE = 0, TRACE_ID_CTRL = 1, TRACE_ID_FOC = 2,
+       TRACE_ID_SAFETY = 3, TRACE_ID_COMMS = 4, TRACE_ID_TELEM = 5 };
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+void traceIn(void);
+void traceOut(void);
+#ifdef __cplusplus
+}
+#endif
+```
+`FreeRTOSConfig.h` then does `#include "trace_c.h"` and defines the two macros in
+terms of those. Do **not** pull `trace.h` (or anything touching SimpleFOC or
+Arduino C++ headers) into `FreeRTOSConfig.h` — it's included from kernel C files
+and will not compile.
 
 **Do — the ring buffer.**
 
@@ -585,35 +921,96 @@ golden dataset re-run needed.
 
 # Phase 2 — Single-task port
 
-**Goal:** the entire existing super-loop, unmodified, inside one task. Highest
-value, lowest risk step in the guide.
+**Goal:** the entire existing super-loop, **behaviorally unmodified**, inside one
+task in a new sketch. Highest value, lowest risk step in the guide — provided you
+resist reorganizing while you port.
 
-## Step 2.1 — Wrap the loop
+## Step 2.0 — Port order
+
+**Concept.** You're writing `rtos_main.cpp` from scratch and moving code across.
+The risk is changing two things at once: the environment *and* the application.
+The mitigation is a fixed port order with a compile-and-flash checkpoint at each
+stage, so a break is attributable.
+
+Port in this order. Flash and check at each numbered stop.
+
+| # | Move across | Check |
+|---|---|---|
+| 1 | Includes, globals, constants, pin defines | Compiles. Diff the constants block against the baseline character by character — this is where a typo does the most damage. |
+| 2 | Hardware init (SPI, encoder, driver, `motor.init/initFOC`, Wire, MPU6050, INA219) into `hwSetup()` | Flash. Boot text matches baseline. Encoder reads sane angle. |
+| 3 | Sensor reads into `sensors.cpp` | Gyro and INA219 values match baseline at rest. |
+| 4 | The §9 control law into `control_law.cpp`, unchanged | Compiles. Not yet called. |
+| 5 | Wire it together as a plain super-loop in `loop()` — **no FreeRTOS yet** | **Full golden dataset. Must match.** This proves the port is clean before the scheduler is a variable. |
+| 6 | Wrap in one task, start the scheduler (Step 2.1) | **Full golden dataset again.** Any difference now is FreeRTOS. |
+
+Stop 5 is the one that makes this approach safe. Don't skip it to save a flash
+cycle — it's the entire reason the from-scratch path is as trustworthy as an
+in-place edit.
+
+**Port verbatim.** Copy-paste, don't retype. Don't rename, don't reorder, don't
+clean up, don't fix the thing that's been bothering you. If you find a real bug,
+fix it in `heading_control.cpp` first, re-run the golden dataset there, confirm
+the change, then carry it across. Otherwise you've moved the reference.
+
+**Trap — the constants block.** `A_1 = 45.5`, `A_2 = 5.35`, `compFrac = 0.89`,
+`K_θ = 119.3`, `K_ω = 35.1`, `ffFrac = 0.90`, `GYRO_SIGN = −1`, deadzones,
+`ALPHA_STALL_MAX`, `STALL_WW`, `WHEEL_SAT_LIMIT`. A single transposed digit here
+produces behavior that looks like an RTOS bug and isn't. Diff them mechanically
+rather than reading them.
+
+---
+
+## Step 2.1 — Wrap the loop in one task
 
 **Concept.** Every environmental difference between bare metal and running under
-a scheduler — stack, FPU, tick, `micros()`, interrupt priorities — hits you here
-with zero application changes to confuse the picture. If something breaks, it's
-the environment, and you know it.
+a scheduler — stack, FPU, tick, `micros()`, interrupt priorities — hits you here.
+Because stop 5 already proved the application code is faithful, anything that
+changes now is the environment.
 
-**Do.**
+**Do.** `src/rtos_main.cpp`:
 ```c
-TaskHandle_t hControl;
-
-static void controlTask(void*) {
-  hwSetup();                 /* everything setup() did after Serial.begin */
-  for (;;) superLoopBody();  /* the existing loop() body, verbatim */
-}
+#include <Arduino.h>
+#include <STM32FreeRTOS.h>
+#include "timebase.h"
+#include "timing_stats.h"
+#include "hw_timers.h"
+#include "faults.h"
+#include "trace.h"
+#include "tasks.h"
 
 void setup() {
   Serial.begin(115200);
   us_init();
-  printLastFaultReason();
-  xTaskCreate(controlTask, "ctrl", 1536, NULL, 3, &hControl);
-  vTaskSetThreadLocalStoragePointer(hControl, 0, (void*)1);
+  faults_reportLastBoot();      /* the .noinit black box from Step 1.2 */
+  tasks_createAll();
   vTaskStartScheduler();
+  /* unreachable — if we get here, the heap was too small */
+  faults_safeStop(FAULT_SCHEDULER_RETURNED);
 }
-void loop() {}
+
+void loop() {}                  /* never runs */
 ```
+
+`src/tasks.cpp`:
+```c
+TaskHandle_t hControl;
+
+static void controlTask(void*) {
+  hwSetup();                    /* everything setup() did after Serial.begin */
+  for (;;) superLoopBody();     /* the ported loop body, verbatim */
+}
+
+void tasks_createAll(void) {
+  configASSERT(xTaskCreate(controlTask, "ctrl", 1536, NULL, 3, &hControl) == pdPASS);
+  vTaskSetThreadLocalStoragePointer(hControl, 0, (void*)TRACE_ID_CTRL);
+}
+```
+
+Note `hwSetup()` runs **inside** the task, not in `setup()`. SimpleFOC's
+`initFOC()` alignment routine spins the motor and takes hundreds of milliseconds;
+doing it before the scheduler starts works, but doing it inside the task means it
+uses the task's stack and the task's FPU context, which is what you want to be
+testing. It also means the failure hooks are live while it runs.
 
 1536 words (6 KB) is deliberately generous — SimpleFOC plus float `sprintf` in
 one task. You'll trim in Phase 7.
