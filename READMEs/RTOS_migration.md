@@ -642,6 +642,18 @@ active). If those aren't there, you're on the wrong port.
 **Trap.** Some ports select by `#define` rather than directory. The objdump
 check is authoritative; trust it over the path.
 
+**Result (2026-08-03) — CONFIRMED `ARM_CM4F`.** The STM32duino `src/port.c`
+selects the variant at compile time: `__CORTEX_M == 4 && __FPU_PRESENT == 1`
+(MPU branch `#if 0`'d) → `#include ".../ARM_CM4F/port.c"`. Objdump of the actual
+compiled `port.c.o` (authoritative, per the trap) shows in `PendSV_Handler`:
+`tst.w lr, #16` (EXC_RETURN bit-4 test), `vstmdbeq r0!, {s16-s31}` (save
+callee-saved FPU regs), `vldmiaeq r0!, {s16-s31}` (restore) — plus the
+`vPortEnableVFP` symbol. The conditional (`eq`) is lazy FPU stacking: S16–S31 are
+saved only for tasks that actually touched the FPU. VFP instructions being
+emitted at all also proves the hard-float ABI (`-mfpu=fpv4-sp-d16
+-mfloat-abi=hard`). Float-heavy control law and FOC transforms in separate tasks
+are safe.
+
 ---
 
 ## Step 1.2 — Write `FreeRTOSConfig.h` deliberately
@@ -736,6 +748,56 @@ debugger attached it's how you'll find out what happened.
 **Trap.** Every stack size in FreeRTOS on ARM is in **words** (4 bytes).
 `xTaskCreate(..., 128, ...)` gives you 512 bytes. A large share of "random
 crashes" reports are this.
+
+**Result (2026-08-03) — files written, compiles clean.** Three files:
+`src/STM32FreeRTOSConfig.h`, `src/faults.h`, `src/faults.cpp`. Build SUCCESS
+(RAM 35.5% / 46.5 KB, Flash 14.6%), no warnings, no hook collisions.
+
+STM32duino-specific decisions worth remembering:
+- **Config filename must be `STM32FreeRTOSConfig.h`, not `FreeRTOSConfig.h`.** The
+  library's wrapper `FreeRTOSConfig.h` does `#if __has_include("STM32FreeRTOSConfig.h")`
+  → full override (skips `FreeRTOSConfig_Default.h`). Naming it `FreeRTOSConfig.h`
+  would be silently ignored and you'd run the library defaults.
+- **Own the hooks via `_BLINK=0`.** The library defines `vApplicationMallocFailedHook`
+  / `vApplicationStackOverflowHook` **strong** (not weak), but only when
+  `configUSE_MALLOC_FAILED_HOOK_BLINK` / `configCHECK_FOR_STACK_OVERFLOW_BLINK`
+  are `1`. Set both `0` → library stays out, `faults.cpp` defines them, no
+  multiple-definition error.
+- **Do NOT alias `xPortSysTickHandler`.** STM32duino's core owns SysTick at 1 kHz
+  and the library hooks it via `osSystickHandler()`; aliasing `SysTick_Handler`
+  double-defines it. Consequence: `configTICK_RATE_HZ` MUST be 1000.
+- **Handler aliases required:** `vPortSVCHandler→SVC_Handler`,
+  `xPortPendSVHandler→PendSV_Handler`, or the vector table never reaches the port.
+- **`INCLUDE_xTaskGetSchedulerState 1` is load-bearing, not optional.** STM32duino
+  drives the kernel tick via core SysTick → `osSystickHandler()` → `xPortSysTickHandler()`,
+  and `osSystickHandler` guards that call with
+  `if (xTaskGetSchedulerState() != taskSCHEDULER_NOT_STARTED)`. That guard is
+  `#if`'d on `INCLUDE_xTaskGetSchedulerState == 1`. With it 1, the super-loop and
+  every RTOS `setup()` run safely before `vTaskStartScheduler()` (tick skipped,
+  only `HAL_IncTick` runs). With it 0, the guard compiles out and the first
+  SysTick before scheduler start calls `xPortSysTickHandler` into uninitialised
+  task lists → hard fault. This is why the super-loop still works with FreeRTOS
+  now linked in.
+- **Run-time-stats clock** routed through `rtRunTimeCounter()` (returns `TIM5->CNT`,
+  in `faults.cpp`) so the config header needn't include the CMSIS device header.
+- **Decoupled safe-stop:** `faults_init(enablePin, ledPin, stopHook)`. Hardware
+  kill (drive DRV8313 enable LOW) runs first, before the SimpleFOC graceful stop,
+  so a corrupt motor object can't prevent the kill. `faults.*` stays SimpleFOC-free.
+
+**Open contingency — the `.noinit` black box.** The F446RE variant ldscript has
+NO `.noinit` section, so `g_fault` lands as an orphan; the `0x5A1F0B0B` magic
+makes a stray zeroing benign (reads as "clean boot"). **Step 1.3 verifies it
+empirically:** trip the assert, reset, and confirm `faults_reportLastBoot()`
+prints `ASSERT at faults.cpp:NN`. If it prints "clean boot" instead, the orphan
+got zeroed — add this project-local fragment (`ldscripts/noinit.ld`) and the flag
+`-Wl,-T"${platformio.project_dir}/ldscripts/noinit.ld"` to `platformio.ini`:
+```
+SECTIONS {
+  .noinit (NOLOAD) : { . = ALIGN(4); *(.noinit) *(.noinit*) . = ALIGN(4); } > RAM
+} INSERT AFTER .bss;
+```
+This places `.noinit` above `_ebss` (startup's bss-clear skips it) and below `_end`
+(heap starts after it) — guaranteed to survive a warm reset.
 
 ---
 
