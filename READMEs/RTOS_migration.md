@@ -24,8 +24,8 @@ replaces the analyzer.
 
 ## Current position
 
-**Phase 1, Step 1.5 (FOC tick timer on TIM9) is NEXT.**
-Done: Phase 0 (all), Steps 1.1, 1.2, 1.3, 1.4. Not started: 1.5, then Phases 2–7.
+**Phase 2 (single-task port) is NEXT. Phase 1 is COMPLETE — tag `rtos-p1-kernel`.**
+Done: Phase 0 (all), Phase 1 (1.1–1.5). Not started: Phases 2–7.
 
 **Git:** branch `rtos-migration`. Last commit `Phase 1.1-1.2: pin deps, prove FPU
 port, FreeRTOSConfig + fault hooks`. The Step 1.3 work (config move to `include/`,
@@ -112,8 +112,8 @@ uncommitted — check `git status` and commit before continuing if so.
 | 1.2 FreeRTOSConfig + faults | ✅ | `include/STM32FreeRTOSConfig.h`, `faults.*`; compiles |
 | 1.3 assert + NVIC audit | ✅ | prio-0 ISR → kernel assert → LED + black box; fixed split-brain config |
 | 1.4 software tracer | ✅ | verified: periodic exactly 1000µs (0 jitter), spinner chopped, idle absent |
-| **1.5 FOC tick timer (TIM9)** | **⬜ NEXT** | — |
-| 2.x single-task port | ⬜ | — |
+| 1.5 FOC tick timer (TIM9) | ✅ | TIM9 @ 3999.98 Hz, jitter 0 µs; HardwareTimer API (core owns the vector) |
+| **2.x single-task port** | **⬜ NEXT** | — |
 | 3.x telemetry extraction | ⬜ | — |
 | 4.x FOC split | ⬜ | — |
 | 5.x safety task + I2C mutex | ⬜ | — |
@@ -1247,6 +1247,22 @@ interfering — find it.
 dump afterwards and confirm TIM2/TIM3 registers are unchanged. `HardwareTimer`
 can silently reconfigure a timer SimpleFOC owns. If anything moved, drop to
 direct register configuration.
+
+**Result (2026-08-04) — PASSED.** In `hw_timers.*`: `focTick_init(hz)`,
+`focTick_count/resetStats/jitter`. **Correction to the plan:** raw
+`TIM1_BRK_TIM9_IRQHandler` is NOT usable — the STM32duino core strongly defines it
+in `HardwareTimer.cpp` (`#if TIM9_BASE`, always true here), so a raw handler
+collides at link exactly like TIM7. Used the `HardwareTimer(TIM9)` API +
+`attachInterrupt`, forcing `HAL_NVIC_SetPriority(TIM1_BRK_TIM9_IRQn, 5, 0)` after
+`resume()`. The ISR callback timestamps against the independent TIM5 timebase.
+Measured over a 5 s window: **rate 3999.98 Hz** (0.0005% error, target ±0.1%),
+**inter-fire dt min=max=250 µs → jitter 0 µs**. Zero jitter is expected: at
+priority 5 the tick is more urgent than SysTick (15), nothing sits at 0–4, and the
+report task is blocked (no serial TX) during the window, so nothing delays ISR
+entry. This carries into Phase 4 unchanged — the callback body just gains the
+`CTRL_DIVISOR` counter + the FOC/control `...GiveFromISR` notifies. The
+`HardwareTimer(TIM9)`-touches-only-TIM9 check is deferred to Phase 4 (p1test has no
+SimpleFOC, so TIM2/TIM3 are clock-disabled anyway).
 
 **Phase 1 exit:** `git tag rtos-p1-kernel`. No application code changed, so no
 golden dataset re-run needed.

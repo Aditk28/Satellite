@@ -134,9 +134,15 @@ TIM4 is free (PB6/D10 is a plain GPIO driver-enable) but deliberately **not**
 
 used — TIM4_CH1 is PB6, so a stray channel-enable would toggle the driver enable.
 
-**TIM9 has no `TIM9_IRQHandler`.** Use `TIM1_BRK_TIM9_IRQHandler` /
+**TIM9's vector is `TIM1_BRK_TIM9_IRQn` (not `TIM9_IRQn`).** But you CANNOT define
 
-`TIM1_BRK_TIM9_IRQn`. Writing the obvious name compiles, links, and never fires.
+`TIM1_BRK_TIM9_IRQHandler` yourself — the STM32duino core strongly defines it in
+
+`HardwareTimer.cpp` (guarded only by `#if TIM9_BASE`, always true here), so a raw
+
+handler collides at link, same as TIM7. **Use the `HardwareTimer(TIM9)` API +**
+
+`attachInterrupt`, then override the NVIC priority (Step 1.5, `focTick_init`).
 
 ## 4. Tooling constraints
 
@@ -346,13 +352,17 @@ re-raise it.
 
   relative `-Iinclude`. Cost real time in Step 1.3.
 
-- STM32duino core defines most `TIMx_IRQHandler` symbols (strong) in
+- STM32duino core defines `TIMx_IRQHandler` for EVERY timer with a `_BASE`
 
-  `HardwareTimer.cpp` — defining your own collides at link. Use the HardwareTimer
+  (strong, in `HardwareTimer.cpp`) — including TIM7 and TIM9's combined
 
-  API + `attachInterrupt`, or a timer whose vector the core leaves free (TIM9 via
+  `TIM1_BRK_TIM9_IRQHandler`. Defining your own collides at link. There is no
 
-  `TIM1_BRK_TIM9_IRQHandler`).
+  "free vector" to raw-define; always use the `HardwareTimer` API +
+
+  `attachInterrupt` (the core's handler dispatches to your callback), then
+
+  `HAL_NVIC_SetPriority(..IRQn, prio, 0)` to force the priority you need.
 
 ## 9. Analysis pipeline
 
