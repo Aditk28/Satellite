@@ -366,7 +366,7 @@ tools/plot_calibration.py     →  <run>/filtered/plots/*.png
 
 tools/make_replay.py          →  <run>/filtered/replay.html
 
-tools/plot_trace.py           →  scheduler Gantt (Phase 1.4, not yet written)
+tools/plot_trace.py           →  scheduler Gantt + inter-arrival (Phase 1.4, done)
 
 ```
 

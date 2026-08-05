@@ -85,6 +85,16 @@ void     rtAssertFail(const char* file, int line);
 #define portCONFIGURE_TIMER_FOR_RUN_TIME_STATS()  /* TIM5 already running */
 #define portGET_RUN_TIME_COUNTER_VALUE()          rtRunTimeCounter()
 
+/* ---- scheduler tracer hooks (Step 1.4) ----------------------------------
+   The kernel calls traceTASK_SWITCHED_OUT/IN inside vTaskSwitchContext on every
+   context switch. We point them at traceOut()/traceIn() (defined in trace.cpp)
+   to log the scheduler timeline. trace_c.h lives in include/ so this kernel-side
+   include resolves (same reason this config does). Do NOT pull the C++ trace.h
+   in here — it's included by plain-C kernel TUs. */
+#include "trace_c.h"
+#define traceTASK_SWITCHED_IN()   traceIn()
+#define traceTASK_SWITCHED_OUT()  traceOut()
+
 /* ---- the assertion: the single most important line here. Silent kernel
    corruption (priority-0 ISR calling an API, mutex-from-ISR, blocking before the
    scheduler starts) becomes a caught, motor-killed, reported halt. ---------- */

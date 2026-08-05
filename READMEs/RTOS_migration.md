@@ -13,6 +13,190 @@ replaces the analyzer.
 
 ---
 
+# ═══════════════════════════════════════════════════════════════════════
+# STATUS & RESUME — read this first
+# ═══════════════════════════════════════════════════════════════════════
+
+> This block is the single source of truth for *where we are*. A fresh session
+> (human or a new Claude window) should be able to read only this section plus
+> the named step below and continue without re-deriving anything. Update it at
+> every step exit.
+
+## Current position
+
+**Phase 1, Step 1.5 (FOC tick timer on TIM9) is NEXT.**
+Done: Phase 0 (all), Steps 1.1, 1.2, 1.3, 1.4. Not started: 1.5, then Phases 2–7.
+
+**Git:** branch `rtos-migration`. Last commit `Phase 1.1-1.2: pin deps, prove FPU
+port, FreeRTOSConfig + fault hooks`. The Step 1.3 work (config move to `include/`,
+`platformio.ini` env split + `-Iinclude`, `src/p1_test.cpp`, doc updates) may be
+uncommitted — check `git status` and commit before continuing if so.
+
+## How to resume (new session checklist)
+
+1. **Read, in order:** `CONTROL_README.md` (the controller and plant),
+   `READMEs/claude.md` (conventions, hardware, tuned constants, status), then this
+   file's Status block and the "current step" section.
+2. **Working style** (from `claude.md`, do not violate): one step at a time,
+   interactive. The *user* flashes hardware and reports results — you do not move
+   on until they confirm. Explain every new file/concept before its code;
+   register-level detail (CMSIS, exception behavior, BASEPRI) is welcome, not to
+   be simplified. Port application code **verbatim** in Phase 2. Record decisions
+   with their reasoning in Appendix B. Maintain this guide, not a side channel.
+3. **Safety** (untethered flywheel stores real energy): `X` stops the motor; any
+   unrecognized serial input stops it. `WHEEL_SAT_LIMIT = 45 rad/s` hard abort.
+   Every fault path disables the driver FIRST, then latches a reason, then reports.
+   Never propose a test with hands near a spinning wheel.
+4. Go to the step named under "Current position" and follow Concept→Do→Verify→Trap.
+
+## Build & flash cheat-sheet
+
+- **`pio`** lives at `C:\Users\k28ad\.platformio\penv\Scripts` (on PATH in newly
+  opened terminals; a Claude shell can call the full path
+  `~/.platformio/penv/Scripts/platformio.exe`).
+- **Two build environments** (PlatformIO `build_src_filter`, see below):
+  - `pio run -e superloop -t upload` — the working controller (`heading_control.cpp`). **Default env.**
+  - `pio run -e p1test -t upload` — the Phase 1 throwaway RTOS test harness (`p1_test.cpp`).
+  - (`rtos` env for `rtos_main.cpp` gets added in Phase 2.)
+- **Monitor:** `pio device monitor -e <env>` (115200). Quit with Ctrl+C.
+- **Serial:** two channels — USB (this board routes `Serial` to the ST-LINK UART,
+  no buffering, so open the monitor then press RESET to catch boot output) and
+  HC-05. `printBoth()` in the controller writes both; `stat_print` in the timing
+  code takes a `Print&` so it can target either.
+
+## Critical environment facts (hard-won — do NOT relearn these)
+
+1. **FreeRTOS config placement is a two-part trap.** Our full override must be at
+   **`include/STM32FreeRTOSConfig.h`** (exact filename; not `FreeRTOSConfig.h`,
+   not in `src/`) AND `platformio.ini` `build_flags` must contain **`-Iinclude`**.
+   The filename is what the library wrapper probes via `__has_include`; the
+   `-Iinclude` is what puts it on the *kernel/library* TUs' include path. Miss
+   either and you get a SPLIT-BRAIN build: your project files use your config, the
+   kernel silently uses `FreeRTOSConfig_Default.h` (whose `configASSERT` is a
+   silent `for(;;)` hang). Verify by temporarily adding `#pragma message("X")` to
+   the config and clean-building: it must fire for `port.c`, `tasks.c`, `queue.c`,
+   `heap.c`, … (we counted 13 TUs when correct, 2 when broken). Do NOT use
+   `${platformio.include_dir}` in build_flags — it mangles on Windows.
+2. **The STM32duino core defines most `TIMx_IRQHandler` symbols (strong)** in
+   `HardwareTimer.cpp`. Defining your own collides at link. Use the `HardwareTimer`
+   API + `attachInterrupt`, or a timer whose vector the core leaves free — TIM9,
+   whose handler is `TIM1_BRK_TIM9_IRQHandler` (Step 1.5).
+3. **SysTick is shared with the Arduino core.** The core owns SysTick at 1 kHz and
+   calls a weak `osSystickHandler()`, which the FreeRTOS library overrides to drive
+   the kernel tick — guarded by `if (xTaskGetSchedulerState() != NOT_STARTED)`.
+   Therefore: `configTICK_RATE_HZ` MUST be 1000; `INCLUDE_xTaskGetSchedulerState`
+   MUST be 1 (or the pre-scheduler `setup()` hard-faults); do NOT alias
+   `xPortSysTickHandler`.
+4. **Heap:** `heap_3` (malloc/free wrapper) selected by `-D configMEMMANG_HEAP_NB=3`.
+   Under heap_3, `configTOTAL_HEAP_SIZE` is decorative; the real heap is the newlib
+   C-runtime heap. A failed allocation fires `vApplicationMallocFailedHook`.
+5. **The `.noinit` black box survives a warm reset on this board** (verified Step
+   1.3) even though the linker script has no dedicated `.noinit` section — the
+   orphan placement lands above `_ebss`. No linker fragment needed. The magic guard
+   makes a cold-boot read return "clean boot".
+6. **`pio` PATH:** if a new terminal can't find `pio`, `C:\Users\k28ad\.platformio\penv\Scripts`
+   is on the user's persistent PATH (added Step 1.3); reopen the terminal, or in
+   the current one `$env:Path += ";$env:USERPROFILE\.platformio\penv\Scripts"`.
+
+## Status checklist
+
+| Step | State | One-line result |
+|---|---|---|
+| 0.1 baseline frozen | ✅ | run-8 CSVs archived; summary table deliberately skipped |
+| 0.2 TIM5 µs timebase | ✅ | PSC=89, 1000 ms → 999,993 µs |
+| 0.3 timer audit | ✅ | TIM2/TIM3 = PWM; TIM5 = timebase; TIM9 chosen for FOC tick |
+| 0.4 WCET measurement | ✅ | loopFOC 40 µs / MPU read 2.37 ms / superloop MAX 2.67 ms = FOC starvation |
+| 0.5 FOC rate | ✅ | 4 kHz FOC / 200 Hz control, CTRL_DIVISOR 20, ~16% CPU (Appendix B4) |
+| 0.6 golden re-capture | ✅ | 178° slew → −0.32°, wheel unwinds; tagged `rtos-p0-baseline` |
+| 1.1 FPU port proof | ✅ | ARM_CM4F confirmed in `port.c.o` disasm; deps pinned |
+| 1.2 FreeRTOSConfig + faults | ✅ | `include/STM32FreeRTOSConfig.h`, `faults.*`; compiles |
+| 1.3 assert + NVIC audit | ✅ | prio-0 ISR → kernel assert → LED + black box; fixed split-brain config |
+| 1.4 software tracer | ✅ | verified: periodic exactly 1000µs (0 jitter), spinner chopped, idle absent |
+| **1.5 FOC tick timer (TIM9)** | **⬜ NEXT** | — |
+| 2.x single-task port | ⬜ | — |
+| 3.x telemetry extraction | ⬜ | — |
+| 4.x FOC split | ⬜ | — |
+| 5.x safety task + I2C mutex | ⬜ | — |
+| 6.x comms task | ⬜ | — |
+| 7.x consolidation | ⬜ | — |
+
+## Files that exist now (Phase 0–1.3)
+
+```
+include/
+  STM32FreeRTOSConfig.h      full FreeRTOS override (Step 1.2; MUST be here + -Iinclude)
+  trace_c.h                  C-side tracer enum + hook decls (Step 1.4; here for the SAME reason)
+src/
+  heading_control.cpp        the super-loop controller (env: superloop). Instrumented in 0.4.
+  p1_test.cpp                Phase 1 throwaway RTOS test harness (env: p1test). Extends in 1.5.
+  MagneticSensorMT6701SSI.h/.cpp   encoder driver (always compiled)
+  timebase.h/.cpp            TIM5 free-running µs counter (Step 0.2)
+  timing_stats.h             header-only min/mean/MAX + TIME_BLOCK macro (Step 0.4)
+  hw_timers.h/.cpp           timer audit dump (Step 0.3); FOC tick added in 1.5
+  faults.h/.cpp              safeStop, .noinit black box, FreeRTOS hooks, rtRunTimeCounter (Step 1.2)
+  trace.h/.cpp               scheduler tracer ring buffer + switch hooks + dump (Step 1.4)
+platformio.ini               [env] base + [env:superloop] + [env:p1test]; -Iinclude; heap_3
+tools/plot_trace.py          Gantt + inter-arrival plot from a trace dump (Step 1.4)
+```
+Not yet created: `rtos_main.cpp`, `tasks.*`, `control_law.*`, `sensors.*`,
+`telemetry.*`, `commands.*` (Phase 2 onward).
+
+## Detailed progress log — what actually happened
+
+**Phase 0 (measurement).** TIM5 µs timebase built and verified. Timer audit: motor
+PWM owns TIM2 (PA5) + TIM3 (PA6/PA7); TIM5 = timebase; TIM9 reserved for the FOC
+tick (chosen over TIM4 because TIM4_CH1 = PB6 = the driver enable). WCET
+instrumentation (`timing_stats.h` + `M`/`M!` commands) added to `heading_control.cpp`.
+Headline finding: the **MPU6050 gyro read is 2.37 ms** and it stalls FOC
+commutation for ~2.4 ms out of every 5 ms control period — the concrete
+justification for the whole migration (Phase 4 preemption fixes it). FOC rate set
+to 4 kHz (PP=11 → f_elec 78.8 Hz → comfortable 3.15 kHz; 4 kHz costs ~16% CPU at
+the 40 µs loopFOC WCET). Golden dataset re-captured with instrumentation in place;
+178° slew settled to −0.32° with the wheel unwinding cleanly (the compFrac-margin
+substitute check passed). Tagged `rtos-p0-baseline`.
+
+**Step 1.1 (FPU port).** Confirmed the compiled `port.c.o` is the `ARM_CM4F` port:
+`PendSV_Handler` disassembly shows `tst.w lr,#16` + `vstmdbeq/vldmiaeq {s16-s31}`
+(callee-saved FPU registers preserved across context switch — mandatory because
+the control law and SimpleFOC transforms run in different tasks). Pinned all six
+libraries to exact installed versions so the LDF can't drift.
+
+**Step 1.2 (config + fault hooks).** Wrote `include/STM32FreeRTOSConfig.h` (full
+override), `faults.h/.cpp` (one `safeStop` path: hardware driver-kill first via
+enable pin, then optional graceful SimpleFOC stop hook, then latch reason to a
+`.noinit` black box, then blink the reason code on the LED forever). Fault hooks
+own `vApplicationMallocFailedHook` / `vApplicationStackOverflowHook` — no collision
+because the library only defines those when its `*_BLINK` config macros are 1, and
+we set them 0. Run-time-stats clock routed through `rtRunTimeCounter()` (reads
+`TIM5->CNT`) so the config header needn't include the CMSIS device header.
+
+**Step 1.3 (assert safety net) — the hard one.** Built `p1_test.cpp`: starts the
+scheduler, fires a TIM7 interrupt whose ISR calls `vTaskNotifyGiveFromISR`, with
+the NVIC priority forced to a test value. At priority 0 (illegal, more urgent than
+`configMAX_SYSCALL` = 5) the kernel's `vPortValidateInterruptPriority()` assert
+must fire. **It initially did nothing** — board froze, no LED, `clean boot` on
+reset. The debugging chain that cracked it:
+  1. Proved the machinery at priority 5 (notifications streamed 1:1 with ISR count).
+  2. Proved the safe-stop path from *thread* context (a direct `configASSERT(0)`
+     blinked the LED and latched the black box → `faults.cpp` and the LED are fine).
+  3. Read the ISR priority back — it was correctly 0.
+  4. So the assert *should* fire but didn't → the kernel wasn't using our assert.
+     A `#pragma message` in the config fired for only **2 TUs** (`faults.cpp`,
+     `p1_test.cpp`) — the kernel TUs (`port.c` etc.) were compiling against the
+     library default `FreeRTOSConfig_Default.h`, whose `configASSERT` is a silent
+     `for(;;)`. **Split-brain config.**
+Root cause + fix: the config was in `src/` (invisible even to project cross-includes
+from the kernel side), then moved to `include/` (fixed the 2 project TUs only),
+then `-Iinclude` added to `build_flags` (fixed all 13 TUs including the kernel).
+After the fix, the priority-0 ISR correctly trips the assert: LD2 single-pulse
+blink, and reset reports `previous boot died: ASSERT at port.c:756`. Priority 5
+(legal) streams notifications with no assert. `PRIGROUP` already 3. `.noinit`
+survives a warm reset → no linker fragment needed. Two other gotchas found and
+logged: the `TIM7_IRQHandler` link collision (→ HardwareTimer API), and
+`${platformio.include_dir}` mangling on Windows (→ relative `-Iinclude`).
+
+---
+
 ## Starting state (confirm before beginning)
 
 ```
@@ -88,38 +272,42 @@ them. Same will be true of the infrastructure files below.
 Build this up as you go. Everything except the active sketch is infrastructure
 that survives all seven phases and that `calibration.cpp` will also want.
 
+Sketches (files that own `setup()`/`loop()`) are selected per PlatformIO
+environment via `build_src_filter` — they all live in `src/` and the env picks
+one; see "Switching between sketches" below. The FreeRTOS config lives in
+`include/` for the reason in the Status block (critical fact #1).
+
 ```
+include/
+  STM32FreeRTOSConfig.h      Step 1.2 — full FreeRTOS override. MUST be here, and
+                             platformio.ini MUST carry -Iinclude (Status fact #1).
+
 src/
-  rtos_main.cpp              THE ACTIVE SKETCH — owns setup()/loop()
+  ── sketches (one per env, build_src_filter) ──
+  heading_control.cpp        the working super-loop     (env: superloop, default)
+  p1_test.cpp                Phase 1 RTOS test harness   (env: p1test) — throwaway
+  rtos_main.cpp              THE Phase-2 sketch          (env: rtos) — added Phase 2
+
+  ── infrastructure, compiled into every env ──
   MagneticSensorMT6701SSI.h/.cpp
-
   timebase.h  timebase.cpp   Step 0.2 — TIM5 free-running µs counter
-  timing_stats.h             Step 0.4 — min/max/mean accumulator (header-only)
+  timing_stats.h             Step 0.4 — min/mean/MAX + TIME_BLOCK (header-only)
   hw_timers.h  hw_timers.cpp Step 0.3 / 1.5 — timer audit + FOC tick timer
-  trace.h  trace.cpp         Step 1.4 — scheduler tracer ring buffer
-  faults.h  faults.cpp       Step 1.2 — safeStop, noinit black box, hooks
+  faults.h  faults.cpp       Step 1.2 — safeStop, .noinit black box, hooks
+  trace_c.h                  Step 1.4 — C-side tracer enum + hook decls (not yet)
+  trace.h  trace.cpp         Step 1.4 — scheduler tracer ring buffer (not yet)
 
-  control_law.h  .cpp        Phase 2 — the §9 control law, lifted verbatim
+  control_law.h  .cpp        Phase 2 — the §8 control law, lifted verbatim
   sensors.h  .cpp            Phase 2 → 5 — MPU6050 + INA219 reads
   telemetry.h  .cpp          Phase 3 — CSV formatting, stream buffer drain
   commands.h  .cpp           Phase 6 — Commander wiring, parse, dispatch
   tasks.h  tasks.cpp         Phase 2 onward — task bodies and creation
 
-  FreeRTOSConfig.h           Step 1.2
-
 unflashed_files/
-  heading_control.cpp        the working super-loop — KEEP, do not delete
-  calibration.cpp
-  full.cpp
-  rtos_tester.cpp            superseded by Phase 1; keep for reference
+  calibration.cpp  full.cpp  rtos_tester.cpp    old sketches, kept for reference
 
-baseline/
-  heading_control_baseline.cpp
-  golden/                    run-8 captures
-
-tools/
-  capture_calibration.py  filter_calibration.py  plot_calibration.py
-  make_replay.py  plot_trace.py    (new, Step 1.4)
+baseline/  heading_control_baseline.cpp,  golden/  (run-8 captures)
+tools/     capture_/filter_/plot_calibration.py, make_replay.py, plot_trace.py (1.4)
 ```
 
 ### Building from scratch rather than editing in place
@@ -147,44 +335,38 @@ If you find a genuine bug in the old code while porting, don't fix it in
 dataset, confirm the change, *then* carry it across. Otherwise you've changed
 the reference and the comparison is meaningless.
 
-### Switching between sketches
+### Switching between sketches (build_src_filter — this is what we use)
 
-Only one file in `src/` may have `setup()`/`loop()`. To flash the old super-loop
-for a comparison run:
+Only one `.cpp` in `src/` may define `setup()`/`loop()`. Rather than moving files
+in and out of `src/` by hand, **each PlatformIO environment filters which sketch
+compiles**, so every sketch stays in `src/` and every build stays compilable at
+all times — which catches "I broke the old sketch while refactoring" immediately.
+This was chosen deliberately over the file-move approach (Step 1.3).
 
-```
-mv src/rtos_main.cpp unflashed_files/
-mv unflashed_files/heading_control.cpp src/
-```
-
-You will do this often — every phase exit compares against the baseline. Two
-shell scripts or a small `Makefile` target are worth the five minutes:
-
-```bash
-# tools/use.sh — usage: ./tools/use.sh rtos_main
-mkdir -p unflashed_files
-for f in src/*.cpp; do
-  b=$(basename "$f" .cpp)
-  case "$b" in
-    MagneticSensorMT6701SSI|timebase|timing_stats|hw_timers|trace|faults| \
-    control_law|sensors|telemetry|commands|tasks) continue ;;
-  esac
-  [ "$b" != "$1" ] && mv "$f" unflashed_files/
-done
-[ -f "unflashed_files/$1.cpp" ] && mv "unflashed_files/$1.cpp" src/
-```
-
-Alternatively use PlatformIO `build_src_filter` per environment, which avoids
-moving files at all:
+Current `platformio.ini` (shared settings in `[env]`, one section per sketch):
 ```ini
-[env:rtos]
-build_src_filter = +<*> -<heading_control.cpp> -<calibration.cpp> -<full.cpp>
+[platformio]
+default_envs = superloop            ; bare `pio run` builds the known-good controller
+
+[env]                               ; inherited by all environments
+platform = ststm32
+board = nucleo_f446re
+framework = arduino
+lib_archive = false                 ; required for SimpleFOC under PlatformIO
+lib_deps = …                        ; pinned to exact versions (Step 1.1)
+build_flags =
+    -D configMEMMANG_HEAP_NB=3      ; heap_3 (fixes the FreeRTOS boot hang)
+    -Iinclude                       ; kernel TUs must see STM32FreeRTOSConfig.h (fact #1)
+
 [env:superloop]
-build_src_filter = +<*> -<rtos_main.cpp> -<calibration.cpp> -<full.cpp>
+build_src_filter = +<*> -<p1_test.cpp> -<rtos_main.cpp>
+[env:p1test]
+build_src_filter = +<*> -<heading_control.cpp> -<rtos_main.cpp>
+; [env:rtos] added in Phase 2: -<heading_control.cpp> -<p1_test.cpp>
 ```
-Then `pio run -e rtos -t upload` or `-e superloop`. Cleaner, and it means both
-builds stay compilable at all times — which catches "I broke the old sketch
-while refactoring" immediately rather than three phases later.
+Excluding a not-yet-created file (`rtos_main.cpp`) is harmless. Flash a specific
+build with `pio run -e <env> -t upload`; compare against the baseline controller
+with `-e superloop`.
 
 ### Header discipline
 
@@ -205,7 +387,7 @@ than pulling a C++ header into the kernel build.
 | Phase | Creates | Modifies |
 |---|---|---|
 | 0 | `timebase.*`, `timing_stats.h`, `hw_timers.*` | `heading_control.cpp` (instrumentation only) |
-| 1 | `FreeRTOSConfig.h`, `trace.*`, `trace_c.h`, `faults.*`, `plot_trace.py` | `platformio.ini` |
+| 1 | `include/STM32FreeRTOSConfig.h`, `faults.*`, `p1_test.cpp` (throwaway harness), `trace_c.h`, `trace.*`, `plot_trace.py` | `platformio.ini` (env split, `-Iinclude`) |
 | 2 | `rtos_main.cpp`, `tasks.*`, `control_law.*`, `sensors.*` | — |
 | 3 | `telemetry.*` | `tasks.*`, `control_law.*` |
 | 4 | — | `tasks.*`, `hw_timers.*`, `control_law.*` |
@@ -1018,6 +1200,29 @@ not dump while the controller is running a step. Capture, stop, then dump.
 both hooks see the *outgoing* task in `traceOut` and the *incoming* one in
 `traceIn`. Verify this empirically with the two-task test rather than trusting
 the reasoning.
+
+**Result (2026-08-04) — PASSED, tracer is trustworthy.** Files:
+`include/trace_c.h` (kernel-visible, in include/ for the same -Iinclude reason as
+the config), `src/trace.h`, `src/trace.cpp`, `tools/plot_trace.py`. The switch
+hooks read the current task's index from TLS slot 0
+(`pvTaskGetThreadLocalStoragePointer(NULL,0)`), set per task at creation; idle's
+NULL slot reads as 0 = IDLE for free. `Y` command dumps the 4096-entry ring as
+CSV (`t_us,id,evt`; 0=out 1=in). Verified with two throwaway tasks (periodic
+prio 3, ~100 µs every 1 ms; spinner prio 1, never blocks), captured over serial,
+plotted:
+- **TEST (periodic) period: min = med = max = 1000 µs** — zero jitter at µs
+  resolution. n=1023.
+- **TEST run 103 µs, spinner run 895 µs** (103 + 895 + ~2 µs switch ≈ 1000).
+- **IDLE absent** — 2048 events each for id 6/7, zero id-0, exactly as predicted
+  (spinner always Ready → idle never runs).
+- **Trap 3 confirmed empirically**: `…6,0` immediately followed by `…7,1`
+  (TEST out → TEST2 in) — out/in labels are correct, no swap.
+The Gantt shows the spinner's bars cleanly chopped every 1 ms by the periodic
+task — preemption made visual. Two engineering notes for reuse: the 24 KB
+`traceBuf` is compiled into EVERY env (the global config defines the hooks, so
+`trace.cpp` must link everywhere) — dead weight in `superloop`, a Phase-7 trim
+candidate. And `plot_trace.py` forces the Agg backend so it never opens a
+blocking window (savefig only).
 
 ---
 
