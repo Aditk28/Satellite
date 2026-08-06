@@ -34,9 +34,11 @@ depth matters as much as the demo working.
 
 8 calibration runs (~150 trials). Closed-loop envelope tested ±30° to ±180°.
 
-**Active work: migrating the super-loop to FreeRTOS.** Currently in Phase 0
+**Active work: migrating the super-loop to FreeRTOS.** Phases 0–2 complete (the
 
-(measurement). See §6.
+controller now runs as a single FreeRTOS task, `src/rtos_main.cpp`, env `rtos`,
+
+with no regression). Currently at Phase 3 (telemetry extraction). See §6.
 
 ### Tuned constants — do not change casually
 
@@ -208,11 +210,11 @@ Phases per `docs/RTOS_MIGRATION_GUIDE.md`. Tag each exit `rtos-pN-name`.
 
 - [x] 0.6 golden dataset re-capture (178° slew → −0.32°, wheel unwinds cleanly; superloop MAX 12.1s = blocking capture dump, the Phase-3 "before")
 
-- [ ] 1.x kernel config, FPU port proof, NVIC audit, software tracer ← **current step**
+- [x] 1.x kernel config, FPU port, NVIC/assert, software tracer, TIM9 FOC tick (tag `rtos-p1-kernel`)
 
-- [ ] 2.x single-task port
+- [x] 2.x single-task port — monolithic; golden dataset matches, ω_w 17.2@2V, 0 overhead (tag `rtos-p2-single-task`)
 
-- [ ] 3.x telemetry extraction
+- [ ] 3.x telemetry extraction ← **current step**
 
 - [ ] 4.x FOC split
 

@@ -24,8 +24,16 @@ replaces the analyzer.
 
 ## Current position
 
-**Phase 2 (single-task port) is NEXT. Phase 1 is COMPLETE — tag `rtos-p1-kernel`.**
-Done: Phase 0 (all), Phase 1 (1.1–1.5). Not started: Phases 2–7.
+**Phase 3 (telemetry extraction) is NEXT. Phase 2 is COMPLETE — tag `rtos-p2-single-task`.**
+Done: Phase 0, Phase 1 (`rtos-p1-kernel`), Phase 2. Decision: **monolithic port** —
+`src/rtos_main.cpp` is `heading_control.cpp` + a single RTOS wrap (`hwSetup()` inside
+`controlTask` prio 3 / 1536-word stack / TLS=CTRL; `superLoopBody()`; pre-scheduler
+`setup()`). File-splitting deferred to Phases 3–6. `diff` vs baseline = 5 regions, all
+the wrap; control law/constants/commands/sensors byte-identical.
+**Gate PASSED (2026-08-06), all measured not inferred:** T90/T−90 final err 1.54°/0.68°
+(in-deadzone), wheels unwound to 0 (compFrac margin intact); **O2 → ω_w 17.2 rad/s,
+K=8.59≈8.51 (velocity estimate undisturbed under FreeRTOS — Trap 1 cleared)**; `M`
+timing identical to baseline (loopFOC 39µs, compute ~12µs → zero FreeRTOS overhead).
 
 **Git:** branch `rtos-migration`. Last commit `Phase 1.1-1.2: pin deps, prove FPU
 port, FreeRTOSConfig + fault hooks`. The Step 1.3 work (config move to `include/`,
@@ -113,8 +121,8 @@ uncommitted — check `git status` and commit before continuing if so.
 | 1.3 assert + NVIC audit | ✅ | prio-0 ISR → kernel assert → LED + black box; fixed split-brain config |
 | 1.4 software tracer | ✅ | verified: periodic exactly 1000µs (0 jitter), spinner chopped, idle absent |
 | 1.5 FOC tick timer (TIM9) | ✅ | TIM9 @ 3999.98 Hz, jitter 0 µs; HardwareTimer API (core owns the vector) |
-| **2.x single-task port** | **⬜ NEXT** | — |
-| 3.x telemetry extraction | ⬜ | — |
+| 2.x single-task port | ✅ | monolithic port; golden dataset matches, ω_w 17.2@2V, 0 overhead |
+| **3.x telemetry extraction** | **⬜ NEXT** | — |
 | 4.x FOC split | ⬜ | — |
 | 5.x safety task + I2C mutex | ⬜ | — |
 | 6.x comms task | ⬜ | — |
@@ -1398,6 +1406,22 @@ only checks at switch time and there are no switches — so add a manual
 Boring — which is the point. It confirms the tracer works in the real firmware,
 not just the toy test.
 
+**Result (2026-08-06) — PASSED, monolithic port.** `src/rtos_main.cpp` =
+`heading_control.cpp` + the RTOS wrap only (`diff` = 5 regions: includes, the `G`
+stack-highwater line, `setup`→`hwSetup`, `loop`→`superLoopBody`, appended
+`controlTask`+`setup`). One task, prio 3, 1536-word stack, `hwSetup()` (incl.
+`initFOC` + `faults_init`) run in-task. Golden-dataset gate, all measured:
+- T90 final err **+1.54°**, T−90 **+0.68°** — in-deadzone, baseline spread; both
+  wheels **unwound to 0** (compFrac margin intact — the key FreeRTOS-didn't-break-it
+  check).
+- **O2 → ω_w plateau 17.2 rad/s at 2.00 V, K=8.59 vs 8.51 (<1%)** — `micros()`/
+  velocity estimate provably undisturbed (Trap 1 cleared, Appendix B8).
+- `M` timing identical to Phase 0.4 (loopFOC 39µs, compute ~12µs, superloop
+  min 38µs) — **zero FreeRTOS overhead** on the control path (single task never
+  blocks → no switches during normal running). Tracer would be empty for the same
+  reason, so its check is moot here.
+No behavioral or timing regression. The controller is now a FreeRTOS task.
+
 **Phase 2 exit:** `git tag rtos-p2-single-task`
 
 ---
@@ -1918,7 +1942,7 @@ CTRL  period 5000 µs   jitter max ____ µs   WCET ____ µs
 | B5 | `CTRL_DIVISOR` | 4.1 | **20** — 4 kHz FOC / 200 Hz control. Control fires every 20th FOC tick, phase-locked. (Set for real in Step 4.1; fixed here by the B4 rate choice.) |
 | B6 | Measured WCETs (super-loop) | 0.4 | loopFOC **40 µs** / move **8 µs** / MPU read **2374 µs** / control-law compute **~14 µs** (`st_law − st_mpu`) / telem row **237 µs** / superloop MAX **2666 µs** = FOC starvation during the blocking gyro read. No INA219 in this sketch. Full table in Step 0.4. |
 | B7 | Telemetry decimation factor | 3.1 | |
-| B8 | `ω_w` calibration check @ 2 V | 2.1, 4.2 | ` rad/s` |
+| B8 | `ω_w` calibration check @ 2 V | 2.1, 4.2 | **Phase 2 (2026-08-06): 17.2 rad/s** at 2.00 V → K=8.59 (rad/s)/V vs identified 8.51 (<1%, inside baseline 2.3% scatter). Confirms `micros()`/velocity estimate undisturbed by FreeRTOS. Re-check after the Phase-4 FOC split. |
 | B9 | compFrac neutral, before / after | 4.5 | ` / ` |
 | B10 | Direction-asymmetry outcome | 4.4 | |
 | B11 | Final stack sizes | 7.1 | |
