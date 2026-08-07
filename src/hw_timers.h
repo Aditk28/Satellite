@@ -13,3 +13,9 @@ void     focTick_init(uint32_t hz);              /* start TIM9 @ hz, IRQ prio 5 
 uint32_t focTick_count(void);                    /* total ISR fires since reset */
 void     focTick_resetStats(void);               /* zero count + jitter accumulators */
 void     focTick_jitter(uint32_t* min_us, uint32_t* max_us);  /* inter-fire delta */
+
+/* Step 4.1 — per-tick callback hook. rtos_main registers a callback that runs
+   inside the TIM9 ISR (prio 5) to notify the FOC and control tasks. Attach it
+   BEFORE focTick_init(); nullptr (the default) keeps the pure-jitter behaviour
+   the Phase-1 harness relies on. */
+void     focTick_attach(void (*cb)(void));

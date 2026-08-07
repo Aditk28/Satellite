@@ -44,6 +44,7 @@ static volatile uint32_t s_focCount = 0;
 static volatile uint32_t s_focLast  = 0;
 static volatile uint32_t s_focDtMin = 0xFFFFFFFFu;
 static volatile uint32_t s_focDtMax = 0;
+static void (*s_focCb)(void) = nullptr;      /* Step 4.1 — per-tick notify hook */
 
 /* Runs inside the core's TIM9 handler (HAL_TIM_IRQHandler clears the flag for
    us). Timestamp with the INDEPENDENT TIM5 timebase so we don't measure jitter
@@ -58,7 +59,10 @@ static void focTick_isr(void) {
   }
   s_focLast = now;
   s_focCount++;
+  if (s_focCb) s_focCb();                   /* Phase 4: notify FOC/control tasks */
 }
+
+void focTick_attach(void (*cb)(void)) { s_focCb = cb; }
 
 void focTick_init(uint32_t hz) {
   s_focTim = new HardwareTimer(TIM9);

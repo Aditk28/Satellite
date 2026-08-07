@@ -291,6 +291,8 @@ float deadzoneFine = 0.035f;
                                      // you want a lower-speed check.
 #define CONTROL_PERIOD_US   5000     // 200 Hz control loop
 #define TELEM_PERIOD_MS     100      // 10 Hz streaming telemetry in HOLD
+#define FOC_RATE_HZ         4000     // TIM9 FOC tick (Step 0.5 / Appendix B4)
+#define CTRL_DIVISOR        20       // 4000 / 20 = 200 Hz control (== CONTROL_PERIOD_US)
 
 // ------------------- state -------------------
 enum CtrlMode { CTRL_IDLE, CTRL_HOLD, CTRL_STEP, CTRL_OPEN, CTRL_COMP };
@@ -351,9 +353,7 @@ void stopMotor(const String &why) {
   ctrlMode = CTRL_IDLE;
   capturing = false;
   stallHold = false; stallStartMs = 0; parked = false; stallCount = 0;
-  motor.target = 0.0f;
-  motor.loopFOC();
-  motor.move();
+  motor.target = 0.0f;               // focTask applies this within one tick (<=250 us)
   printBoth("!! STOP: " + why + "  (send R to re-enable)");
 }
 
@@ -365,9 +365,7 @@ void measureGyroBias() {
     sensors_event_t a, g, t;
     mpu.getEvent(&a, &g, &t);
     sum += g.gyro.z * 180.0f / PI;
-    motor.loopFOC();
-    motor.move();
-    delay(5);
+    delay(5);                        // focTask commutates via the TIM9 ISR meanwhile
   }
   gyroBias = sum / N;
   printBoth("[GYRO] bias = " + String(gyroBias, 4) + " dps");
@@ -691,7 +689,9 @@ void handleLine(String s) {
           stat_print(o, "INA219 read",  &st_ina);   // no samples: no INA219 here
           stat_print(o, "control law",  &st_law);   // incl. MPU; compute = law - MPU
           stat_print(o, "telem row",    &st_telem);
-          stat_print(o, "superloop",    &st_period);
+          stat_print(o, "ctrl period",  &st_period);   // control-release interval (~5000 us)
+          uint32_t fmn, fmx; focTick_jitter(&fmn, &fmx);
+          o.print("FOC tick dt (us): min="); o.print(fmn); o.print(" max="); o.println(fmx);
           o.println("-------------------");
         }
       }
@@ -727,6 +727,12 @@ void pollSerial() {
 // RTOS STRUCTURE (Step 2.1) — the ONLY change from the verbatim super-loop.
 // Everything above (control law, constants, commands, sensors) is untouched.
 // ============================================================================
+
+// Phase 4 tasks + ISR callback, defined below -- forward-declared so hwSetup()
+// can create focTask and register focTickNotify.
+extern TaskHandle_t hFoc;
+static void focTask(void*);
+static void focTickNotify(void);
 
 // hwSetup(): everything the old setup() did after Serial.begin -- run INSIDE the
 // control task. initFOC()'s alignment spins the motor for hundreds of ms and is
@@ -776,6 +782,13 @@ static void hwSetup() {
   motor.initFOC();
   motor.target = 0.0f;
 
+  // Phase 4: hand commutation to focTask, clocked by the TIM9 tick. Created here
+  // (after initFOC, motor ready) not in setup(). focTask blocks on its notify at
+  // once; nothing commutates until focTick_init() starts TIM9 on the next line.
+  configASSERT(xTaskCreate(focTask, "foc", 768, NULL, 4, &hFoc) == pdPASS);
+  focTick_attach(focTickNotify);
+  focTick_init(FOC_RATE_HZ);     // 4 kHz: focTask each tick, control every 20th
+
   timers_dumpAll("AFTER SimpleFOC init");
   Serial.print("TIM2 CR1=0x"); Serial.println(TIM2->CR1, HEX);
 
@@ -799,50 +812,42 @@ static void hwSetup() {
   lastControlUs = micros();
 }
 
-// superLoopBody(): the old loop() body, verbatim. Runs forever inside the task.
-static void superLoopBody() {
-  static uint32_t t_prev = 0;
-  uint32_t t_now = us_now();
-  if (t_prev) stat_add(&st_period, t_now - t_prev);
-  t_prev = t_now;
-  
-  // FOC must run as fast as possible, every iteration, uninterrupted.
-  TIME_BLOCK(st_foc,  { motor.loopFOC(); });
-  TIME_BLOCK(st_move, { motor.move();    });
-
+// controlStep(): one 200 Hz control iteration. Body is the old superLoopBody
+// verbatim MINUS loopFOC/move (now in focTask) and MINUS the micros() rate gate
+// (the TIM9 notification IS the 200 Hz clock now). dt still comes from micros()
+// so it stays correct across a blocking command (e.g. B rebias), as before.
+static void controlStep() {
   pollSerial();
 
   unsigned long now = micros();
-  if (now - lastControlUs >= CONTROL_PERIOD_US) {
-    float dt = (now - lastControlUs) * 1e-6f;
-    lastControlUs = now;
+  float dt = (now - lastControlUs) * 1e-6f;
+  lastControlUs = now;
 
-    TIME_BLOCK(st_law, { controlUpdate(dt); });
+  TIME_BLOCK(st_law, { controlUpdate(dt); });
 
-    if (capturing) {
-      if (capN < MAX_CAP) {
-        cap_t[capN]      = now;
-        cap_target[capN] = target;
-        cap_theta[capN]  = theta;
-        cap_wp[capN]     = omega_p;
-        cap_ww[capN]     = omega_w;
-        cap_alpha[capN]  = lastAlpha;
-        cap_u[capN]      = lastU;
-        capN++;
-      }
-      if (capN >= MAX_CAP || (millis() - capStartMs) >= CAPTURE_MS) {
-        capturing = false;
-        dumpCapture();
-        // After an OPEN-LOOP pulse, return to IDLE -- do NOT engage the
-        // closed loop, since the whole point was to verify the sign first.
-        bool wasOpen = (ctrlMode == CTRL_OPEN || ctrlMode == CTRL_COMP);
-        ctrlMode = wasOpen ? CTRL_IDLE : CTRL_HOLD;
-        if (wasOpen)
-          printBoth("open-loop capture done, back to IDLE. Check: positive volts "
-                    "should give POSITIVE wheel and NEGATIVE theta.");
-        else
-          printBoth("capture done, now HOLDing. Adjust gains and send T again.");
-      }
+  if (capturing) {
+    if (capN < MAX_CAP) {
+      cap_t[capN]      = now;
+      cap_target[capN] = target;
+      cap_theta[capN]  = theta;
+      cap_wp[capN]     = omega_p;
+      cap_ww[capN]     = omega_w;
+      cap_alpha[capN]  = lastAlpha;
+      cap_u[capN]      = lastU;
+      capN++;
+    }
+    if (capN >= MAX_CAP || (millis() - capStartMs) >= CAPTURE_MS) {
+      capturing = false;
+      dumpCapture();
+      // After an OPEN-LOOP pulse, return to IDLE -- do NOT engage the
+      // closed loop, since the whole point was to verify the sign first.
+      bool wasOpen = (ctrlMode == CTRL_OPEN || ctrlMode == CTRL_COMP);
+      ctrlMode = wasOpen ? CTRL_IDLE : CTRL_HOLD;
+      if (wasOpen)
+        printBoth("open-loop capture done, back to IDLE. Check: positive volts "
+                  "should give POSITIVE wheel and NEGATIVE theta.");
+      else
+        printBoth("capture done, now HOLDing. Adjust gains and send T again.");
     }
   }
 
@@ -860,12 +865,43 @@ static void superLoopBody() {
   }
 }
 
-// ---- the one task, and the pre-scheduler setup ----------------------------
+// ---- the tasks, the FOC-tick ISR callback, and the pre-scheduler setup ----
 TaskHandle_t hControl;
+TaskHandle_t hFoc;
+
+// focTickNotify(): runs inside the TIM9 ISR (NVIC prio 5 = the configMAX_SYSCALL
+// boundary, so these FromISR calls are legal; anything more urgent would trip the
+// kernel assert). Notify focTask every tick, controlTask every CTRL_DIVISOR-th,
+// then request a context switch on exception return.
+static void focTickNotify(void) {
+  static uint32_t n = 0;
+  BaseType_t woken = pdFALSE;
+  vTaskNotifyGiveFromISR(hFoc, &woken);
+  if (++n >= CTRL_DIVISOR) { n = 0; vTaskNotifyGiveFromISR(hControl, &woken); }
+  portYIELD_FROM_ISR(woken);
+}
+
+// focTask: commutation only. Prio 4 (highest) + hardware-interrupt driven, so it
+// preempts straight through the blocking MPU read in the control task -- the
+// whole point of Phase 4. loopFOC()/move() run ONLY here now.
+static void focTask(void*) {
+  for (;;) {
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    TIME_BLOCK(st_foc,  { motor.loopFOC(); });
+    TIME_BLOCK(st_move, { motor.move();    });
+  }
+}
 
 static void controlTask(void*) {
-  hwSetup();                 // bring up hardware (in-task: task stack + FPU ctx)
-  for (;;) superLoopBody();  // then the ported super-loop, forever
+  hwSetup();                 // bring up hardware; creates focTask + starts TIM9
+  static uint32_t t_prev = 0;
+  for (;;) {
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);        // 200 Hz release from TIM9 ISR
+    uint32_t t = us_now();
+    if (t_prev) stat_add(&st_period, t - t_prev);   // st_period = control-release interval
+    t_prev = t;
+    controlStep();
+  }
 }
 
 // setup(): pre-scheduler only. Create the task and hand the CPU to FreeRTOS.

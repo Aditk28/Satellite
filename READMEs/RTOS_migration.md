@@ -24,7 +24,21 @@ replaces the analyzer.
 
 ## Current position
 
-**Phase 3 (telemetry extraction) is NEXT. Phase 2 is COMPLETE — tag `rtos-p2-single-task`.**
+**PHASES 3 AND 4 SWAPPED (2026-08-06). FOC split Steps 4.1–4.2 DONE & verified
+(2026-08-07); Phase 3 (telemetry, Option C) is NEXT.** Phase 4 Steps 4.4–4.5 (asymmetry,
+compFrac re-verify) and the dead passive-unwind are deferred to the CONTROL_README hardware
+retune (new STM32 + added translation-motor mass — unwind fails on OLD firmware too, so
+pre-existing, not the split). Step 4.3 (FOC-inside-I2C trace) is an optional headline
+artifact, skippable. NOT YET committed/tagged — see below. Swap reason: preemptive
+telemetry needs a lower-priority `telemTask`, which only
+gets CPU when the control task blocks — but the monolithic control task is a pure busy-spin
+(inline `loopFOC`, never blocks), so a prio-1 `telemTask` would be starved. Making the
+control task block requires FOC to be ISR-driven (uniform kHz commutation can't survive a
+≥1 ms tick-granular `vTaskDelay`). That FOC-in-ISR restructure *is* Phase 4, so Phase 4 is
+the real unlock for ALL concurrency (telem, safety, comms). Telemetry's Option-C design
+(Appendix B7) still stands, just sequenced after the split. See Appendix B13.
+
+**Phase 2 is COMPLETE — tag `rtos-p2-single-task`.**
 Done: Phase 0, Phase 1 (`rtos-p1-kernel`), Phase 2. Decision: **monolithic port** —
 `src/rtos_main.cpp` is `heading_control.cpp` + a single RTOS wrap (`hwSetup()` inside
 `controlTask` prio 3 / 1536-word stack / TLS=CTRL; `superLoopBody()`; pre-scheduler
@@ -122,8 +136,8 @@ uncommitted — check `git status` and commit before continuing if so.
 | 1.4 software tracer | ✅ | verified: periodic exactly 1000µs (0 jitter), spinner chopped, idle absent |
 | 1.5 FOC tick timer (TIM9) | ✅ | TIM9 @ 3999.98 Hz, jitter 0 µs; HardwareTimer API (core owns the vector) |
 | 2.x single-task port | ✅ | monolithic port; golden dataset matches, ω_w 17.2@2V, 0 overhead |
-| **3.x telemetry extraction** | **⬜ NEXT** | — |
-| 4.x FOC split | ⬜ | — |
+| **4.x FOC split** | **🟡 4.1–4.2 DONE, verified; 4.3 optional; 4.4–4.5 → retune** | FOC flat 4000.2 Hz running THROUGH the 62 s of cumulative MPU reads = preemption proven from counts. Unwind/compFrac + asymmetry deferred to hardware retune (new STM32 + added mass — unwind fails on OLD firmware too, so pre-existing). |
+| 3.x telemetry extraction | ⬜ (after 4) | Arch decided: Option C hybrid (Appendix B7). Deferred behind 4 — needs the control task to block. |
 | 5.x safety task + I2C mutex | ⬜ | — |
 | 6.x comms task | ⬜ | — |
 | 7.x consolidation | ⬜ | — |
@@ -1580,6 +1594,33 @@ justify *not* synchronizing is as much a skill as knowing when to.
 - **`ω_w` calibration recheck**: 2 V open loop → ~17.0 rad/s per `K = 8.51`. If
   this has shifted, the compFrac margin has shifted with it.
 
+**Result (2026-08-07) — Steps 4.1–4.2 DONE, split verified.** TIM9 ISR (`focTick_isr`
+→ `focTickNotify`, NVIC prio 5) notifies `focTask` (prio 4) every tick and `controlTask`
+(prio 3) every 20th; both wait on `ulTaskNotifyTake`. `loopFOC`/`move` removed from the
+control path (incl. `stopMotor`/`measureGyroBias` — `focTask` commutates through them).
+Measured (`M`, ~148 s run): **FOC tick dt 242–258 µs** (clean 4 kHz, ±8 µs, not bimodal);
+**`loopFOC` n = 592,051 = 4000.2 Hz flat**. Preemption proven from the counts: cumulative
+MPU-read time was ~62 s (24,811 reads × 2.51 ms); a starved `focTask` would have lost
+~249k ticks (→ ~343k), but the full 592k confirms commutation ran *through* the blocking
+I2C — the migration's whole point, measured without needing the Step 4.3 trace. `loopFOC`
+cost unchanged (31/32/45 µs). Build RAM 54.5%.
+
+Control-rate figures are dump/telem artifacts, NOT a regression: `ctrl period` mean 5902 µs
+/ MAX 11.5 s and the 23.9:1 (not 20:1) ratio come from the capture dump + inline HOLD
+telemetry still on the control path coalescing control notifications. **This is a 3↔4
+interaction**: the guide's "release jitter max < 50 µs" (Step 4.2 Verify) can't be met until
+Phase 3 moves telem+dump off the control path. Re-check clean release jitter at Phase 3 exit.
+
+**Deferred to the combined hardware retune** (new STM32 swapped in + translation-motor mass
+added, 2026-08-07): Step 4.4 (direction asymmetry) and Step 4.5 (compFrac re-verify). The
+passive unwind is currently dead — wheel holds at ~17.7 rad/s in-deadzone instead of
+decaying (effective K′≈9.57 vs identified 8.50, ~12%). **Confirmed NOT caused by the split:**
+the OLD monolithic firmware on the SAME new board (run `150522`, T−90) also fails to unwind
+and stall-retries. So it's a plant/tuning shift from the hardware change, folded into the
+CONTROL_README deferred retune, not a Phase-4 defect. Trap 2 (4 kHz velocity quantization)
+remains a candidate contributor to be separated during that retune via a clean O2 on the
+split binary.
+
 **Trap 1 — don't split `loopFOC()` from `move()`.** SimpleFOC's internal state
 isn't designed for concurrent access from two tasks. Both in the FOC task.
 
@@ -1941,12 +1982,13 @@ CTRL  period 5000 µs   jitter max ____ µs   WCET ____ µs
 | B4 | FOC rate + justification | 0.5 | **4 kHz.** `f_elec = PP·ω_max/(2π) = 11·45/6.283 = 78.8 Hz`; comfortable rate `40·f_elec = 3.15 kHz`. 4 kHz clears that with margin. Affordable: `4000 × 40 µs (loopFOC WCET) = 16%` CPU, 19% including `move()`. Not lowered — `loopFOC` at 40 µs is already cheap (SPI fast, no reason to drop the rate). Not raised — no commutation benefit above what the electrical rate needs, and higher eats margin. Canonical pairing with the tuned 200 Hz control loop. |
 | B5 | `CTRL_DIVISOR` | 4.1 | **20** — 4 kHz FOC / 200 Hz control. Control fires every 20th FOC tick, phase-locked. (Set for real in Step 4.1; fixed here by the B4 rate choice.) |
 | B6 | Measured WCETs (super-loop) | 0.4 | loopFOC **40 µs** / move **8 µs** / MPU read **2374 µs** / control-law compute **~14 µs** (`st_law − st_mpu`) / telem row **237 µs** / superloop MAX **2666 µs** = FOC starvation during the blocking gyro read. No INA219 in this sketch. Full table in Step 0.4. |
-| B7 | Telemetry decimation factor | 3.1 | |
-| B8 | `ω_w` calibration check @ 2 V | 2.1, 4.2 | **Phase 2 (2026-08-06): 17.2 rad/s** at 2.00 V → K=8.59 (rad/s)/V vs identified 8.51 (<1%, inside baseline 2.3% scatter). Confirms `micros()`/velocity estimate undisturbed by FreeRTOS. Re-check after the Phase-4 FOC split. |
-| B9 | compFrac neutral, before / after | 4.5 | ` / ` |
-| B10 | Direction-asymmetry outcome | 4.4 | |
+| B7 | Telemetry architecture + decimation | 3.1 | **Option C — hybrid (2026-08-06).** Capture dump (`T`/`O`/`C`) keeps the full-rate 200 Hz RAM buffer (`cap_*`) and hands the *frozen* buffer to `telemTask` for the slow serial dump (control task no longer blocks → `loopFOC`/`WHEEL_SAT` stay live during output, the real Phase-3 goal). Live `H` stream moves onto a per-tick `LogSample_t` **stream buffer** drained by `telemTask` (builds the SPSC primitive; removes the 2nd Serial writer from the control task, Trap 2). **Decimation factor: N/A** — C never streams at 200 Hz over serial, so the Trap-1 bandwidth ceiling (≈140 kbaud > 115200) never binds; capture stays byte-identical at 200 Hz and live `H` stays 10 Hz. Chose C over the guide's literal Step 3.1 (Option A, per-tick 200 Hz streaming) because A forces ≤100 Hz decimation, which halves golden-dataset capture density — A's *Do* section contradicts its own *Verify* ("CSV byte-identical, golden dataset unchanged"); C resolves the tension toward the Verify, which is the criterion that actually protects the controller. Rejected Option B (dump-handoff only, no stream buffer) because it defers the SPSC primitive and leaves Trap 2 open. |
+| B8 | `ω_w` calibration check @ 2 V | 2.1, 4.2 | **Phase 2 (2026-08-06): 17.2 rad/s** at 2.00 V → K=8.59 vs identified 8.51 (<1%). **Phase 4 (2026-08-07): shifted** — in-deadzone hold implies effective K′≈9.57 (~12% high) at uniform 4 kHz. NOT the split's fault: OLD firmware on the same new board (run 150522) also fails to unwind. Confounded by the hardware swap (new STM32 + added mass); clean O2 on the split binary still owed to separate Trap-2 quantization from a genuine plant shift. Folded into the deferred retune. |
+| B9 | compFrac neutral, before / after | 4.5 | **Deferred to hardware retune (2026-08-07).** compFrac=0.89 no longer holds the −0.84 unwind pole after the STM32 swap + added mass; passive desat is dead (wheel holds ~17.7 rad/s in-deadzone). Re-run the C-sweep during the combined retune, not now (user decision — hardware changed, retuning anyway). |
+| B10 | Direction-asymmetry outcome | 4.4 | **Deferred to hardware retune (2026-08-07).** The run-2 re-run comparison is only meaningful against a re-identified plant; folded into the combined retune campaign. |
 | B11 | Final stack sizes | 7.1 | |
 | B12 | Final `U` vs bound | 7.3 | |
+| B13 | **Phase 3 ↔ 4 reorder** | 3/4 | **Swapped: Phase 4 (FOC split) before Phase 3 (telemetry), 2026-08-06.** Found while scoping Phase 3: the monolithic control task never blocks (inline `loopFOC` busy-spin, [rtos_main.cpp:803]), so it holds the CPU continuously and any lower-priority task is starved (the "never-block → starves-below" rule, biting in practice). A telemetry task MUST be lower prio than control — else its ~7 s dump would starve `loopFOC` while the wheel spins. So preemptive telemetry needs the control task to yield, which needs FOC off the busy-loop and into a timer ISR (a ≥1 ms tick-granular `vTaskDelay` can't pace uniform kHz commutation — it makes FOC bursty with hundreds-of-µs stale-angle gaps, risking the compFrac margin). That restructure is exactly Phase 4. Conclusion: the guide's 3-before-4 order had the dependency backwards; Phase 4 is the real unlock for telem/safety/comms alike. Rejected the two stopgaps (cooperative in-loop dump; pull only Step 4.1 forward) in favor of doing Phase 4 properly first — same FOC-timing/ω_w risk either way, so do it cleanly with full phase isolation. Cost: lose the Phase-3 tracer plot as Phase-4's "before" (mitigated: Phase-2 tracer baseline exists). Telemetry Option-C (B7) unchanged, just resequenced. |
 
 ---
 

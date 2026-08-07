@@ -38,7 +38,7 @@ depth matters as much as the demo working.
 
 controller now runs as a single FreeRTOS task, `src/rtos_main.cpp`, env `rtos`,
 
-with no regression). Currently at Phase 3 (telemetry extraction). See §6.
+with no regression). Currently at Phase 4 (FOC split; reordered ahead of Phase 3 telemetry — see §6). See §6.
 
 ### Tuned constants — do not change casually
 
@@ -214,9 +214,9 @@ Phases per `docs/RTOS_MIGRATION_GUIDE.md`. Tag each exit `rtos-pN-name`.
 
 - [x] 2.x single-task port — monolithic; golden dataset matches, ω_w 17.2@2V, 0 overhead (tag `rtos-p2-single-task`)
 
-- [ ] 3.x telemetry extraction ← **current step**
+- [ ] 4.x FOC split ← **current step** (Phases 3 & 4 SWAPPED — see guide Appendix B13)
 
-- [ ] 4.x FOC split
+- [ ] 3.x telemetry extraction (deferred until after 4.x)
 
 - [ ] 5.x safety task + I2C mutex
 
