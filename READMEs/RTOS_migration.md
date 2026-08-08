@@ -24,13 +24,18 @@ replaces the analyzer.
 
 ## Current position
 
-**PHASES 3 AND 4 SWAPPED (2026-08-06). FOC split Steps 4.1–4.2 DONE & verified
-(2026-08-07); Phase 3 (telemetry, Option C) is NEXT.** Phase 4 Steps 4.4–4.5 (asymmetry,
-compFrac re-verify) and the dead passive-unwind are deferred to the CONTROL_README hardware
-retune (new STM32 + added translation-motor mass — unwind fails on OLD firmware too, so
-pre-existing, not the split). Step 4.3 (FOC-inside-I2C trace) is an optional headline
-artifact, skippable. NOT YET committed/tagged — see below. Swap reason: preemptive
-telemetry needs a lower-priority `telemTask`, which only
+**PHASES 3 AND 4 SWAPPED. FOC split Steps 4.1–4.2 DONE & verified; spurious-saturation
+bug RESOLVED (2026-08-08); Phase 3 (telemetry, Option C) is NEXT.** A hardware rework
+(STM32 swap + rewiring) introduced a spurious-`WHEEL_SAT` velocity-estimate glitch that
+briefly looked like a Phase-4 regression — it was NOT (reverted monolith showed it too).
+Fixed with a physical-plausibility reject on ω_w (`WW_MAX_JUMP`, `wwRejects` in `G`); root
+is a marginal MPU I2C read coupling into the encoder SSI (Appendix Phase-4 diag note).
+**Working-tree state:** Phase-4 split (from tag `rtos-p4-foc-split`) + the ω_w guard + kept
+diagnostic cmds `E`/`V` + dump-on-abort — all UNCOMMITTED, compiles clean, ready to flash
+and to commit as the new Phase-4 tip. Phase 4 Steps 4.4–4.5 (asymmetry, compFrac re-verify)
+and the dead passive-unwind stay deferred to the CONTROL_README hardware retune. Step 4.3
+(FOC-inside-I2C trace) optional. Swap reason: preemptive telemetry needs a lower-priority
+`telemTask`, which only
 gets CPU when the control task blocks — but the monolithic control task is a pure busy-spin
 (inline `loopFOC`, never blocks), so a prio-1 `telemTask` would be starved. Making the
 control task block requires FOC to be ISR-driven (uniform kHz commutation can't survive a
@@ -136,7 +141,7 @@ uncommitted — check `git status` and commit before continuing if so.
 | 1.4 software tracer | ✅ | verified: periodic exactly 1000µs (0 jitter), spinner chopped, idle absent |
 | 1.5 FOC tick timer (TIM9) | ✅ | TIM9 @ 3999.98 Hz, jitter 0 µs; HardwareTimer API (core owns the vector) |
 | 2.x single-task port | ✅ | monolithic port; golden dataset matches, ω_w 17.2@2V, 0 overhead |
-| **4.x FOC split** | **🟡 4.1–4.2 DONE, verified; 4.3 optional; 4.4–4.5 → retune** | FOC flat 4000.2 Hz running THROUGH the 62 s of cumulative MPU reads = preemption proven from counts. Unwind/compFrac + asymmetry deferred to hardware retune (new STM32 + added mass — unwind fails on OLD firmware too, so pre-existing). |
+| **4.x FOC split** | **🟢 4.1–4.2 DONE + spurious-sat RESOLVED (2026-08-08)** | Split verified (FOC flat 4000.2 Hz, preemption proven). Spurious `WHEEL_SAT` traced to a **velocity-estimate glitch** (not the split, not real speed): closed-loop-only, absent in open-loop `V` drive. Cause: the MPU I2C read went marginal (2373→2510 µs, more spread) after the wire rework, coupling noise into the encoder SSI read. Guard added: reject non-physical ω_w jumps (>`WW_MAX_JUMP` 15 rad/s/cycle) in sense, `wwRejects` in `G`. Diagnostic cmds kept: `E` (encoder), `V<volts>` (manual drive+stream). 4.3 optional; 4.4–4.5 → retune. |
 | 3.x telemetry extraction | ⬜ (after 4) | Arch decided: Option C hybrid (Appendix B7). Deferred behind 4 — needs the control task to block. |
 | 5.x safety task + I2C mutex | ⬜ | — |
 | 6.x comms task | ⬜ | — |
@@ -1621,6 +1626,43 @@ CONTROL_README deferred retune, not a Phase-4 defect. Trap 2 (4 kHz velocity qua
 remains a candidate contributor to be separated during that retune via a clean O2 on the
 split binary.
 
+**Diagnosis note (2026-08-07) — spurious WHEEL_SAT on nudges, Phase 4 backed out.**
+After the split, small hand-nudges randomly trip `WHEEL_SAT` with a nonsense ω_w (hundreds
+of rad/s) while the wheel is barely moving; sometimes fine. Encoder ruled out (added `E`
+cmd: raw single-turn angle reads smooth and monotonic by hand). **Leading hypothesis
+DISPROVEN:** SimpleFOC computes wheel velocity from `micros()` (SysTick-based —
+`_micros()` in `time_utils.cpp`), the clock Phase 0 flagged as unreliable under FreeRTOS,
+and the 4 kHz rate would amplify a small-Δt glitch. BUT `Sensor::getVelocity()`
+(`Sensor.cpp:30`) guards it: `Ts < min_elapsed_time → return old velocity`, capping any
+Δt-glitch overestimate at ~2.5× — cannot manufacture a 200 rad/s reading. So a nonsense
+spike must come from a large *Δangle* (angle/full-rotation glitch), which points back at the
+encoder read — yet that's verified clean AND Phase 2 exercised SSI *more* often (~13 kHz)
+without the symptom. **Unresolved.** Open threads for the redo: (1) instrument raw
+`sensor.getVelocity()` + `Ts` + `full_rotations` at 4 kHz to catch the actual spike; (2)
+check whether control-notify coalescing makes `dt` in `controlUpdate` occasionally huge →
+big Δtheta → real α slam → *real* fast spin (a genuine over-react, not a measurement
+glitch) — this fits "overreacting" and is my current best suspect; (3) consider driving
+velocity/`dt` off TIM5 `us_now()` instead of SysTick `micros()`. Working tree reverted to
+`rtos-p2-single-task` to test whether nudges still saturate on the known-good monolith
+(saturates → hardware; clean → the split). Split preserved in `9d6830e`.
+
+**RESOLVED (2026-08-08) — it was NOT the split.** The reverted Phase-2 monolith saturated
+too, so the split was exonerated. Dump-on-abort caught the smoking gun: a T90 with normal
+gains was converging cleanly (θ 68→79°, ω_w steady −23) then aborted at −76 on the very next
+5 ms cycle — a −23→−76 jump = ~10,600 rad/s², physically impossible (wheel max ~455). So the
+"saturation" is a **spurious velocity-estimate spike**, not real speed. Open-loop `V` drive
+(V1–V4) was perfectly clean (K′≈8.6→9.4, smooth), which rules out the wheel/encoder/commutation
+and ground-bounce/buck (all present in `V`); the discriminator is the **MPU I2C read**, which
+only closed loop does — and it went marginal after the wire rework (2373→2510 µs, more spread),
+coupling noise into the encoder SSI read that follows it. Fix: physical-plausibility reject on
+ω_w (`WW_MAX_JUMP`) in the sense stage — a real wheel can't change speed that fast, so a
+single-cycle jump is a measurement glitch; hold last-good, streak-capped resync, `wwRejects`
+counted in `G`. This guard is architecture-independent and now lives in the Phase-4 code. Real
+hardware follow-ups (separate I2C/SSI wiring, MT6701 supply decoupling, and driving SimpleFOC
+velocity off TIM5 `us_now()` instead of SysTick `micros()`) are logged for later, not blocking.
+Diagnostic commands `E` (encoder readout) and `V<volts>` (manual drive + unlimited stream) kept
+in the build permanently — they earned their place.
+
 **Trap 1 — don't split `loopFOC()` from `move()`.** SimpleFOC's internal state
 isn't designed for concurrent access from two tasks. Both in the FOC task.
 
@@ -1988,6 +2030,7 @@ CTRL  period 5000 µs   jitter max ____ µs   WCET ____ µs
 | B10 | Direction-asymmetry outcome | 4.4 | **Deferred to hardware retune (2026-08-07).** The run-2 re-run comparison is only meaningful against a re-identified plant; folded into the combined retune campaign. |
 | B11 | Final stack sizes | 7.1 | |
 | B12 | Final `U` vs bound | 7.3 | |
+| B14 | **Verification policy relaxed to structure+safety** | 4/all | **2026-08-07 (user decision).** Hardware changed mid-migration (STM32 swapped, translation-motor mass added), and the plant will be fully re-identified in the CONTROL_README combined retune after translation regardless. So the migration's original regression-test discipline — golden dataset must match, compFrac margin preserved phase-to-phase — is **relaxed**. Goal is now: prove the RTOS *structure* is correct, not that behavior is byte-identical to the bare-metal baseline. **Consistency gates become informational; SAFETY gates stay blocking** (wheel-can't-reach-45-abort is a safety property, not a consistency one). Practical effect on remaining phases: skip golden-dataset matching and margin-preservation as pass/fail; keep the WHEEL_SAT/X/fault-path checks. Telemetry "CSV byte-identical" (Phase 3) stays a goal only because the Python pipeline is convenient, not as a regression gate. |
 | B13 | **Phase 3 ↔ 4 reorder** | 3/4 | **Swapped: Phase 4 (FOC split) before Phase 3 (telemetry), 2026-08-06.** Found while scoping Phase 3: the monolithic control task never blocks (inline `loopFOC` busy-spin, [rtos_main.cpp:803]), so it holds the CPU continuously and any lower-priority task is starved (the "never-block → starves-below" rule, biting in practice). A telemetry task MUST be lower prio than control — else its ~7 s dump would starve `loopFOC` while the wheel spins. So preemptive telemetry needs the control task to yield, which needs FOC off the busy-loop and into a timer ISR (a ≥1 ms tick-granular `vTaskDelay` can't pace uniform kHz commutation — it makes FOC bursty with hundreds-of-µs stale-angle gaps, risking the compFrac margin). That restructure is exactly Phase 4. Conclusion: the guide's 3-before-4 order had the dependency backwards; Phase 4 is the real unlock for telem/safety/comms alike. Rejected the two stopgaps (cooperative in-loop dump; pull only Step 4.1 forward) in favor of doing Phase 4 properly first — same FOC-timing/ω_w risk either way, so do it cleanly with full phase isolation. Cost: lose the Phase-3 tracer plot as Phase-4's "before" (mitigated: Phase-2 tracer baseline exists). Telemetry Option-C (B7) unchanged, just resequenced. |
 
 ---

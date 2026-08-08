@@ -284,6 +284,9 @@ float deadzoneFine = 0.035f;
                                      // enough momentum to abort violently
 #define STALL_MS             600     // ms of continuous stall before backing off
 #define STALL_HOLD_MS       2000     // ms of alpha = 0 before retrying
+#define WW_MAX_JUMP         15.0f    // rad/s per control cycle -- above this is a
+                                     // velocity-estimate glitch, not real (physical
+                                     // max ~2.3 rad/s/cycle). Rejected in sense.
 #define WHEEL_SAT_LIMIT     45.0f    // rad/s -- abort above this.
                                      // Keep at 45: a C3 spin-up alone reaches
                                      // ~26 rad/s, so a lower limit aborts the
@@ -309,6 +312,7 @@ unsigned long openStartMs = 0;
 float theta      = 0.0f;    // estimated platform heading, rad
 float omega_p    = 0.0f;    // platform rate, rad/s
 float omega_w    = 0.0f;    // wheel rate, rad/s
+unsigned long wwRejects = 0;// count of rejected wheel-velocity glitches (see sense)
 float target     = 0.0f;    // commanded heading, rad
 float gyroBias   = 0.0f;    // dps, measured at startup
 float lastAlpha  = 0.0f;
@@ -396,6 +400,7 @@ void printGains() {
   printBoth("theta=" + String(degrees(theta), 2) + "deg  target=" + String(degrees(target), 2)
             + "deg  omega_p=" + String(omega_p, 3) + "  omega_w=" + String(omega_w, 2)
             + "  mode=" + String(ctrlMode == CTRL_IDLE ? "IDLE" : (ctrlMode == CTRL_HOLD ? "HOLD" : "STEP")));
+  printBoth("wheel-velocity glitches rejected: " + String(wwRejects));
   // RTOS (Step 2.1, Trap 3): the single task never blocks, so the stack-overflow
   // hook (checked only at switch time) never runs. Read the high-water mark by
   // hand -- the MINIMUM free stack (in words) the ctrl task has ever had.
@@ -442,7 +447,26 @@ void controlUpdate(float dt) {
   TIME_BLOCK(st_mpu, { mpu.getEvent(&a, &g, &t); });
   float gyro_dps = (g.gyro.z * 180.0f / PI) - gyroBias;
   omega_p = GYRO_SIGN * gyro_dps * PI / 180.0f;     // rad/s, model convention
-  omega_w = motor.shaft_velocity;                    // rad/s, alignment-corrected
+
+  // Wheel velocity, with a physical-plausibility reject. The wheel cannot change
+  // speed faster than ~A_1*V_max = ~455 rad/s^2 = ~2.3 rad/s per 5 ms cycle, so a
+  // single-cycle jump beyond WW_MAX_JUMP is a velocity-ESTIMATE glitch (noise on
+  // the SSI read, coupled from the MPU I2C traffic on nearby wiring) -- hold the
+  // last good value rather than act on it or false-trip WHEEL_SAT. The streak cap
+  // resyncs if the "spike" persists, so a real level change is never stuck out.
+  float w_w_raw = motor.shaft_velocity;              // rad/s, alignment-corrected
+  static float w_w_prev = 0.0f;
+  static bool  w_w_init = false;
+  static int   w_w_rejStreak = 0;
+  if (w_w_init && fabsf(w_w_raw - w_w_prev) > WW_MAX_JUMP && w_w_rejStreak < 3) {
+    w_w_raw = w_w_prev;                              // reject an isolated glitch...
+    w_w_rejStreak++;
+    wwRejects++;
+  } else {
+    w_w_rejStreak = 0;                               // ...but resync if it persists
+  }
+  w_w_prev = w_w_raw; w_w_init = true;
+  omega_w = w_w_raw;
 
   // ---- estimate heading (gyro integration; vision correction later) ----
   theta = wrapPi(theta + omega_p * dt);
@@ -494,6 +518,7 @@ void controlUpdate(float dt) {
   //      spin as the wheel dumps its momentum; that is accepted behaviour. ----
   if (fabsf(omega_w) > WHEEL_SAT_LIMIT) {
     stopMotor("wheel saturation " + String(omega_w, 1) + " rad/s");
+    dumpCapture();   // DIAG: dump omega_w trajectory up to the abort (ramp vs spike)
     return;
   }
 
@@ -697,6 +722,58 @@ void handleLine(String s) {
       }
       break;
     case 'X': stopMotor("operator"); break;
+    case 'E': {
+      // Encoder diagnostic. Motor OFF (zero torque) so the wheel hand-turns
+      // safely. Reads the CACHED angle/velocity focTask refreshes every 250us --
+      // must NOT do its own SSI read, SPI2 is focTask's post-split. at rest:
+      // single_turn_deg steady, vel ~0. hand-turn: sweeps smoothly. jumps = bad read.
+      motor.target = 0.0f; controllerEnabled = false; ctrlMode = CTRL_IDLE;
+      capturing = false;
+      printBoth("ENC DIAG: motor OFF -- hand-turn the wheel and watch.");
+      printBoth("i,shaft_angle_rad,single_turn_deg,shaft_vel_rad_s");
+      for (int i = 0; i < 30; i++) {
+        float ang = motor.shaft_angle;
+        float vel = motor.shaft_velocity;
+        float turn = ang - floorf(ang / (2.0f * PI)) * (2.0f * PI);
+        String line = String(i) + "," + String(ang, 4) + ","
+                    + String(degrees(turn), 2) + "," + String(vel, 3);
+        Serial.println(line); hc05Serial.println(line);
+        delay(100);
+      }
+      printBoth("ENC DIAG done (motor still OFF; send R to re-enable).");
+      break;
+    }
+    case 'V': {
+      // Manual constant-voltage drive + unlimited encoder stream. focTask
+      // commutates it -- do NOT call loopFOC/move here, SPI2 is focTask's.
+      // Streams cached angle/velocity at ~50 Hz until ANY serial byte. Start
+      // SMALL (V1, V2). steady V -> angle smooth, vel steady ~8.5*V; spikes = noise.
+      float volts = constrain(v, -VOLTAGE_LIMIT, VOLTAGE_LIMIT);
+      controllerEnabled = false; ctrlMode = CTRL_IDLE; capturing = false;
+      motor.enable();
+      motor.target = volts;
+      printBoth("MANUAL DRIVE " + String(volts, 2) + "V. Press any key (or X) to STOP.");
+      printBoth("t_ms,shaft_angle_rad,single_turn_deg,shaft_vel_rad_s,V");
+      unsigned long t0 = millis(), lastP = 0;
+      while (!Serial.available() && !hc05Serial.available()) {
+        motor.target = volts;                          // focTask applies it each tick
+        if (millis() - lastP >= 20) {                  // ~50 Hz, unlimited
+          lastP = millis();
+          float ang  = motor.shaft_angle;
+          float vel  = motor.shaft_velocity;
+          float turn = ang - floorf(ang / (2.0f * PI)) * (2.0f * PI);
+          String line = String(millis() - t0) + "," + String(ang, 4) + ","
+                      + String(degrees(turn), 2) + "," + String(vel, 3) + ","
+                      + String(volts, 2);
+          Serial.println(line); hc05Serial.println(line);
+        }
+      }
+      motor.target = 0.0f;                              // focTask applies within one tick
+      while (Serial.available())     Serial.read();     // drain the stop key
+      while (hc05Serial.available()) hc05Serial.read();
+      printBoth("MANUAL DRIVE stopped (target 0).");
+      break;
+    }
     case 'R':
       controllerEnabled = true; ctrlMode = CTRL_IDLE;
       printBoth("controller re-enabled (IDLE)");
@@ -806,6 +883,7 @@ static void hwSetup() {
   printBoth("          Z zero | P/D gains | K<0-1.2> compFrac | F<0-1> ff");
   printBoth("          W<deg> coarse dz | N<deg> fine dz | A<val> friction magnitude");
   printBoth("          G status | B rebias | M timing | M! reset timing | X stop | R resume");
+  printBoth("          E encoder-diag (motor off) | V<volts> manual drive + encoder stream");
   printBoth("Start at K_theta=19.1 K_omega=14.0, then work down the gain table.");
   printBoth("Mode is IDLE -- send H0 or T<deg> to engage.");
 
