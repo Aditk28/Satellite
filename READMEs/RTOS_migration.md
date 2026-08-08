@@ -156,9 +156,9 @@ uncommitted — check `git status` and commit before continuing if so.
 | 2.x single-task port | ✅ | monolithic port; golden dataset matches, ω_w 17.2@2V, 0 overhead |
 | **4.x FOC split** | **✅ 4.1–4.2 (2026-08-08)** | FOC flat 4000.2 Hz preempting the blocking MPU read. Spurious `WHEEL_SAT` traced to a velocity-estimate glitch (not the split — present on reverted monolith too); guarded by `WW_MAX_JUMP` reject + `wwRejects` in `G`. Diagnostics kept: `E`, `V<volts>`, `enctest` env. 4.3 optional; 4.4–4.5 → hardware retune. |
 | **3.x telemetry extraction** | **✅ (2026-08-08)** | Option C, sole-writer `telemTask` prio 1. **`ctrl period` MAX 11,500,760 → 5,006 µs**; ratio now exactly 20:1; drops 0. Step 3.1 first shipped BROKEN (half-applied invariant) — see the Phase 3 result note; the lesson is Trap A9. |
-| 5.x safety task + I2C mutex | ⬜ | — |
-| 6.x comms task | ⬜ | — |
-| 7.x consolidation | ⬜ | — |
+| **5.x safety task + I2C mutex** | **✅ (2026-08-08)** | `safetyTask` prio 2, 50 ms: wheel backstop + time-based heartbeat + INA219 power trips (10.0 V / 2500 mA, debounced, set from measured data). I2C **mutex** (priority inheritance); control `i2c_lock(2)` + degrade, safety `(5)`, bias `(20)`. `ctrl period` unchanged at 5006 µs, `i2c timeouts` 0. |
+| **6.x comms task** | **✅ (2026-08-08)** | `commsTask` prio 2 = SOLE serial reader; lines queued, `handleCommand` still executes verbatim on the control task. `X` fast path ≤250 µs. `comms drops` 0 under spam. |
+| 7.x consolidation | ⬜ **NEXT** | — |
 
 ## Files that exist now (Phase 0–1.3)
 
@@ -2097,6 +2097,59 @@ with a 400 ms timeout. Don't port the polling logic verbatim.
 task at priority 2 drains far faster. Add an overflow counter anyway; silent loss
 is worse than a reported one.
 
+### Result — Phase 6 (2026-08-08): PASSED
+
+Built `commands.h/.cpp` — `commsTask` prio 2, polling both channels every 2 ms
+(500 Hz; ~23 bytes/poll at 115200, comfortably inside the core's 64-byte RX buffer).
+
+**What moved: RX and line assembly only. Command EXECUTION deliberately did not.**
+`handleCommand` writes controller state (target, ctrlMode, gains, capture flags); running
+it on commsTask would drop those writes into the middle of `controlUpdate()` — a torn read
+of the very state the control law is using. So complete lines are queued and the control
+task drains them at the top of its cycle, calling `handleLine()` **verbatim, unchanged**.
+
+**THE SINGLE-READER RULE — the mirror of telemetry's single-writer rule (B15).** Only
+commsTask reads the ports. Two readers race the RX ring buffer's tail and one silently eats
+the other's bytes. This bit immediately: `V` polled `Serial.available()` itself, so commsTask
+would have swallowed its stop key and `V` would never have exited. Fixed by watching
+`commands_rxBytes()` instead of reading the port. Audited: zero direct reads remain in
+`rtos_main.cpp`. (RX/TX across tasks stays safe — HardwareSerial keeps separate ring buffers
+and head/tail per direction, so commsTask reading while telemTask writes touches disjoint
+state.)
+
+**`X` fast path:** commsTask zeroes `motor.target` the instant it sees an X, *before* queueing
+— an aligned 32-bit float store is atomic on Cortex-M4, so focTask applies it within one tick
+(≤250 µs) instead of waiting up to a full 5 ms control period. The line is still queued so
+`handleLine` runs the full stop (flags + operator message) normally.
+
+**Measured (hardware):** `V2` streams and stops cleanly on a keypress (reader race avoided);
+`X` immediate; **`comms drops: 0`** throughout, including ~12 `G` commands spammed during an
+active capture — the capture completed intact (1201 rows) and the heading settled 91.5° vs
+90°. **GATE: `ctrl period` min 4416 / mean 4999 / MAX 5005 µs measured DURING a T90 capture with
+~10 `G` commands spammed at it** — command traffic no longer perturbs the control loop at
+all; capture intact (1201 rows), settled 88.95° vs 90.00°, `comms drops` 0, `telem drops` 0.
+comms stack free 714/768.
+
+**Latent interaction, logged not fixed:** `INA219 read` MAX hit **3042 µs** on one sample
+(typ. 1370). That exceeds the control task's 2 ms `i2c_lock` timeout, so control *can*
+legitimately fail to get the bus and degrade to the previous gyro sample. It did not happen
+here (`i2c timeouts: 0`) and degrading is the designed-safe response, but if timeouts ever
+start appearing, this is why — the fix would be splitting the INA219 read into two shorter
+transactions or lengthening the control timeout, NOT removing the degrade path. Also observed: `wheel-velocity glitches rejected: 3` during a T90 — the Phase-4
+plausibility guard suppressing what would previously have been false saturation aborts.
+
+**`telem drops: 22` under command spam is a BANDWIDTH limit, not a bug (Trap 18 observed).**
+Each `G` is ~8 lines; a ~60-char line to *two* ports at 115200 costs ~10.4 ms, so sustained
+output caps near ~96 lines/s. Spamming `G` faster than ~12/s asks for more than the wire can
+carry and the queue correctly sheds load rather than delaying control. **Enlarging the queue
+would not help** — it only moves the same ceiling. Left as-is deliberately.
+
+**Known, deliberately not fixed:** `B`/`E`/`V` still execute on the control task, so they
+occupy it for their duration (they disable the controller first, so it is safe — but it is
+why `ctrl period` MAX reads in seconds after running them; take timing on a clean window).
+Moving them to commsTask means they would touch motor state from another task, which is
+exactly what the queue design avoids — a Phase 7 decision, not a rush.
+
 **Phase 6 exit:** `git tag rtos-p6-comms`
 
 ---
@@ -2207,6 +2260,7 @@ CTRL  period 5000 µs   jitter max ____ µs   WCET ____ µs
 | 17 | Two tasks writing `Serial` | **NOT merely "interleaved garbage" — that undersells it and cost us a day (2026-08-08).** `HardwareSerial` is not reentrant: concurrent writers corrupt the driver. Observed: board **froze** after a capture dump, platform slewed the **wrong way at full torque**, `wp` froze at an impossible 11.78 rad/s, control period stretched to **303 ms**. Reads like a hardware fault. Cause was a **half-applied** single-writer design (text queued to telemTask; dump/`M`/`E`/`V` still direct from the control task) — worse than none, because it looks correct. Fix = the absolute invariant B15 + `telem_run(fn)` for bulk writers. |
 | 18 | Serial bandwidth < telemetry rate | Silent drops; decimate |
 | 19 | **Arduino `delay()` in a task** | Busy-spins on `yield()`, which only yields to equal-or-higher priority → **silently starves every lower-priority task** for the whole delay. Use `vTaskDelay()`. Cost us a false watchdog trip + swallowed telemetry (Step 5.1, 2026-08-08). |
+| 21 | **Two tasks READING one serial port** | Mirror of Trap 17. They race the RX ring buffer's tail and one silently eats the other's bytes — `V`'s stop key vanished into commsTask, so it could never exit. One reader only; anything else that needs "did the operator press something" watches a byte counter (Phase 6). |
 | 20 | **Watchdog counting iterations instead of time** | If the watchdog is ever starved, `vTaskDelayUntil` returns immediately once per missed period, so N "consecutive" checks span microseconds, not N periods — and a healthy task reads as dead. Always compare **wall-clock elapsed** since the monitored counter last moved (Step 5.1). |
 | 19 | Reading the trace buffer while tracing | Torn data |
 | 20 | High-water from an unexercised path | Overflow appears weeks later |

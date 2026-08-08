@@ -148,6 +148,7 @@
 #include "telemetry.h"       // Phase 3: telemTask is the SOLE serial writer
 #include "safety.h"          // Phase 5: independent watchdog task
 #include "i2c_bus.h"         // Phase 5.2: I2C mutex (control MPU + safety INA219)
+#include "commands.h"        // Phase 6: commsTask owns serial RX
 #include <Adafruit_INA219.h>
 
 // ------------------------- hardware -------------------------
@@ -375,6 +376,12 @@ void stopMotor(const String &why) {
 static float safetyWheelVel(void)          { return motor.shaft_velocity; }
 static void  safetyStop(const char* why)   { stopMotor(String(why)); }
 
+// Phase 6 X fast path. Runs on commsTask the instant an X is seen, ahead of the
+// queue. An aligned 32-bit float store is atomic on Cortex-M4, so focTask picks it
+// up within one tick (<=250 us) instead of waiting up to a full 5 ms control
+// period. handleLine() still runs the full stop when the control task drains it.
+static void commsEmergencyStop(void) { motor.target = 0.0f; }
+
 // Called from safetyTask (prio 2). Takes the I2C mutex around the transaction ONLY.
 // Longer timeout than the control path (5 ms): safety is not deadline-critical and
 // would rather wait behind a 2.5 ms gyro read than miss the sample entirely.
@@ -442,6 +449,9 @@ void printGains() {
   printBoth("safety checks: " + String(safety_checks())
             + "  stack free (words): " + String(safety_stackFreeWords())
             + "  i2c timeouts: " + String(i2c_timeouts()));
+  printBoth("comms: rx bytes=" + String(commands_rxBytes())
+            + "  drops=" + String(commands_drops())
+            + "  stack free (words): " + String(commands_stackFreeWords()));
   {
     float mnV, mxV, mxA; uint32_t pf;
     if (safety_powerStats(&mnV, &mxV, &mxA, &pf))
@@ -837,8 +847,12 @@ void handleLine(String s) {
       motor.target = volts;
       printBoth("MANUAL DRIVE " + String(volts, 2) + "V. Press any key (or X) to STOP.");
       printBoth("t_ms,shaft_angle_rad,single_turn_deg,shaft_vel_rad_s,V");
+      // Watch the RX byte COUNTER, don't read the port: commsTask is the sole
+      // reader now (see commands.h), and a second reader would race it on the RX
+      // ring buffer -- commsTask would swallow the stop key and this would never exit.
       unsigned long t0 = millis(), lastP = 0;
-      while (!Serial.available() && !hc05Serial.available()) {
+      uint32_t rxAtStart = commands_rxBytes();
+      while (commands_rxBytes() == rxAtStart) {
         motor.target = volts;                          // focTask applies it each tick
         if (millis() - lastP >= 20) {                  // ~50 Hz, unlimited
           lastP = millis();
@@ -852,9 +866,9 @@ void handleLine(String s) {
         safety_kick();   // runs until a keypress: keep the heartbeat alive
         vTaskDelay(1);   // yield so telemTask can drain (this loop never blocks otherwise)
       }
-      motor.target = 0.0f;                              // focTask applies within one tick
-      while (Serial.available())     Serial.read();     // drain the stop key
-      while (hc05Serial.available()) hc05Serial.read();
+      motor.target = 0.0f;   // focTask applies within one tick
+      // No RX drain here: commsTask owns the port and has already consumed the
+      // stop key into its queue, where it will be handled as a normal command.
       printBoth("MANUAL DRIVE stopped (target 0).");
       break;
     }
@@ -869,18 +883,12 @@ void handleLine(String s) {
   }
 }
 
+// Phase 6: RX and line assembly moved to commsTask (prio 2). The control task now
+// only DRAINS complete lines and executes handleLine() -- unchanged -- at a known
+// point in its cycle, so command writes can never land mid-controlUpdate().
 void pollSerial() {
-  static String bufU, bufB;
-  while (Serial.available()) {
-    char ch = Serial.read();
-    if (ch == '\n' || ch == '\r') { if (bufU.length()) { handleLine(bufU); bufU = ""; } }
-    else bufU += ch;
-  }
-  while (hc05Serial.available()) {
-    char ch = hc05Serial.read();
-    if (ch == '\n' || ch == '\r') { if (bufB.length()) { handleLine(bufB); bufB = ""; } }
-    else bufB += ch;
-  }
+  String line;
+  while (commands_next(line)) handleLine(line);
 }
 
 // =====================================================================
@@ -1116,6 +1124,10 @@ void setup() {
   // observed peak, clear of an aggressive slew but far below a hard short.
   // Both debounced 2 checks. Tighten once T180 / stall data exists.
   safety_setPowerLimits(10.0f, 2500.0f);
+
+  // Phase 6: commsTask (prio 2) becomes the SOLE serial READER. Created before the
+  // control task; harmless if bytes arrive early, they just queue.
+  commands_init(Serial, hc05Serial, commsEmergencyStop);
 
   configASSERT(xTaskCreate(controlTask, "ctrl", 1536, NULL, 3, &hControl) == pdPASS);
   vTaskSetThreadLocalStoragePointer(hControl, 0, (void*)(uintptr_t)TRACE_ID_CTRL);
