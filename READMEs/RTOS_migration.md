@@ -1910,6 +1910,58 @@ running. These are different failures.
 
 ---
 
+### Result — Step 5.1 (2026-08-08): PASSED after one instructive false trip
+
+Built `safety.h/.cpp` — `safetyTask`, prio 2, 50 ms via `vTaskDelayUntil`. Two checks:
+wheel overspeed (reads `motor.shaft_velocity` **straight from the FOC layer**, not from a
+value the control task publishes — a wedged control task must not be able to freeze the
+watchdog's own input) → recoverable `stopMotor`; and a control-task heartbeat → terminal
+`faults_safeStop(FAULT_HEARTBEAT)` (8 LED pulses). Terminal is the honest response: clearing
+flags a dead task will never read recovers nothing. The inline 200 Hz `WHEEL_SAT` check
+STAYS — defence in depth, per the Trap below. Arming is deferred to `safety_arm()` at the end
+of `hwSetup`, because `initFOC` and the gyro-bias measurement legitimately block for seconds.
+
+**THE BUG — a watchdog must measure TIME, not ITERATIONS.** First version tripped after `B`
+and `E`, freezing the board (LD2 blinking 8). Chain:
+1. Arduino `delay()` **busy-spins on `yield()`** (`wiring_time.c`), and `yield()` only yields
+   to equal-or-higher priority. So during `B` (~1 s) and `E` (3 s) the control task spun at
+   prio 3 and **starved safetyTask (2) and telemTask (1) completely**.
+2. `safetyTask`'s `vTaskDelayUntil` deadline fell behind by 20–60 periods.
+3. When control finally blocked, `vTaskDelayUntil` returned **immediately once per missed
+   period**, so the 4 heartbeat checks ran back-to-back **in microseconds** instead of over
+   200 ms.
+4. The control task kicks at 200 Hz (every 5 ms), so within those microseconds the counter
+   had not moved — 4 identical reads → false `FAULT_HEARTBEAT` on a perfectly healthy system.
+
+Three fixes, all kept:
+- **Heartbeat is wall-clock based** (300 ms since the counter last moved), not N consecutive
+  iterations. An iteration count silently assumes the watchdog runs on schedule; time does not.
+- **Resync on starvation** — if the deadline has slipped >2 periods, reset it rather than let
+  `vTaskDelayUntil` burst through the backlog.
+- **`delay()` → `vTaskDelay()`** in `measureGyroBias` and `E`. This is the root-cause fix and
+  it also repaired a latent Phase-3 bug: `E`'s own output was being queued and dropped because
+  telemTask could never drain while the control task busy-spun.
+
+**`delay()` is now a landmine anywhere in the control task** — it starves every lower-priority
+task silently. Audit for it in Phase 6. (The two remaining `while(1) delay(1000)` calls are
+`hwSetup` init-failure dead-ends, before arming — harmless.)
+
+Measured after the fix: `B`, `E`, `V2`, `G`, `T90` all clean; `safety checks` climbing ~20/s;
+safety stack free 701/768 words; FOC tick 238–261 µs; `loopFOC` 31/32/45 µs unchanged.
+**Clean-window timing (`M!` → `Z` → `T90` → `M`): `ctrl period` min 4994 / mean 5000 / MAX
+5006 µs — 200.00 Hz at ±6 µs.** The safety task costs nothing measurable. Same run: T90
+settled 90.83° vs 90.00° (0.83° error), α=0 in the deadzone, wheel bled −4.32 → −0.01 rad/s
+with u → 0 (passive unwind behaving at low speed).
+
+**Reading `ctrl period` after running diagnostics.** `B`/`E`/`V` execute *inside* the control
+task, so `controlStep()` does not return for their duration and the period stat logs one
+multi-second gap (observed MAX 4.83 s after a `V2` run). That is NOT a Phase-3 regression —
+all three disable the controller first, so the control law is not meant to be running. Take
+timing on a clean window: `M!` → `Z` → `T90` → `M`. The structural wart (blocking commands
+hijack the control task) is what **Phase 6** fixes by moving command handling to its own task.
+
+---
+
 ## Step 5.2 — The I2C mutex
 
 **Concept.** Two tasks now touch `Wire`: control (MPU6050, 200 Hz) and safety
@@ -1951,6 +2003,48 @@ design — priority inheritance is meaningless when there's no task to boost.
 **Trap 2.** Take the mutex immediately before the transaction, release
 immediately after. Never hold it across a computation. Long hold times mean long
 inversion windows.
+
+### Result — Step 5.2 (2026-08-08): PASSED, mutex costs nothing
+
+Built `i2c_bus.h/.cpp` — `xSemaphoreCreateMutex()` (NOT a binary semaphore; ownership is
+what gives priority inheritance). Two users: `controlTask` MPU6050 @ 200 Hz, `safetyTask`
+INA219 @ 20 Hz. INA219 auto-detected at boot with the `setCalibration_32V_2A()` gotcha
+handled (CONTROL_README §16 — `begin()` only confirms an I2C ack); **absence is non-fatal**,
+monitoring just disables, so a missing sensor can never cause a spurious safe-stop.
+
+**Timeouts are asymmetric on purpose.** Control uses `i2c_lock(2)` — 2 ms of a 5 ms budget is
+the most the loop can afford — and on failure **degrades** (reuses the previous gyro sample,
+counts it) rather than blocking. Safety uses `i2c_lock(5)`: not deadline-critical, and it
+would rather wait behind a 2.5 ms gyro read than miss its sample. `B` (`measureGyroBias`)
+uses `i2c_lock(20)` — caught during an audit, it re-runs *after* the watchdog is armed so it
+genuinely races safetyTask; a skipped sample there would bias the bias measurement.
+
+**Measured (hardware):**
+```
+ctrl period      min 4994 / mean 5000 / MAX 5006 us   <- IDENTICAL to pre-mutex
+INA219 read      n=529   1372 / 1372 / 1377 us        (safety holds the bus 1.37 ms @ 20 Hz)
+i2c timeouts     0                                     (control never lost the bus)
+control law MAX  2530 -> 2771 us                       (+240 us = occasional mutex wait)
+MPU6050 read     2392 / 2500 / 2591 us
+power (idle)     busV 12.07-12.08, |I| 8 mA
+power (T90)      busV min 11.65, |I| max 813 mA
+```
+The headline: safetyTask holds the bus for 1.37 ms every 50 ms and the 200 Hz control loop
+still never misses a deadline by more than 6 µs. Priority inheritance + short holds work.
+
+**Trip thresholds set from MEASURED data, not guessed** (deliberately a two-flash sequence:
+monitor first, then arm — guessing a threshold on a spinning flywheel invites nuisance
+safe-stops). `minBusV = 10.0 V` (~14% below nominal, well under the 11.65 V working sag, so
+it catches a collapsing battery not normal load); `maxCurrent = 2500 mA` (~3× the observed
+813 mA peak). **Both debounced over 2 consecutive checks (100 ms)** so one noisy INA219 sample
+cannot kill a run. Trips use the *recoverable* stop, not `faults_safeStop` — a sagging battery
+should let the operator swap it and send `R`, not force a reset. Tighten once T180/stall data
+exists.
+
+**Fixed alongside: `telem drops: 97`.** Not random — during the ~11 s dump, telemTask is busy
+writing 1201 rows while the control task keeps queueing 10 Hz HOLD rows; ~110 arrive against a
+24-deep queue. Dropping is *by design* (never delay control for telemetry) and the dump itself
+was complete, but the noise is avoidable: HOLD rows are now suppressed while `telem_busy()`.
 
 **Phase 5 exit:** `git tag rtos-p5-safety`
 
@@ -2112,6 +2206,8 @@ CTRL  period 5000 µs   jitter max ____ µs   WCET ____ µs
 | 16 | Telemetry stack too small (`sprintf %f`) | Overflow in the least-tested task |
 | 17 | Two tasks writing `Serial` | **NOT merely "interleaved garbage" — that undersells it and cost us a day (2026-08-08).** `HardwareSerial` is not reentrant: concurrent writers corrupt the driver. Observed: board **froze** after a capture dump, platform slewed the **wrong way at full torque**, `wp` froze at an impossible 11.78 rad/s, control period stretched to **303 ms**. Reads like a hardware fault. Cause was a **half-applied** single-writer design (text queued to telemTask; dump/`M`/`E`/`V` still direct from the control task) — worse than none, because it looks correct. Fix = the absolute invariant B15 + `telem_run(fn)` for bulk writers. |
 | 18 | Serial bandwidth < telemetry rate | Silent drops; decimate |
+| 19 | **Arduino `delay()` in a task** | Busy-spins on `yield()`, which only yields to equal-or-higher priority → **silently starves every lower-priority task** for the whole delay. Use `vTaskDelay()`. Cost us a false watchdog trip + swallowed telemetry (Step 5.1, 2026-08-08). |
+| 20 | **Watchdog counting iterations instead of time** | If the watchdog is ever starved, `vTaskDelayUntil` returns immediately once per missed period, so N "consecutive" checks span microseconds, not N periods — and a healthy task reads as dead. Always compare **wall-clock elapsed** since the monitored counter last moved (Step 5.1). |
 | 19 | Reading the trace buffer while tracing | Torn data |
 | 20 | High-water from an unexercised path | Overflow appears weeks later |
 

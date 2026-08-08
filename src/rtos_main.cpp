@@ -146,6 +146,9 @@
 #include "faults.h"
 #include "trace.h"           // TRACE_ID_CTRL for the task's trace index
 #include "telemetry.h"       // Phase 3: telemTask is the SOLE serial writer
+#include "safety.h"          // Phase 5: independent watchdog task
+#include "i2c_bus.h"         // Phase 5.2: I2C mutex (control MPU + safety INA219)
+#include <Adafruit_INA219.h>
 
 // ------------------------- hardware -------------------------
 #define POLE_PAIRS      11
@@ -167,6 +170,8 @@ BLDCDriver3PWM driver = BLDCDriver3PWM(PIN_PWM_A, PIN_PWM_B, PIN_PWM_C, PIN_ENAB
 SPIClass encoderSPI(PB15, PB14, PB13);
 MagneticSensorMT6701SSI sensor(PIN_ENCODER_CS);
 Adafruit_MPU6050 mpu;
+Adafruit_INA219  ina219;          // Phase 5.2: read by safetyTask under the mutex
+bool             inaPresent = false;
 
 // ------------------- identified plant constants -------------------
 // NAMING NOTE: these are A_1 / A_2, not A1 / A2. On STM32duino, A0-A15 are
@@ -364,15 +369,43 @@ void stopMotor(const String &why) {
   printBoth("!! STOP: " + why + "  (send R to re-enable)");
 }
 
+// Adapters handed to safetyTask, which is deliberately SimpleFOC-free.
+// Wheel speed is read straight from the FOC layer (focTask keeps it fresh) so a
+// wedged control task cannot freeze the value the watchdog depends on.
+static float safetyWheelVel(void)          { return motor.shaft_velocity; }
+static void  safetyStop(const char* why)   { stopMotor(String(why)); }
+
+// Called from safetyTask (prio 2). Takes the I2C mutex around the transaction ONLY.
+// Longer timeout than the control path (5 ms): safety is not deadline-critical and
+// would rather wait behind a 2.5 ms gyro read than miss the sample entirely.
+static bool safetyReadPower(float* busV, float* mA) {
+  if (!inaPresent) return false;
+  if (!i2c_lock(5)) return false;
+  TIME_BLOCK(st_ina, {
+    *busV = ina219.getBusVoltage_V();
+    *mA   = ina219.getCurrent_mA();
+  });
+  i2c_unlock();
+  return true;
+}
+
 // Platform must be stationary. Takes about a second.
 void measureGyroBias() {
   const int N = 200;
   float sum = 0.0f;
   for (int i = 0; i < N; i++) {
+    // Under the mutex: `B` re-runs this AFTER the watchdog is armed, so safetyTask
+    // may be reading the INA219 on the same bus. Generous timeout -- this is a
+    // calibration routine, not the control path, so waiting is fine; a skipped
+    // sample would bias the average.
     sensors_event_t a, g, t;
-    mpu.getEvent(&a, &g, &t);
+    if (i2c_lock(20)) { mpu.getEvent(&a, &g, &t); i2c_unlock(); }
     sum += g.gyro.z * 180.0f / PI;
-    delay(5);                        // focTask commutates via the TIM9 ISR meanwhile
+    safety_kick();                   // ~1 s loop: keep the heartbeat alive
+    // vTaskDelay, NOT delay(): Arduino delay() busy-spins on yield(), which only
+    // yields to equal-or-higher priority -- it would starve safetyTask (2) and
+    // telemTask (1) for the whole second. vTaskDelay actually BLOCKS.
+    vTaskDelay(pdMS_TO_TICKS(5));
   }
   gyroBias = sum / N;
   printBoth("[GYRO] bias = " + String(gyroBias, 4) + " dps");
@@ -406,6 +439,18 @@ void printGains() {
   printBoth("wheel-velocity glitches rejected: " + String(wwRejects)
             + "  |  telem drops: " + String(telem_drops())
             + "  telem stack free (words): " + String(telem_stackFreeWords()));
+  printBoth("safety checks: " + String(safety_checks())
+            + "  stack free (words): " + String(safety_stackFreeWords())
+            + "  i2c timeouts: " + String(i2c_timeouts()));
+  {
+    float mnV, mxV, mxA; uint32_t pf;
+    if (safety_powerStats(&mnV, &mxV, &mxA, &pf))
+      printBoth("power: busV min=" + String(mnV, 2) + " max=" + String(mxV, 2)
+                + "  |I| max=" + String(mxA, 0) + "mA  read fails=" + String(pf)
+                + "   (trips: <10.0V, >2500mA)");
+    else
+      printBoth("power: no INA219 samples yet");
+  }
   // RTOS (Step 2.1, Trap 3): the single task never blocks, so the stack-overflow
   // hook (checked only at switch time) never runs. Read the high-water mark by
   // hand -- the MINIMUM free stack (in words) the ctrl task has ever had.
@@ -471,9 +516,22 @@ void printTimingStats() {
 // =====================================================================
 void controlUpdate(float dt) {
   // ---- sense ----
+  // Gyro read under the I2C mutex (safetyTask reads the INA219 on the same bus).
+  // SHORT TIMEOUT, never portMAX_DELAY: the safety read is ~1 ms and 2 ms of a 5 ms
+  // budget is the most this loop can afford to wait. On failure we DEGRADE -- reuse
+  // the previous gyro sample and count it -- rather than block. A control task
+  // waiting forever on a wedged bus with a spinning flywheel is how runaways happen.
+  static float gyro_dps_prev = 0.0f;
+  float gyro_dps;
   sensors_event_t a, g, t;
-  TIME_BLOCK(st_mpu, { mpu.getEvent(&a, &g, &t); });
-  float gyro_dps = (g.gyro.z * 180.0f / PI) - gyroBias;
+  if (i2c_lock(2)) {
+    TIME_BLOCK(st_mpu, { mpu.getEvent(&a, &g, &t); });
+    i2c_unlock();                                    // release IMMEDIATELY after
+    gyro_dps = (g.gyro.z * 180.0f / PI) - gyroBias;
+    gyro_dps_prev = gyro_dps;
+  } else {
+    gyro_dps = gyro_dps_prev;                        // degrade: hold last good
+  }
   omega_p = GYRO_SIGN * gyro_dps * PI / 180.0f;     // rad/s, model convention
 
   // Wheel velocity, with a physical-plausibility reject. The wheel cannot change
@@ -760,7 +818,10 @@ void handleLine(String s) {
         float turn = ang - floorf(ang / (2.0f * PI)) * (2.0f * PI);
         telem_print(String(i) + "," + String(ang, 4) + ","
                   + String(degrees(turn), 2) + "," + String(vel, 3));
-        delay(100);   // telemTask drains during this (control task is blocked)
+        safety_kick();   // 3 s loop: keep the heartbeat alive
+        // vTaskDelay, NOT delay(): delay() busy-spins and would starve telemTask,
+        // so this command's own output would never get written out.
+        vTaskDelay(pdMS_TO_TICKS(100));
       }
       printBoth("ENC DIAG done (motor still OFF; send R to re-enable).");
       break;
@@ -788,6 +849,7 @@ void handleLine(String s) {
                     + String(degrees(turn), 2) + "," + String(vel, 3) + ","
                     + String(volts, 2));
         }
+        safety_kick();   // runs until a keypress: keep the heartbeat alive
         vTaskDelay(1);   // yield so telemTask can drain (this loop never blocks otherwise)
       }
       motor.target = 0.0f;                              // focTask applies within one tick
@@ -867,6 +929,19 @@ static void hwSetup() {
   mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
   printBoth("[MPU6050] OK");
 
+  // INA219 — the second I2C user (safetyTask reads it under the mutex).
+  // begin() returning true only confirms an I2C ack, NOT that the calibration
+  // registers are set; without the explicit call the readings come back `inf`
+  // (CONTROL_README §16). Absence is NOT fatal: monitoring is simply skipped, so
+  // a missing sensor can never cause a spurious safe-stop.
+  inaPresent = ina219.begin();
+  if (inaPresent) {
+    ina219.setCalibration_32V_2A();
+    printBoth("[INA219] OK (power monitoring active)");
+  } else {
+    printBoth("[INA219] NOT FOUND -- power monitoring disabled (not fatal)");
+  }
+
   sensor.init(&encoderSPI);
   motor.linkSensor(&sensor);
   driver.voltage_power_supply = VOLTAGE_PSU;
@@ -917,6 +992,7 @@ static void hwSetup() {
 // (the TIM9 notification IS the 200 Hz clock now). dt still comes from micros()
 // so it stays correct across a blocking command (e.g. B rebias), as before.
 static void controlStep() {
+  safety_kick();             // "control task is alive" -- the watchdog's signal
   pollSerial();
 
   unsigned long now = micros();
@@ -958,7 +1034,12 @@ static void controlStep() {
 
   // Slow telemetry while holding, so you can nudge the platform by hand and
   // watch it recover without needing a full capture.
-  if (ctrlMode == CTRL_HOLD && !capturing && (millis() - lastTelemMs) >= TELEM_PERIOD_MS) {
+  // ...but not while a capture dump is in flight: telemTask is busy for ~11 s
+  // writing 1201 rows, so these 10 Hz rows would just overflow the queue and be
+  // dropped (97 of them, observed). Skipping them is honest -- the operator is
+  // reading the dump, not the live stream.
+  if (ctrlMode == CTRL_HOLD && !capturing && !telem_busy()
+      && (millis() - lastTelemMs) >= TELEM_PERIOD_MS) {
     lastTelemMs = millis();
     TIME_BLOCK(st_telem, {
       // Queued, not written here -- the control task must never touch the ports.
@@ -999,6 +1080,8 @@ static void focTask(void*) {
 static void controlTask(void*) {
   hwSetup();                 // bring up hardware; creates focTask + starts TIM9
   telem_activate();          // boot prints done -> telemTask owns serial from here
+  safety_kick();             // seed the heartbeat before arming the watchdog
+  safety_arm();              // hwSetup done -> watchdog live from here
   static uint32_t t_prev = 0;
   for (;;) {
     ulTaskNotifyTake(pdTRUE, portMAX_DELAY);        // 200 Hz release from TIM9 ISR
@@ -1019,6 +1102,20 @@ void setup() {
   // Phase 3: telemTask (prio 1) before the control task. It only gets CPU once
   // control blocks, and until telem_activate() output goes straight out.
   telem_init(Serial, hc05Serial);
+
+  // Phase 5: independent watchdog (prio 2). Idles until safety_arm() at the end
+  // of hwSetup -- initFOC and the gyro-bias measurement legitimately block the
+  // control task for seconds, which would otherwise read as a dead heartbeat.
+  i2c_init();                // Phase 5.2: bus mutex, before any task can use Wire
+  safety_init(safetyWheelVel, WHEEL_SAT_LIMIT, safetyStop);
+  safety_setPowerMonitor(safetyReadPower);
+  // Thresholds from MEASURED values (2026-08-08), not guessed:
+  //   idle 12.07-12.08 V; under a T90 slew min 11.65 V, peak |I| 813 mA.
+  // 10.0 V is ~14% below nominal and well under the 11.65 V working sag -- it
+  // catches a genuinely collapsing battery, not normal load. 2500 mA is ~3x the
+  // observed peak, clear of an aggressive slew but far below a hard short.
+  // Both debounced 2 checks. Tighten once T180 / stall data exists.
+  safety_setPowerLimits(10.0f, 2500.0f);
 
   configASSERT(xTaskCreate(controlTask, "ctrl", 1536, NULL, 3, &hControl) == pdPASS);
   vTaskSetThreadLocalStoragePointer(hControl, 0, (void*)(uintptr_t)TRACE_ID_CTRL);
