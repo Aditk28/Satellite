@@ -145,6 +145,7 @@
 #include <STM32FreeRTOS.h>
 #include "faults.h"
 #include "trace.h"           // TRACE_ID_CTRL for the task's trace index
+#include "telemetry.h"       // Phase 3: telemTask is the SOLE serial writer
 
 // ------------------------- hardware -------------------------
 #define POLE_PAIRS      11
@@ -350,7 +351,9 @@ static inline float wrapPi(float x) {
 }
 static inline float signf(float x) { return (x > 0.0f) ? 1.0f : ((x < 0.0f) ? -1.0f : 0.0f); }
 
-void printBoth(const String &s) { Serial.println(s); hc05Serial.println(s); }
+// Phase 3: queued to telemTask, which is the sole serial writer after activation.
+// Direct-writes during boot (telemTask can't drain until the control loop yields).
+void printBoth(const String &s) { telem_print(s); }
 
 void stopMotor(const String &why) {
   controllerEnabled = false;
@@ -400,7 +403,9 @@ void printGains() {
   printBoth("theta=" + String(degrees(theta), 2) + "deg  target=" + String(degrees(target), 2)
             + "deg  omega_p=" + String(omega_p, 3) + "  omega_w=" + String(omega_w, 2)
             + "  mode=" + String(ctrlMode == CTRL_IDLE ? "IDLE" : (ctrlMode == CTRL_HOLD ? "HOLD" : "STEP")));
-  printBoth("wheel-velocity glitches rejected: " + String(wwRejects));
+  printBoth("wheel-velocity glitches rejected: " + String(wwRejects)
+            + "  |  telem drops: " + String(telem_drops())
+            + "  telem stack free (words): " + String(telem_stackFreeWords()));
   // RTOS (Step 2.1, Trap 3): the single task never blocks, so the stack-overflow
   // hook (checked only at switch time) never runs. Read the high-water mark by
   // hand -- the MINIMUM free stack (in words) the ctrl task has ever had.
@@ -436,7 +441,30 @@ void dumpCaptureTo(Print &out) {
   out.println("--- capture end ---");
 }
 
+// Both of these are RUN ON telemTask via telem_run() -- telemTask owns the serial
+// ports, so writing them directly in here is correct. Never call these from the
+// control task once telem_activate() has run.
 void dumpCapture() { dumpCaptureTo(Serial); dumpCaptureTo(hc05Serial); }
+
+void printTimingStats() {
+  // Dump to BOTH channels -- if this only went to USB, sending M over HC-05
+  // would land the reply on USB and look like nothing happened.
+  Print* outs[2] = { &Serial, &hc05Serial };
+  for (int i = 0; i < 2; i++) {
+    Print& o = *outs[i];
+    o.println("--- timing (us) ---");
+    stat_print(o, "loopFOC",      &st_foc);
+    stat_print(o, "move",         &st_move);
+    stat_print(o, "MPU6050 read", &st_mpu);
+    stat_print(o, "INA219 read",  &st_ina);   // no samples: no INA219 here
+    stat_print(o, "control law",  &st_law);   // incl. MPU; compute = law - MPU
+    stat_print(o, "telem row",    &st_telem);
+    stat_print(o, "ctrl period",  &st_period);   // control-release interval (~5000 us)
+    uint32_t fmn, fmx; focTick_jitter(&fmn, &fmx);
+    o.print("FOC tick dt (us): min="); o.print(fmn); o.print(" max="); o.println(fmx);
+    o.println("-------------------");
+  }
+}
 
 // =====================================================================
 // THE CONTROL LAW
@@ -518,7 +546,7 @@ void controlUpdate(float dt) {
   //      spin as the wheel dumps its momentum; that is accepted behaviour. ----
   if (fabsf(omega_w) > WHEEL_SAT_LIMIT) {
     stopMotor("wheel saturation " + String(omega_w, 1) + " rad/s");
-    dumpCapture();   // DIAG: dump omega_w trajectory up to the abort (ramp vs spike)
+    telem_run(dumpCapture);   // DIAG: trajectory up to the abort (ramp vs spike)
     return;
   }
 
@@ -625,6 +653,14 @@ void handleLine(String s) {
   char c = toupper(s.charAt(0));
   float v = (s.length() > 1) ? s.substring(1).toFloat() : 0.0f;
 
+  // Phase 3 buffer-lifetime guard: a capture writes cap_*, and a queued dump
+  // READS cap_* from telemTask. Starting a new capture mid-dump would rewrite the
+  // buffer underneath it. Refuse rather than corrupt -- the dump is a few seconds.
+  if ((c == 'T' || c == 'O' || c == 'C') && telem_busy()) {
+    printBoth("busy: previous capture still dumping -- wait, then resend");
+    return;
+  }
+
   switch (c) {
     case 'O':
       // Open-loop sign check. Positive voltage should drive the wheel
@@ -702,23 +738,10 @@ void handleLine(String s) {
         stat_reset(&st_period);
         printBoth("timing stats reset");
       } else {
-        // Dump to BOTH channels -- if this only went to USB, sending M over
-        // HC-05 would land the reply on USB and look like nothing happened.
-        Print* outs[2] = { &Serial, &hc05Serial };
-        for (int i = 0; i < 2; i++) {
-          Print& o = *outs[i];
-          o.println("--- timing (us) ---");
-          stat_print(o, "loopFOC",      &st_foc);
-          stat_print(o, "move",         &st_move);
-          stat_print(o, "MPU6050 read", &st_mpu);
-          stat_print(o, "INA219 read",  &st_ina);   // no samples: no INA219 here
-          stat_print(o, "control law",  &st_law);   // incl. MPU; compute = law - MPU
-          stat_print(o, "telem row",    &st_telem);
-          stat_print(o, "ctrl period",  &st_period);   // control-release interval (~5000 us)
-          uint32_t fmn, fmx; focTick_jitter(&fmn, &fmx);
-          o.print("FOC tick dt (us): min="); o.print(fmn); o.print(" max="); o.println(fmx);
-          o.println("-------------------");
-        }
+        // Run the whole block ON telemTask -- it owns the ports, so stat_print
+        // may write them directly there. Doing this from the control task would
+        // be a second writer (exactly the Step 3.1 bug).
+        telem_run(printTimingStats);
       }
       break;
     case 'X': stopMotor("operator"); break;
@@ -735,10 +758,9 @@ void handleLine(String s) {
         float ang = motor.shaft_angle;
         float vel = motor.shaft_velocity;
         float turn = ang - floorf(ang / (2.0f * PI)) * (2.0f * PI);
-        String line = String(i) + "," + String(ang, 4) + ","
-                    + String(degrees(turn), 2) + "," + String(vel, 3);
-        Serial.println(line); hc05Serial.println(line);
-        delay(100);
+        telem_print(String(i) + "," + String(ang, 4) + ","
+                  + String(degrees(turn), 2) + "," + String(vel, 3));
+        delay(100);   // telemTask drains during this (control task is blocked)
       }
       printBoth("ENC DIAG done (motor still OFF; send R to re-enable).");
       break;
@@ -762,11 +784,11 @@ void handleLine(String s) {
           float ang  = motor.shaft_angle;
           float vel  = motor.shaft_velocity;
           float turn = ang - floorf(ang / (2.0f * PI)) * (2.0f * PI);
-          String line = String(millis() - t0) + "," + String(ang, 4) + ","
-                      + String(degrees(turn), 2) + "," + String(vel, 3) + ","
-                      + String(volts, 2);
-          Serial.println(line); hc05Serial.println(line);
+          telem_print(String(millis() - t0) + "," + String(ang, 4) + ","
+                    + String(degrees(turn), 2) + "," + String(vel, 3) + ","
+                    + String(volts, 2));
         }
+        vTaskDelay(1);   // yield so telemTask can drain (this loop never blocks otherwise)
       }
       motor.target = 0.0f;                              // focTask applies within one tick
       while (Serial.available())     Serial.read();     // drain the stop key
@@ -916,7 +938,12 @@ static void controlStep() {
     }
     if (capN >= MAX_CAP || (millis() - capStartMs) >= CAPTURE_MS) {
       capturing = false;
-      dumpCapture();
+      // PHASE 3 PAYOFF: hand the frozen buffer to telemTask instead of writing it
+      // here. The control task returns to its 200 Hz cadence immediately; the ~11 s
+      // of serial output happens at priority 1, in the gaps between control
+      // releases. The capture buffer stays untouched until the dump finishes --
+      // the T/O/C commands refuse to start a new capture while telem_busy().
+      telem_run(dumpCapture);
       // After an OPEN-LOOP pulse, return to IDLE -- do NOT engage the
       // closed loop, since the whole point was to verify the sign first.
       bool wasOpen = (ctrlMode == CTRL_OPEN || ctrlMode == CTRL_COMP);
@@ -934,11 +961,10 @@ static void controlStep() {
   if (ctrlMode == CTRL_HOLD && !capturing && (millis() - lastTelemMs) >= TELEM_PERIOD_MS) {
     lastTelemMs = millis();
     TIME_BLOCK(st_telem, {
-      String s = String(degrees(theta), 2) + "," + String(degrees(target), 2) + ","
-               + String(omega_p, 3) + "," + String(omega_w, 2) + ","
-               + String(lastAlpha, 2) + "," + String(lastU, 3);
-      Serial.println(s);
-      hc05Serial.println(s);
+      // Queued, not written here -- the control task must never touch the ports.
+      telem_print(String(degrees(theta), 2) + "," + String(degrees(target), 2) + ","
+                + String(omega_p, 3) + "," + String(omega_w, 2) + ","
+                + String(lastAlpha, 2) + "," + String(lastU, 3));
     });
   }
 }
@@ -972,6 +998,7 @@ static void focTask(void*) {
 
 static void controlTask(void*) {
   hwSetup();                 // bring up hardware; creates focTask + starts TIM9
+  telem_activate();          // boot prints done -> telemTask owns serial from here
   static uint32_t t_prev = 0;
   for (;;) {
     ulTaskNotifyTake(pdTRUE, portMAX_DELAY);        // 200 Hz release from TIM9 ISR
@@ -988,6 +1015,10 @@ void setup() {
   while (!Serial && millis() < 3000) {}
   us_init();
   faults_reportLastBoot();   // the .noinit black box (Step 1.2)
+
+  // Phase 3: telemTask (prio 1) before the control task. It only gets CPU once
+  // control blocks, and until telem_activate() output goes straight out.
+  telem_init(Serial, hc05Serial);
 
   configASSERT(xTaskCreate(controlTask, "ctrl", 1536, NULL, 3, &hControl) == pdPASS);
   vTaskSetThreadLocalStoragePointer(hControl, 0, (void*)(uintptr_t)TRACE_ID_CTRL);

@@ -24,17 +24,30 @@ replaces the analyzer.
 
 ## Current position
 
-**PHASES 3 AND 4 SWAPPED. FOC split Steps 4.1–4.2 DONE & verified; spurious-saturation
-bug RESOLVED (2026-08-08); Phase 3 (telemetry, Option C) is NEXT.** A hardware rework
-(STM32 swap + rewiring) introduced a spurious-`WHEEL_SAT` velocity-estimate glitch that
-briefly looked like a Phase-4 regression — it was NOT (reverted monolith showed it too).
-Fixed with a physical-plausibility reject on ω_w (`WW_MAX_JUMP`, `wwRejects` in `G`); root
-is a marginal MPU I2C read coupling into the encoder SSI (Appendix Phase-4 diag note).
-**Working-tree state:** Phase-4 split (from tag `rtos-p4-foc-split`) + the ω_w guard + kept
-diagnostic cmds `E`/`V` + dump-on-abort — all UNCOMMITTED, compiles clean, ready to flash
-and to commit as the new Phase-4 tip. Phase 4 Steps 4.4–4.5 (asymmetry, compFrac re-verify)
-and the dead passive-unwind stay deferred to the CONTROL_README hardware retune. Step 4.3
-(FOC-inside-I2C trace) optional. Swap reason: preemptive telemetry needs a lower-priority
+**PHASES 3 AND 4 SWAPPED, BOTH NOW DONE & VERIFIED ON HARDWARE (2026-08-08).
+Phase 5 (safety task + I2C mutex) is NEXT.**
+
+**Phase 3 gate PASSED — the headline number:** `ctrl period` MAX went from
+**11,500,760 µs → 5,006 µs** (mean 4999 = 200.04 Hz, i.e. ≤6 µs late worst case). The
+~11.5 s capture dump no longer stalls the control loop at all; it runs on `telemTask` at
+priority 1 in the gaps. Also now `loopFOC : control law` = 352678/17326 = **20.35 ≈ 20**,
+exactly `CTRL_DIVISOR` — the 23.9:1 notification-coalescing artifact is gone. `telem drops: 0`,
+telem stack free 1479/1536 words. FOC tick dt 239–260 µs, loopFOC 31/32/46 µs (unchanged).
+**This also retroactively satisfies the Step 4.2 verify criterion** ("control release jitter
+max < 50 µs") which was unmeetable until telemetry left the control path.
+
+**Phase 4 (4.1–4.2) verified:** FOC flat 4000.2 Hz preempting the blocking MPU read.
+Steps 4.4–4.5 (asymmetry, compFrac re-verify) and the dead passive-unwind are deferred to
+the CONTROL_README hardware retune (STM32 swap + added mass moved the plant; unwind fails on
+OLD firmware too, so pre-existing). Step 4.3 (FOC-inside-I2C trace) optional, skippable —
+the `M` counts already prove preemption.
+
+**Task inventory now:** `focTask` prio 4 (commutation, TIM9-notified 4 kHz) · `controlTask`
+prio 3 (sense + control law + capture fill + command parse, 200 Hz) · `telemTask` prio 1
+(ALL serial output) · idle prio 0. Still unsplit: safety/watchdog + INA219 (Phase 5),
+command RX (Phase 6).
+
+Swap reason (kept for the record): preemptive telemetry needs a lower-priority
 `telemTask`, which only
 gets CPU when the control task blocks — but the monolithic control task is a pure busy-spin
 (inline `loopFOC`, never blocks), so a prio-1 `telemTask` would be starved. Making the
@@ -141,8 +154,8 @@ uncommitted — check `git status` and commit before continuing if so.
 | 1.4 software tracer | ✅ | verified: periodic exactly 1000µs (0 jitter), spinner chopped, idle absent |
 | 1.5 FOC tick timer (TIM9) | ✅ | TIM9 @ 3999.98 Hz, jitter 0 µs; HardwareTimer API (core owns the vector) |
 | 2.x single-task port | ✅ | monolithic port; golden dataset matches, ω_w 17.2@2V, 0 overhead |
-| **4.x FOC split** | **🟢 4.1–4.2 DONE + spurious-sat RESOLVED (2026-08-08)** | Split verified (FOC flat 4000.2 Hz, preemption proven). Spurious `WHEEL_SAT` traced to a **velocity-estimate glitch** (not the split, not real speed): closed-loop-only, absent in open-loop `V` drive. Cause: the MPU I2C read went marginal (2373→2510 µs, more spread) after the wire rework, coupling noise into the encoder SSI read. Guard added: reject non-physical ω_w jumps (>`WW_MAX_JUMP` 15 rad/s/cycle) in sense, `wwRejects` in `G`. Diagnostic cmds kept: `E` (encoder), `V<volts>` (manual drive+stream). 4.3 optional; 4.4–4.5 → retune. |
-| 3.x telemetry extraction | ⬜ (after 4) | Arch decided: Option C hybrid (Appendix B7). Deferred behind 4 — needs the control task to block. |
+| **4.x FOC split** | **✅ 4.1–4.2 (2026-08-08)** | FOC flat 4000.2 Hz preempting the blocking MPU read. Spurious `WHEEL_SAT` traced to a velocity-estimate glitch (not the split — present on reverted monolith too); guarded by `WW_MAX_JUMP` reject + `wwRejects` in `G`. Diagnostics kept: `E`, `V<volts>`, `enctest` env. 4.3 optional; 4.4–4.5 → hardware retune. |
+| **3.x telemetry extraction** | **✅ (2026-08-08)** | Option C, sole-writer `telemTask` prio 1. **`ctrl period` MAX 11,500,760 → 5,006 µs**; ratio now exactly 20:1; drops 0. Step 3.1 first shipped BROKEN (half-applied invariant) — see the Phase 3 result note; the lesson is Trap A9. |
 | 5.x safety task + I2C mutex | ⬜ | — |
 | 6.x comms task | ⬜ | — |
 | 7.x consolidation | ⬜ | — |
@@ -162,11 +175,16 @@ src/
   hw_timers.h/.cpp           timer audit dump (Step 0.3); FOC tick added in 1.5
   faults.h/.cpp              safeStop, .noinit black box, FreeRTOS hooks, rtRunTimeCounter (Step 1.2)
   trace.h/.cpp               scheduler tracer ring buffer + switch hooks + dump (Step 1.4)
-platformio.ini               [env] base + [env:superloop] + [env:p1test]; -Iinclude; heap_3
+  rtos_main.cpp              THE sketch (env: rtos) — Phase 2 monolith + P4 split + P3 wiring
+  telemetry.h/.cpp           Phase 3 — telemTask (prio 1), the SOLE serial writer (B15/B16)
+  enc_test.cpp               standalone bare-metal MT6701 SSI test (env: enctest) — no
+                             FreeRTOS/SimpleFOC/motor. 30-second hardware-vs-firmware check.
+platformio.ini               [env] base + superloop / p1test / rtos / enctest; -Iinclude; heap_3
 tools/plot_trace.py          Gantt + inter-arrival plot from a trace dump (Step 1.4)
 ```
-Not yet created: `rtos_main.cpp`, `tasks.*`, `control_law.*`, `sensors.*`,
-`telemetry.*`, `commands.*` (Phase 2 onward).
+Not yet created: `tasks.*`, `control_law.*`, `sensors.*`, `commands.*` — the remaining
+file-splits, deferred into Phases 5–7. `rtos_main.cpp` is still monolithic apart from
+`telemetry.*` (the first split, Phase 3).
 
 ## Detailed progress log — what actually happened
 
@@ -1516,6 +1534,91 @@ check the high-water mark.
 slack? Compute it. If telemetry can't drain that fast on average, no buffer size
 saves you — decimate harder.
 
+---
+
+## Result (2026-08-08) — PASSED, but only after shipping it wrong once
+
+### What was built (Option C, Appendix B7)
+
+`telemetry.h/.cpp` — the first real file-split. A priority-1 `telemTask` plus a 24-deep
+queue of tagged records. **THE INVARIANT: after `telem_activate()`, `telemTask` is the only
+task that writes the serial ports. No exceptions.** Two mechanisms cover every writer:
+
+| mechanism | for | how |
+|---|---|---|
+| `telem_print(String)` | all text: `printBoth`, HOLD 10 Hz stream, `E`, `V` | copies into a queued `K_TEXT` record, **timeout 0** — the producer can never block |
+| `telem_run(fn)` | bulk writers: **capture dump**, `M` timing stats | queues a `K_CALL` with a function pointer; telemTask *invokes* it. Since telemTask owns the ports, `fn` may use `Serial`/`hc05Serial` directly |
+
+`telem_run` is the trick that made this cheap: the bulk writers did not have to be rewritten
+to build Strings — the *same code* is simply executed on the *right thread*. `dumpCaptureTo(Serial)`
+is correct on telemTask and a bug on the control task.
+
+**Buffer-lifetime guard:** the dump READS `cap_*` from telemTask while the control task could
+start a new capture and rewrite it. `T`/`O`/`C` therefore refuse with `busy: previous capture
+still dumping` while `telem_busy()`. Refuse, don't corrupt.
+
+**Boot path:** before `telem_activate()` (end of `hwSetup`) the control task never blocks, so
+telemTask cannot drain; `telem_print`/`telem_run` fall back to direct/inline execution. Single-writer
+still holds because telemTask isn't running yet. Activation happens once, immediately before
+the control loop starts blocking on its notification.
+
+### The failure, and why it is the most useful part of this phase
+
+Step 3.1 was first shipped **half-applied**: text was routed through `telemTask` while the
+capture dump, HOLD stream, `M`, `E` and `V` still wrote serial **directly from the control
+task**. `HardwareSerial` is not reentrant. Two tasks inside the driver corrupted it, and the
+symptom was nothing like "garbled text":
+
+- board **froze** after a capture dump (unrecoverable, no further commands)
+- the platform slewed the **wrong way** under huge torque
+- `wp` froze at 11.78 rad/s (impossible — beyond the MPU's ±8.73 rad/s range), `ww` froze,
+  and the control period stretched to **~303 ms**, so θ integrated a frozen garbage rate over
+  a 60× oversized dt and the controller slammed 10 V
+
+**A partially-applied single-writer design is worse than none, because it looks correct.**
+
+The debugging that cracked it, worth repeating verbatim as method:
+1. Reverted to the Phase-4 tag → clean. So it was the new code, not hardware.
+2. **Bisect Test A:** re-added *only* the task creation — an idle prio-1 task blocking forever
+   on an empty queue, 6 added lines, no routing, no guards. → **CLEAN.** This proved adding a
+   low-priority task is safe, which also cleared Phases 5 and 6 (both add tasks) of suspicion.
+3. That left the routing as the only candidate → complete the invariant rather than back away
+   from it.
+
+Two hypotheses were checked by inspection and **eliminated** before the bisect: the scheduler
+tracer (bounds-masked with `& (TRACE_N-1)` and a no-op when off, so an unset TLS id on the new
+task cannot corrupt) and the kernel config (prio 1 legal under `configMAX_PRIORITIES` 6, ample
+heap headroom).
+
+### Measured (hardware, 2026-08-08)
+
+```
+                      before (P4)        after (P3)
+ctrl period MAX       11,500,760 us      5,006 us      <- the whole point
+ctrl period mean      5,902 us           4,999 us      = 200.04 Hz
+loopFOC : ctrl-law    23.9 : 1           20.35 : 1     = CTRL_DIVISOR exactly
+FOC tick dt           242-258 us         239-260 us    unchanged
+loopFOC               31/32/45 us        31/32/46 us   unchanged
+telem drops           -                  0
+telem stack free      -                  1479 / 1536 words
+```
+
+- **`ctrl period` MAX 11.5 s → 5.006 ms is the phase.** Worst case is now 6 µs *late*, i.e.
+  the dump is completely off the control path. Verified with `M` taken right after a `T90`.
+- The **20.35:1 ratio** is independent confirmation: control is now released on exactly every
+  20th FOC tick with no coalescing, because nothing occupies the control task long enough to
+  make it miss releases.
+- **This retroactively satisfies Step 4.2's "release jitter max < 50 µs"**, which could not be
+  met while telemetry sat on the control path. Phase 4's odd timing figures were this, not a
+  Phase-4 defect.
+- `telem stack free 1479/1536` — 1536 words is oversized; could drop to ~512 at Phase 7
+  consolidation (Appendix B11).
+
+Deliberately NOT done (per Appendix B14, verification relaxed to structure+safety): the
+byte-identical-CSV and golden-dataset regression gates. Format is unchanged by construction
+(the same `dumpCaptureTo` code runs, just on another thread), and the plant is being
+re-identified in the combined retune anyway.
+
 **Phase 3 exit:** `git tag rtos-p3-telemetry`
 
 ---
@@ -2007,7 +2110,7 @@ CTRL  period 5000 µs   jitter max ____ µs   WCET ____ µs
 | 14 | SysTick handoff breaking SimpleFOC `_micros()` | `ω_w` wrong → linearization wrong → compFrac margin wrong |
 | 15 | FOC-rate velocity quantization | Noisy `u`, shifted unwind rate |
 | 16 | Telemetry stack too small (`sprintf %f`) | Overflow in the least-tested task |
-| 17 | Two tasks writing `Serial` | Interleaved garbage in CSV |
+| 17 | Two tasks writing `Serial` | **NOT merely "interleaved garbage" — that undersells it and cost us a day (2026-08-08).** `HardwareSerial` is not reentrant: concurrent writers corrupt the driver. Observed: board **froze** after a capture dump, platform slewed the **wrong way at full torque**, `wp` froze at an impossible 11.78 rad/s, control period stretched to **303 ms**. Reads like a hardware fault. Cause was a **half-applied** single-writer design (text queued to telemTask; dump/`M`/`E`/`V` still direct from the control task) — worse than none, because it looks correct. Fix = the absolute invariant B15 + `telem_run(fn)` for bulk writers. |
 | 18 | Serial bandwidth < telemetry rate | Silent drops; decimate |
 | 19 | Reading the trace buffer while tracing | Torn data |
 | 20 | High-water from an unexercised path | Overflow appears weeks later |
@@ -2024,12 +2127,14 @@ CTRL  period 5000 µs   jitter max ____ µs   WCET ____ µs
 | B4 | FOC rate + justification | 0.5 | **4 kHz.** `f_elec = PP·ω_max/(2π) = 11·45/6.283 = 78.8 Hz`; comfortable rate `40·f_elec = 3.15 kHz`. 4 kHz clears that with margin. Affordable: `4000 × 40 µs (loopFOC WCET) = 16%` CPU, 19% including `move()`. Not lowered — `loopFOC` at 40 µs is already cheap (SPI fast, no reason to drop the rate). Not raised — no commutation benefit above what the electrical rate needs, and higher eats margin. Canonical pairing with the tuned 200 Hz control loop. |
 | B5 | `CTRL_DIVISOR` | 4.1 | **20** — 4 kHz FOC / 200 Hz control. Control fires every 20th FOC tick, phase-locked. (Set for real in Step 4.1; fixed here by the B4 rate choice.) |
 | B6 | Measured WCETs (super-loop) | 0.4 | loopFOC **40 µs** / move **8 µs** / MPU read **2374 µs** / control-law compute **~14 µs** (`st_law − st_mpu`) / telem row **237 µs** / superloop MAX **2666 µs** = FOC starvation during the blocking gyro read. No INA219 in this sketch. Full table in Step 0.4. |
-| B7 | Telemetry architecture + decimation | 3.1 | **Option C — hybrid (2026-08-06).** Capture dump (`T`/`O`/`C`) keeps the full-rate 200 Hz RAM buffer (`cap_*`) and hands the *frozen* buffer to `telemTask` for the slow serial dump (control task no longer blocks → `loopFOC`/`WHEEL_SAT` stay live during output, the real Phase-3 goal). Live `H` stream moves onto a per-tick `LogSample_t` **stream buffer** drained by `telemTask` (builds the SPSC primitive; removes the 2nd Serial writer from the control task, Trap 2). **Decimation factor: N/A** — C never streams at 200 Hz over serial, so the Trap-1 bandwidth ceiling (≈140 kbaud > 115200) never binds; capture stays byte-identical at 200 Hz and live `H` stays 10 Hz. Chose C over the guide's literal Step 3.1 (Option A, per-tick 200 Hz streaming) because A forces ≤100 Hz decimation, which halves golden-dataset capture density — A's *Do* section contradicts its own *Verify* ("CSV byte-identical, golden dataset unchanged"); C resolves the tension toward the Verify, which is the criterion that actually protects the controller. Rejected Option B (dump-handoff only, no stream buffer) because it defers the SPSC primitive and leaves Trap 2 open. |
+| B7 | Telemetry architecture + decimation | 3.1 | **DONE 2026-08-08 — Option C shipped and verified** (`ctrl period` MAX 11.5 s → 5.006 ms; drops 0). Implemented exactly as decided below, plus the sole-writer invariant B15 that the first attempt violated. **Option C — hybrid (2026-08-06).** Capture dump (`T`/`O`/`C`) keeps the full-rate 200 Hz RAM buffer (`cap_*`) and hands the *frozen* buffer to `telemTask` for the slow serial dump (control task no longer blocks → `loopFOC`/`WHEEL_SAT` stay live during output, the real Phase-3 goal). Live `H` stream moves onto a per-tick `LogSample_t` **stream buffer** drained by `telemTask` (builds the SPSC primitive; removes the 2nd Serial writer from the control task, Trap 2). **Decimation factor: N/A** — C never streams at 200 Hz over serial, so the Trap-1 bandwidth ceiling (≈140 kbaud > 115200) never binds; capture stays byte-identical at 200 Hz and live `H` stays 10 Hz. Chose C over the guide's literal Step 3.1 (Option A, per-tick 200 Hz streaming) because A forces ≤100 Hz decimation, which halves golden-dataset capture density — A's *Do* section contradicts its own *Verify* ("CSV byte-identical, golden dataset unchanged"); C resolves the tension toward the Verify, which is the criterion that actually protects the controller. Rejected Option B (dump-handoff only, no stream buffer) because it defers the SPSC primitive and leaves Trap 2 open. |
 | B8 | `ω_w` calibration check @ 2 V | 2.1, 4.2 | **Phase 2 (2026-08-06): 17.2 rad/s** at 2.00 V → K=8.59 vs identified 8.51 (<1%). **Phase 4 (2026-08-07): shifted** — in-deadzone hold implies effective K′≈9.57 (~12% high) at uniform 4 kHz. NOT the split's fault: OLD firmware on the same new board (run 150522) also fails to unwind. Confounded by the hardware swap (new STM32 + added mass); clean O2 on the split binary still owed to separate Trap-2 quantization from a genuine plant shift. Folded into the deferred retune. |
 | B9 | compFrac neutral, before / after | 4.5 | **Deferred to hardware retune (2026-08-07).** compFrac=0.89 no longer holds the −0.84 unwind pole after the STM32 swap + added mass; passive desat is dead (wheel holds ~17.7 rad/s in-deadzone). Re-run the C-sweep during the combined retune, not now (user decision — hardware changed, retuning anyway). |
 | B10 | Direction-asymmetry outcome | 4.4 | **Deferred to hardware retune (2026-08-07).** The run-2 re-run comparison is only meaningful against a re-identified plant; folded into the combined retune campaign. |
 | B11 | Final stack sizes | 7.1 | |
 | B12 | Final `U` vs bound | 7.3 | |
+| B15 | **Sole-writer serial invariant** | 3.1 | **Decided 2026-08-08, after shipping the violation.** After `telem_activate()`, `telemTask` is the ONLY task that writes `Serial`/`hc05Serial`. Enforced by two mechanisms: `telem_print()` (queue text) and `telem_run(fn)` (execute a bulk writer ON telemTask, so it may use the ports directly). Chose `telem_run(fn)` over rewriting the bulk writers into String builders because it moves the *same* code to the *right thread* — a small diff and no risk of altering the CSV format. Rationale for the invariant being absolute: `HardwareSerial` is not reentrant, and the half-applied version (text queued, dump/`M`/`E`/`V` still direct) did not degrade gracefully — it corrupted the driver, froze the board, and produced frozen sensor reads + a 303 ms control period that looked exactly like a hardware fault. Any future writer (Phase 6 command echo) MUST use one of the two mechanisms. |
+| B16 | **telemTask priority + queue depth** | 3.1 | **Prio 1, depth 24.** Prio 1 is below control (3) and foc (4) so telemetry can never delay commutation or the control law — it runs only in the CPU the control task leaves idle while blocked on its 200 Hz notification. Deliberately NOT higher: a ~11 s dump at a priority above control would starve the loop, which is the very failure being fixed. Depth 24 × ~104 B ≈ 2.5 KB; measured `telem drops: 0` in normal use because text is low-rate and the one bulk item (the dump) is a single `K_CALL` record, not 1500 rows. Producers always send with **timeout 0**, so a full queue drops-and-counts rather than blocking the control task — dropping telemetry is always preferable to delaying control. |
 | B14 | **Verification policy relaxed to structure+safety** | 4/all | **2026-08-07 (user decision).** Hardware changed mid-migration (STM32 swapped, translation-motor mass added), and the plant will be fully re-identified in the CONTROL_README combined retune after translation regardless. So the migration's original regression-test discipline — golden dataset must match, compFrac margin preserved phase-to-phase — is **relaxed**. Goal is now: prove the RTOS *structure* is correct, not that behavior is byte-identical to the bare-metal baseline. **Consistency gates become informational; SAFETY gates stay blocking** (wheel-can't-reach-45-abort is a safety property, not a consistency one). Practical effect on remaining phases: skip golden-dataset matching and margin-preservation as pass/fail; keep the WHEEL_SAT/X/fault-path checks. Telemetry "CSV byte-identical" (Phase 3) stays a goal only because the Python pipeline is convenient, not as a regression gate. |
 | B13 | **Phase 3 ↔ 4 reorder** | 3/4 | **Swapped: Phase 4 (FOC split) before Phase 3 (telemetry), 2026-08-06.** Found while scoping Phase 3: the monolithic control task never blocks (inline `loopFOC` busy-spin, [rtos_main.cpp:803]), so it holds the CPU continuously and any lower-priority task is starved (the "never-block → starves-below" rule, biting in practice). A telemetry task MUST be lower prio than control — else its ~7 s dump would starve `loopFOC` while the wheel spins. So preemptive telemetry needs the control task to yield, which needs FOC off the busy-loop and into a timer ISR (a ≥1 ms tick-granular `vTaskDelay` can't pace uniform kHz commutation — it makes FOC bursty with hundreds-of-µs stale-angle gaps, risking the compFrac margin). That restructure is exactly Phase 4. Conclusion: the guide's 3-before-4 order had the dependency backwards; Phase 4 is the real unlock for telem/safety/comms alike. Rejected the two stopgaps (cooperative in-loop dump; pull only Step 4.1 forward) in favor of doing Phase 4 properly first — same FOC-timing/ω_w risk either way, so do it cleanly with full phase isolation. Cost: lose the Phase-3 tracer plot as Phase-4's "before" (mitigated: Phase-2 tracer baseline exists). Telemetry Option-C (B7) unchanged, just resequenced. |
 
