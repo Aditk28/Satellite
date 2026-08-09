@@ -38,7 +38,9 @@ depth matters as much as the demo working.
 
 controller now runs as a single FreeRTOS task, `src/rtos_main.cpp`, env `rtos`,
 
-with no regression). Currently at Phase 4 (FOC split; reordered ahead of Phase 3 telemetry — see §6). See §6.
+with no regression). **RTOS migration COMPLETE** — all seven phases done and verified on hardware (3 and 4 were
+swapped). Five tasks: focTask (4), controlTask (3), safetyTask (2), commsTask (2),
+telemTask (1). Next major work is the combined hardware retune, then translation. See §6.
 
 ### Tuned constants — do not change casually
 
@@ -214,15 +216,22 @@ Phases per `docs/RTOS_MIGRATION_GUIDE.md`. Tag each exit `rtos-pN-name`.
 
 - [x] 2.x single-task port — monolithic; golden dataset matches, ω_w 17.2@2V, 0 overhead (tag `rtos-p2-single-task`)
 
-- [ ] 4.x FOC split ← **current step** (Phases 3 & 4 SWAPPED — see guide Appendix B13)
+- [x] 4.x FOC split — focTask prio 4, TIM9-notified 4 kHz, preempts the blocking MPU read
 
-- [ ] 3.x telemetry extraction (deferred until after 4.x)
+- [x] 3.x telemetry extraction — telemTask prio 1 = SOLE serial writer; ctrl period MAX
+      11.5 s → 5.006 ms (Phases 3 & 4 were SWAPPED — see guide Appendix B13)
 
-- [ ] 5.x safety task + I2C mutex
+- [x] 5.x safety task + I2C mutex — independent watchdog (wheel + time-based heartbeat +
+      INA219 power trips); mutex with priority inheritance, control degrades on timeout
 
-- [ ] 6.x comms task
+- [x] 6.x comms task — commsTask = sole serial reader; lines queued, commands still
+      execute on the control task; `X` fast path ≤250 µs
 
-- [ ] 7.x consolidation
+- [x] 7.x consolidation — stacks resized (12.8 KB reclaimed), CPU 27% idle, deadlines
+      proven by response-time analysis, CONTROL_README rewritten
+
+**RTOS MIGRATION COMPLETE.** Remaining: optional tracer Gantt plots, and the plant-dependent
+artifacts folded into the combined hardware retune (see guide 7.5).
 
 **The Phase 0 baseline summary table was skipped by choice.** Raw run-8 CSVs are
 

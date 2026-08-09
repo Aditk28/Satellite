@@ -64,7 +64,7 @@ void commands_init(Stream& usb, Stream& bt, void (*emergencyHook)(void)) {
   s_usb = &usb; s_bt = &bt; s_emergency = emergencyHook;
   s_q = xQueueCreate(CMD_QUEUE_DEPTH, sizeof(CmdMsg));
   configASSERT(s_q != nullptr);
-  configASSERT(xTaskCreate(commsTask, "comms", 768, nullptr, 2, &s_task) == pdPASS);
+  configASSERT(xTaskCreate(commsTask, "comms", 256, nullptr, 2, &s_task) == pdPASS);
 }
 
 bool commands_next(String& out) {

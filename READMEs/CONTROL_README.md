@@ -17,6 +17,17 @@ Tuning twice is wasted work — the plan is to finish the RTOS merge, build
 translation, then run one full identification and tuning campaign across all
 three axes at once.
 
+**Firmware status (2026-08-08): the RTOS migration is complete.** The controller runs as
+five FreeRTOS tasks (§12); the control law and constants below were ported verbatim and are
+unchanged. Two caveats on the numbers in §2, both from a mid-migration hardware rework
+(STM32 swapped, translation-motor mass added, wiring moved) rather than from the migration:
+the plant has shifted, so **passive desaturation currently does not complete** — the wheel
+holds speed in the deadzone instead of bleeding to zero — and the terminal-approach figures
+predate the change. Both fold into the combined retune (§17), which was always the plan.
+A physical-plausibility guard now rejects impossible single-cycle jumps in `ω_w` and `ω_p`
+before they reach the control law, after wiring noise produced false 150 rad/s saturation
+aborts that killed otherwise healthy slews.
+
 ---
 
 ## Contents
@@ -777,9 +788,54 @@ Only one sketch can be in `src/` at a time (PlatformIO builds one
 
 | file | purpose |
 |---|---|
-| `heading_control.cpp` | **the controller** — 200 Hz loop, runtime-tunable gains, capture and dump |
+| `rtos_main.cpp` | **the controller** (env `rtos`) — FreeRTOS, five tasks, 200 Hz control / 4 kHz FOC |
+| `heading_control.cpp` | the original super-loop (env `superloop`) — kept as the regression reference |
+| `telemetry.*` `safety.*` `commands.*` `i2c_bus.*` | RTOS subsystems, see below |
+| `timebase.*` `hw_timers.*` `faults.*` `trace.*` `timing_stats.h` | measurement + fault infrastructure |
+| `enc_test.cpp` | standalone bare-metal MT6701 test (env `enctest`) — 30-second hardware-vs-firmware check |
 | `calibration.cpp` | system ID: `MODE_STEP` (run 2), `MODE_STAIRCASE` (superseded, kept for motor deadband), `MODE_BREAKAWAY` (run 5) |
 | `full.cpp` | earliest open-loop bring-up, superseded |
+
+### Firmware architecture — FreeRTOS, five tasks
+
+The super-loop was migrated to FreeRTOS in seven phases (see `RTOS_migration.md` for the
+full record, including the failures). The control law, constants, and sensor code were
+ported **verbatim** — the migration changed structure, not behaviour.
+
+| task | prio | period | owns |
+|---|---|---|---|
+| `focTask` | 4 | 250 µs (4 kHz) | `loopFOC()` + `move()` — commutation only |
+| `controlTask` | 3 | 5 ms (200 Hz) | gyro read, control law, capture buffer, command execution |
+| `safetyTask` | 2 | 50 ms (20 Hz) | independent watchdog: wheel overspeed, heartbeat, INA219 power |
+| `commsTask` | 2 | 2 ms poll | serial RX + line assembly — **sole reader** |
+| `telemTask` | 1 | event | **all** serial output — **sole writer** |
+
+One TIM9 interrupt at 4 kHz notifies `focTask` every tick and `controlTask` every 20th
+(`CTRL_DIVISOR`), so control is phase-locked to commutation with no drift between clocks.
+
+**Two invariants hold the design together, both learned the hard way:**
+- **One writer.** Only `telemTask` writes the serial ports. `HardwareSerial` is not
+  reentrant; a *partially* applied version of this rule corrupted the driver, froze the
+  board, and produced frozen sensor reads that looked exactly like a hardware fault.
+- **One reader.** Only `commsTask` reads them. Two readers race the RX ring buffer and one
+  silently eats the other's bytes.
+
+**Shared state:** `motor.target` and `motor.shaft_velocity` are aligned 32-bit floats —
+atomic on Cortex-M4, no mutex needed. The **I2C bus does** need one (MPU6050 on control at
+200 Hz, INA219 on safety at 20 Hz): a real mutex, for priority inheritance. The control task
+takes it with a **2 ms timeout, never `portMAX_DELAY`**, and on failure degrades to the
+previous gyro sample — a control loop blocked forever on a wedged bus with a spinning
+flywheel is how runaways happen.
+
+**Measured performance (2026-08-08):** control period 4994 / 5000 / 5006 µs (200.00 Hz,
+±6 µs); FOC tick 238–261 µs; CPU 42% ctrl / 15% foc / 11% telem / 2% safety / **27% idle**.
+Response-time analysis proves every deadline is met (control converges at R = 3599 µs
+against a 5000 µs deadline) even though total utilisation 0.868 exceeds the Liu & Layland
+rate-monotonic bound of 0.757 — the bound is sufficient, not necessary.
+
+**What the migration bought, concretely:** a telemetry dump used to stall the control loop
+for **11.5 seconds**; it now costs **6 µs**. Commutation used to stop for 2.4 ms during every
+gyro read; it now runs at a flat 4 kHz straight through it.
 
 ### Commands (115200, newline-terminated, USB or HC-05)
 
@@ -798,6 +854,10 @@ Only one sketch can be in `src/` at a time (PlatformIO builds one
 | `G` | Print gains, state, the deadband floor, and `ffFrac × A_FRICTION` |
 | `B` | Re-measure gyro bias (platform must be still) |
 | `X` / `R` | Stop / resume |
+| `M` / `M!` | Print / reset timing stats (per-block min/mean/MAX, FOC tick jitter) |
+| `U` | System report: per-task CPU % and stack high-water marks |
+| `E` | Encoder diagnostic — motor off, stream shaft angle/velocity to hand-turn the wheel |
+| `V<V>` | Manual constant-voltage drive + unlimited encoder stream; any key stops |
 
 **Any unrecognised input stops the motor.** Deliberate — a confused operator
 should not leave a flywheel spinning.
@@ -1108,6 +1168,13 @@ skeleton uses `HardwareTimer(TIM2)` for its 1 kHz tick — `setOverflow()` rewri
 TIM2's ARR, the same register that sets the PWM period. **Use TIM4, TIM5, or
 TIM9 for the control-loop timer.**
 
+**Resolved:** TIM5 is the µs timebase, **TIM9 is the FOC/control tick** (4 kHz). TIM9 was
+chosen over TIM4 deliberately — TIM4_CH1 is PB6, which is physically the DRV8313 enable, so
+a stray channel-enable there would toggle the driver at the tick rate. Two further traps
+found in the process: TIM9's vector is `TIM1_BRK_TIM9_IRQn` (not `TIM9_IRQn`), and the
+STM32duino core **strongly defines every `TIMx_IRQHandler`**, so you cannot write your own —
+use the `HardwareTimer` API + `attachInterrupt`, then override the NVIC priority.
+
 ### Angle wrapping in analysis
 
 A `T180` that lands at −178.24° is 1.76° from target, not 358°. Wrap before
@@ -1125,9 +1192,9 @@ computing error or a good result reads as a catastrophic one.
    own variability, and the terminal approach stays a coin flip. The test is
    repeated 5° corrections from rest, not large slews. **Deliberately deferred to
    the combined retune** (see below) rather than done now.
-1. **RTOS merge.** Currently a super-loop. Target: Control Loop task
-   (timer/semaphore, 500 Hz–1 kHz), Safety/Watchdog (10–20 Hz), Comms
-   (event-driven). Remember the TIM2 conflict.
+1. ~~**RTOS merge.**~~ **DONE (2026-08-08).** Five tasks on FreeRTOS, TIM9 at 4 kHz driving
+   both FOC and (÷20) control. See §12 and `RTOS_migration.md`. Deadlines proven by
+   response-time analysis; 27% CPU idle; 12.8 KB of stack reclaimed by high-water resizing.
 2. **Vision.** AprilTag on the Pi, UART protocol, complementary filter, then
    Kalman. This is what removes the 0.8°/min drift and makes heading *accurate*
    rather than merely precise.

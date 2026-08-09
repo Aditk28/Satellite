@@ -134,7 +134,7 @@ void safety_init(float (*wheelVel)(void), float satLimit,
   s_wheelVel = wheelVel;
   s_satLimit = satLimit;
   s_safeStop = safeStopFn;
-  configASSERT(xTaskCreate(safetyTask, "safety", 768, nullptr, 2, &s_task) == pdPASS);
+  configASSERT(xTaskCreate(safetyTask, "safety", 384, nullptr, 2, &s_task) == pdPASS);
 }
 
 uint32_t safety_checks(void) { return s_checks; }

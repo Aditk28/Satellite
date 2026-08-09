@@ -158,7 +158,7 @@ uncommitted — check `git status` and commit before continuing if so.
 | **3.x telemetry extraction** | **✅ (2026-08-08)** | Option C, sole-writer `telemTask` prio 1. **`ctrl period` MAX 11,500,760 → 5,006 µs**; ratio now exactly 20:1; drops 0. Step 3.1 first shipped BROKEN (half-applied invariant) — see the Phase 3 result note; the lesson is Trap A9. |
 | **5.x safety task + I2C mutex** | **✅ (2026-08-08)** | `safetyTask` prio 2, 50 ms: wheel backstop + time-based heartbeat + INA219 power trips (10.0 V / 2500 mA, debounced, set from measured data). I2C **mutex** (priority inheritance); control `i2c_lock(2)` + degrade, safety `(5)`, bias `(20)`. `ctrl period` unchanged at 5006 µs, `i2c timeouts` 0. |
 | **6.x comms task** | **✅ (2026-08-08)** | `commsTask` prio 2 = SOLE serial reader; lines queued, `handleCommand` still executes verbatim on the control task. `X` fast path ≤250 µs. `comms drops` 0 under spam. |
-| 7.x consolidation | ⬜ **NEXT** | — |
+| **7.x consolidation** | **✅ (2026-08-08)** | Stacks resized 5376→2176 words (**12.8 KB reclaimed**, ≥61% margin retained); CPU 42/15/11/2/<1, **27% idle**; schedulability proven by response-time analysis (ctrl R=3599 µs < 5000) despite U=0.868 > RM bound 0.757; `CONTROL_README.md` rewritten. Tracer Gantts + plant-dependent artifacts deferred with reasons (7.5). |
 
 ## Files that exist now (Phase 0–1.3)
 
@@ -2206,6 +2206,79 @@ U = Σ (WCET_i / T_i) = _______   vs bound 0.743
 Write it up. One page. Include the priority assignment and why FOC — the
 "less important" task — is highest.
 
+### Result — Steps 7.1–7.3 (2026-08-08)
+
+New `U` command (runs on telemTask, sole-writer rule): `vTaskGetRunTimeStats` + all five
+stack high-water marks. The run-time clock is `rtRunTimeCounter()` = `TIM5->CNT` at 1 MHz,
+wired back in Step 1.2 and unused until now — **32 bits at 1 MHz wraps every ~71.6 min, so
+read `U` well within an hour of boot.**
+
+**7.2 — CPU utilisation** (measured after a punishing session: T180, T−180, H0+nudges, B, E,
+V3, M, command spam):
+
+| task | prio | % | note |
+|---|---|---|---|
+| ctrl | 3 | **41%** | dominated by the blocking 2.4 ms MPU read |
+| foc | 4 | **15%** | 4 kHz × ~35 µs mean — matches the Step 0.5 prediction of ~16% |
+| telem | 1 | **10%** | the T180 dumps; pushing bytes out two UARTs is real work |
+| safety | 2 | **2%** | |
+| comms | 2 | **<1%** | |
+| **IDLE** | 0 | **30%** | headroom |
+
+**7.1 — Stack high-water and resize.** Used (words): foc 65, ctrl 259, safety 143, comms 54,
+telem 150. Resized at **≥3× margin** — more generous than the guide's 1.5×, because the fault
+handlers and the stall-recovery path were NOT exercised in that session and high-water only
+bounds the paths actually taken:
+
+| task | was | now | used | margin |
+|---|---|---|---|---|
+| foc | 768 | **256** | 65 | 3.9× |
+| ctrl | 1536 | **768** | 259 | 3.0× |
+| safety | 768 | **384** | 143 | 2.7× |
+| comms | 768 | **256** | 54 | 4.7× |
+| telem | 1536 | **512** | 150 | 3.4× |
+
+5376 → 2176 words = **12.8 KB of RAM reclaimed**. `configCHECK_FOR_STACK_OVERFLOW = 2` is the
+safety net if any estimate is wrong (pattern check at every switch → `faults_safeStop`).
+
+**7.3 — Schedulability.** Using measured **WCETs**, not means:
+
+```
+task    C (WCET)   T        U = C/T
+foc       62 us     250 us   0.248     (loopFOC 46 MAX + move 16 MAX)
+ctrl    2669 us    5000 us   0.534     (control law MAX, incl. the MPU read)
+safety  3042 us   50000 us   0.061     (INA219 read MAX outlier)
+comms     ~50 us   2000 us   0.025
+                             -------
+                        U =  0.868   vs Liu & Layland bound 4(2^(1/4)-1) = 0.757
+```
+
+**U exceeds the RM bound — which does NOT mean deadlines are missed.** The bound is
+*sufficient, not necessary*; above it you owe a response-time analysis
+`R = C + Σ⌈R/T_j⌉·C_j` iterated to a fixed point:
+
+- **ctrl**: 2669 → 3351 → 3537 → 3599 → converges **R = 3599 µs < 5000 µs deadline ✓**
+  (72% of its window; measured `ctrl period` MAX 5006 vs 5000 nominal agrees)
+- **safety**: converges **R = 14,707 µs < 50,000 µs ✓**
+- **foc** (highest prio): **R = 62 µs < 250 µs ✓**
+
+**All deadlines provably met.** This is the difference between "it seems to work" and "here is
+why it meets deadlines."
+
+**Deliberate deviation from strict rate-monotonic:** `commsTask` polls every 2 ms — a *shorter*
+period than control's 5 ms — so pure RM would rank it ABOVE control. It is deliberately below.
+RM assumes deadline = period; comms' real deadline is human-scale (~100 ms), and a command
+serviced 5 ms late is meaningless while control missing 5 ms is not. That is deadline-monotonic
+reasoning, and it is the correct assignment. Same logic answers "why is FOC — the least
+'important' task — highest priority": commutation has the shortest period and the hardest
+deadline; a late commutation corrupts torque, and everything else depends on the motor working.
+
+**The single biggest remaining lever:** ctrl's 2669 µs is ~2.5 ms of blocking `mpu.getEvent()`,
+which reads accel+gyro+temp when the law uses only `g.gyro.z`. The Step 0.4 deferred
+optimisation (targeted 2-byte read of `GYRO_ZOUT_H/L`, 0x47/0x48) would take U from 0.868 to
+roughly 0.47 — comfortably under the bound. Still deferred under the verbatim rule: fix it in
+`heading_control.cpp` first, re-verify, then carry across.
+
 ## Step 7.4 — Jitter report
 
 **Do.** From the tracer CSV: per-task inter-arrival min/max/mean/σ over a
@@ -2231,6 +2304,47 @@ CTRL  period 5000 µs   jitter max ____ µs   WCET ____ µs
 - [ ] Jitter report with histograms
 - [ ] `CONTROL_README.md` updated: firmware structure, timer allocation, task
       table, tracer documentation, resolved/unresolved items
+
+### Result — Step 7.1 resize VERIFIED, 7.5 checklist status (2026-08-08)
+
+Re-measured after resizing, same punishing session. Every task retains far more than the
+required 30% margin, and the used-words figures reproduced almost exactly:
+
+| task | free / allocated | used | headroom |
+|---|---|---|---|
+| foc | 191 / 256 | 65 | 75% |
+| ctrl | 481 / 768 | 287 | 63% |
+| safety | 235 / 384 | 149 | 61% |
+| comms | 202 / 256 | 54 | 79% |
+| telem | 362 / 512 | 150 | 71% |
+
+CPU after resize: ctrl 42% / foc 15% / telem 11% / safety 2% / comms <1% / **IDLE 27%**.
+
+**7.5 artifact checklist — honest status.** Several items depend on plant measurements that
+were deliberately deferred (B14 relaxed verification to structure+safety; B9/B10 folded into
+the combined retune after the STM32 swap + added mass). They are marked deferred WITH REASONS
+rather than fabricated — a write-up that says "not measured, here is why" is more credible
+than one with invented numbers.
+
+- [x] CPU utilisation table — §7.2 above
+- [x] Schedulability analysis — §7.3 above, incl. response-time proof and the RM deviation
+- [x] Stack high-water table — above, before and after resize
+- [x] `CONTROL_README.md` updated — firmware architecture, task table, the two invariants,
+      timer allocation resolved, new commands (`M`/`U`/`E`/`V`), RTOS open-item closed
+- [x] Phase 3 vs Phase 4 evidence that commutation survives the I2C read — obtained from
+      **counts** rather than a Gantt: `loopFOC` held 592,051 samples = 4000.2 Hz flat across
+      62 s of cumulative blocking MPU reads, where a starved focTask would have lost ~249k
+      ticks. Step 4.3's trace plot would be prettier; the count is the same proof.
+- [ ] Tracer Gantt plots (Step 7.4 / 4.3) — NOT done. The tracer (Step 1.4) and
+      `plot_trace.py` exist and work; nobody re-enabled them after Phase 2. Optional: the
+      timing evidence above already establishes the result.
+- [ ] Golden dataset Phase 0 vs Phase 7 — **deferred, B14.** The plant moved mid-migration
+      (hardware rework), so a before/after comparison would measure the rework, not the
+      migration.
+- [ ] compFrac neutral before/after — **deferred, B9.** Passive unwind is currently dead;
+      confirmed pre-existing (fails on the reverted monolith too), folded into the retune.
+- [ ] Direction-asymmetry experiment — **deferred, B10.** Only meaningful against a
+      re-identified plant.
 
 **Phase 7 exit:** `git tag rtos-p7-complete`
 

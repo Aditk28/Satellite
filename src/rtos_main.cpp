@@ -501,6 +501,46 @@ void dumpCaptureTo(Print &out) {
 // control task once telem_activate() has run.
 void dumpCapture() { dumpCaptureTo(Serial); dumpCaptureTo(hc05Serial); }
 
+extern TaskHandle_t hControl;    // defined with the task bodies further down
+extern TaskHandle_t hFoc;
+
+// Step 7.1/7.2 — one system report: per-task CPU share + every stack high-water.
+// RUN ON telemTask (telem_run) like the other bulk writers.
+//
+// vTaskGetRunTimeStats needs configGENERATE_RUN_TIME_STATS +
+// configUSE_STATS_FORMATTING_FUNCTIONS + configUSE_TRACE_FACILITY (all 1 since
+// Step 1.2). Its clock is rtRunTimeCounter() = TIM5->CNT at 1 MHz -- 1000x the
+// tick, so plenty of resolution, but 32 bits at 1 MHz WRAPS EVERY ~71.6 MINUTES.
+// Read these within an hour of boot, or reboot before measuring.
+//
+// High-water is the MINIMUM FREE words ever seen on that stack (FreeRTOS fills new
+// stacks with 0xA5 and counts the surviving pattern). It is a floor observed over
+// the paths actually exercised -- an untaken error path can still blow a stack
+// later, so exercise the fault handlers before trusting these to resize.
+void printSystemReport() {
+  static char buf[768];          // ~40 B/task; static, single caller (telemTask)
+  vTaskGetRunTimeStats(buf);
+  Print* outs[2] = { &Serial, &hc05Serial };
+  for (int i = 0; i < 2; i++) {
+    Print& o = *outs[i];
+    o.println("--- CPU utilisation (since boot; TIM5 1MHz, wraps ~71 min) ---");
+    o.println("Task            AbsTime         %");
+    o.print(buf);
+    o.println("--- stack high-water: free words (allocated) ---");
+    o.print("foc     "); o.print((unsigned)uxTaskGetStackHighWaterMark(hFoc));
+    o.println(" / 256");
+    o.print("ctrl    "); o.print((unsigned)uxTaskGetStackHighWaterMark(hControl));
+    o.println(" / 768");
+    o.print("safety  "); o.print((unsigned)safety_stackFreeWords());
+    o.println(" / 384");
+    o.print("comms   "); o.print((unsigned)commands_stackFreeWords());
+    o.println(" / 256");
+    o.print("telem   "); o.print((unsigned)telem_stackFreeWords());
+    o.println(" / 512");
+    o.println("-------------------------------------------------------------");
+  }
+}
+
 void printTimingStats() {
   // Dump to BOTH channels -- if this only went to USB, sending M over HC-05
   // would land the reply on USB and look like nothing happened.
@@ -812,6 +852,10 @@ void handleLine(String s) {
         telem_run(printTimingStats);
       }
       break;
+    case 'U':
+      // Step 7.1/7.2 system report. Runs on telemTask (sole writer).
+      telem_run(printSystemReport);
+      break;
     case 'X': stopMotor("operator"); break;
     case 'E': {
       // Encoder diagnostic. Motor OFF (zero torque) so the wheel hand-turns
@@ -967,7 +1011,7 @@ static void hwSetup() {
   // Phase 4: hand commutation to focTask, clocked by the TIM9 tick. Created here
   // (after initFOC, motor ready) not in setup(). focTask blocks on its notify at
   // once; nothing commutates until focTick_init() starts TIM9 on the next line.
-  configASSERT(xTaskCreate(focTask, "foc", 768, NULL, 4, &hFoc) == pdPASS);
+  configASSERT(xTaskCreate(focTask, "foc", 256, NULL, 4, &hFoc) == pdPASS);
   focTick_attach(focTickNotify);
   focTick_init(FOC_RATE_HZ);     // 4 kHz: focTask each tick, control every 20th
 
@@ -989,6 +1033,7 @@ static void hwSetup() {
   printBoth("          W<deg> coarse dz | N<deg> fine dz | A<val> friction magnitude");
   printBoth("          G status | B rebias | M timing | M! reset timing | X stop | R resume");
   printBoth("          E encoder-diag (motor off) | V<volts> manual drive + encoder stream");
+  printBoth("          U system report (per-task CPU % + stack high-water)");
   printBoth("Start at K_theta=19.1 K_omega=14.0, then work down the gain table.");
   printBoth("Mode is IDLE -- send H0 or T<deg> to engage.");
 
@@ -1129,7 +1174,7 @@ void setup() {
   // control task; harmless if bytes arrive early, they just queue.
   commands_init(Serial, hc05Serial, commsEmergencyStop);
 
-  configASSERT(xTaskCreate(controlTask, "ctrl", 1536, NULL, 3, &hControl) == pdPASS);
+  configASSERT(xTaskCreate(controlTask, "ctrl", 768, NULL, 3, &hControl) == pdPASS);
   vTaskSetThreadLocalStoragePointer(hControl, 0, (void*)(uintptr_t)TRACE_ID_CTRL);
 
   vTaskStartScheduler();

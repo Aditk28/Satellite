@@ -50,7 +50,7 @@ void telem_init(Print& usb, Print& bt) {
   s_usb = &usb; s_bt = &bt;
   s_q = xQueueCreate(24, sizeof(TelemMsg));
   configASSERT(s_q != nullptr);
-  configASSERT(xTaskCreate(telemTask, "telem", 1536, nullptr, 1, &s_task) == pdPASS);
+  configASSERT(xTaskCreate(telemTask, "telem", 512, nullptr, 1, &s_task) == pdPASS);
 }
 
 void telem_activate() { s_active = true; }
