@@ -2,9 +2,13 @@
 
 Context file for the reaction-wheel / autonomous docking platform firmware.
 
-Read `docs/RTOS_MIGRATION_GUIDE.md` for the full plan; this file is the summary
+**Guides, in reading order:** `CONTROL_README.md` (plant, constants, control law)
 
-plus working conventions.
+→ `RTOS_migration.md` (the five-task firmware, COMPLETE — read its STATUS block and
+
+Appendix A trap table) → **`TRANSLATION_DOCKING.md` (the ACTIVE guide — translation,
+
+vision, docking)**. This file is the summary plus working conventions.
 
 ---
 
@@ -16,9 +20,11 @@ reaction wheel — a benchtop analogue of spacecraft attitude control. Long-term
 
 goal is autonomous vision-guided docking (translation via four fans, overhead
 
-AprilTag, Pi doing guidance). **Translation is not started.** Everything current
+AprilTag, camera on the platform). **Translation hardware is built and tested;
 
-is rotation-only.
+translation CONTROL is not started** — see `TRANSLATION_DOCKING.md`. All flight
+
+firmware today is rotation-only.
 
 The project exists to demonstrate a full engineering stack: system
 
@@ -33,6 +39,22 @@ depth matters as much as the demo working.
 **Rotation control is written, tuned, and working.** Plant fully identified over
 
 8 calibration runs (~150 trials). Closed-loop envelope tested ±30° to ±180°.
+
+**RTOS migration COMPLETE** (all 7 phases, `rtos-p7-complete`). **Translation
+
+hardware COMPLETE and tested** — 4 fans on a 4-in-1 ESC, all channels spinning
+
+under DSHOT300; Pi 3B+ and camera mounted. **Active work: `TRANSLATION_DOCKING.md`,
+
+Phase 0 (safety hardening — props are exposed, wires unsecured).**
+
+Two known-open rotation items, deliberately deferred into that guide's Phase 2:
+
+passive desaturation no longer completes (plant shifted with the added mass —
+
+fails on the OLD firmware too, so not an RTOS defect), and `A_FRICTION` was never
+
+swept on hardware.
 
 **Active work: migrating the super-loop to FreeRTOS.** Phases 0–2 complete (the
 
@@ -117,6 +139,24 @@ attribute it to FreeRTOS.
 | INA219 | motor supply V/I | I2C1, same bus |
 
 | HC-05 | wireless command + telemetry | 115200, PC10/PC11/PC12/PC0 |
+
+| 4× FEICHAO 2204 2300KV | translation fans | 420 gf claim, 12 A max, 0.112 Ω |
+
+| HQProp 4043 3-blade | props | **orientation matters — backwards ≈ half thrust** |
+
+| AERO SELFIE 45A 4-in-1 ESC | fan drive | **Bluejay firmware — DSHOT ONLY, no analog PWM** |
+
+| Raspberry Pi 3B+ (1 GB) | AprilTag vision | mounted; link = wired UART (USART6) |
+
+**Fan DSHOT pins — all must stay on ONE GPIO port:** ch1 PA8/D7, ch2 PA9/D8,
+
+ch3 PA10/D2, ch4 **PA0/A0** (NOT D9/PC7). Splitting across ports broke every
+
+channel, repeatedly. Currently bit-banged in `fan_test.cpp` only; the RTOS
+
+version moves to TIM1+DMA and ch4 to PA11.
+
+**Planned Pi link:** USART6, PC6 (TX) / PC7 (RX) / GND. 3.3 V both sides.
 
 **Timer allocation (audited, Step 0.3):**
 
@@ -345,6 +385,42 @@ re-raise it.
 
   after the character. Drain until the link is quiet for 400 ms.
 
+- **The ESC runs Bluejay = DSHOT ONLY.** Servo PWM produces nothing even when
+
+  measured perfect (TIM1 50.000 Hz, 999.8 µs, MOE set, verified at the ESC pad).
+
+  Throttle calibration also gives no beeps — analog range calibration doesn't
+
+  exist in that firmware. Cost most of a session.
+
+- **All DSHOT channels must share one GPIO port.** Moving ch4 to PC7 (GPIOC)
+
+  forced a port parameter or a duplicate send function, and *every* variant broke
+
+  the previously-working channels. Root cause never proven; one port + one
+
+  `dshotSend()` is the fix. Do not "clean this up."
+
+- **A backwards prop costs ~half its thrust** — 75% throttle became 50% by
+
+  flipping one prop. Check orientation before concluding you need bigger props.
+
+- **`pinMode()` is overloaded on `PinName` and `uint32_t` pin index** (different
+
+  numbering systems). Passing pin constants through an integer array silently
+
+  retargets them. Type pin tables as `PinName`.
+
+- **A DC voltmeter verifies duty cycle, not pulse width.** 5% at 50 Hz and 5% at
+
+  5 kHz read identically; only one is a valid servo pulse. Dump timer registers.
+
+- **When the user suggests testing a different variable, try it before theorising
+
+  again.** "Should I try a different channel?" was right and was dismissed; it
+
+  cost hours.
+
 - `STM32FreeRTOSConfig.h` (our full FreeRTOS override) MUST live in `include/`
 
   AND `platformio.ini` build_flags MUST include `-Iinclude`. include/ alone only
@@ -397,7 +473,19 @@ Heading controller capture format:
 
 ## 10. Safety
 
-The flywheel stores real energy and the platform is untethered.
+The flywheel stores real energy and the platform is untethered — and there are now
+
+**four exposed 4-inch 3-blade props capable of ~25,000 RPM** at the platform's
+
+perimeter, i.e. exactly where you reach to pick it up. Props are currently
+
+UNGUARDED and wiring is unsecured; `TRANSLATION_DOCKING.md` Phase 0 fixes both and
+
+blocks everything else. Never propose a test with hands near props or wheel.
+
+Fan current goes as throttle³ (~1.5 A/motor at 50%, ~5 A at 75%) — the fitted 10 A
+
+fuse and 18 AWG wiring (15 A max) were sized for low throttle.
 
 - `X` stops the motor. Any unrecognised serial input stops the motor —
 

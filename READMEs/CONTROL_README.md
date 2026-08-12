@@ -9,7 +9,8 @@ measured performance.
 terminal approach is **inconsistent** — roughly half of large negative slews
 stall a few degrees short and need a retry. Cause is understood and documented
 in §7 and §17; the fix needs a friction recalibration that has been deliberately
-deferred. Translation (fans) not started.
+deferred. **Translation hardware is BUILT and TESTED — control not started (§18).
+The active build guide is `TRANSLATION_DOCKING.md`.**
 
 **Why deferred:** adding the fan subsystem changes the platform's mass,
 inertia, and friction, so every constant here has to be re-identified anyway.
@@ -1255,9 +1256,47 @@ from it.
 
 ---
 
-## 18. Translation subsystem — future
+## 18. Translation subsystem
 
-Not started.
+**Hardware built and tested (2026-08-08). Control not started — see
+`TRANSLATION_DOCKING.md`, the active build guide.**
+
+### What exists and is proven
+
+| item | state |
+|---|---|
+| 4× FEICHAO 2204 2300KV + HQProp 4043 3-blade | mounted, all four channels spinning |
+| AERO SELFIE 45A 4-in-1 ESC | working — **Bluejay firmware, DSHOT only** |
+| Raspberry Pi 3B+ (1 GB) + camera | mounted and wired; link not yet run |
+| DSHOT300 drive | proven in `fan_test.cpp` (standalone, env `fantest`) |
+
+**Measured:** unloaded commutation floor **~2%** (1% pulses = desync/retry, 2%
+runs). With props, **~50% throttle gives usable translation velocity**. A quick
+translation test produced a curved path, attributed to table dust rather than tilt.
+
+**The single most expensive lesson: the ESC runs Bluejay, which removed analog
+input entirely.** Servo PWM produces nothing regardless of accuracy — TIM1 at
+50.000 Hz with 999.8 µs pulses and MOE set, verified with a meter at the ESC's own
+pad, and the ESC never armed. Throttle-range calibration also produces no beeps,
+because analog range calibration does not exist in that firmware. DSHOT works on
+both Bluejay and BLHeli_S, so it is the correct target regardless.
+
+**Second lesson: a backwards prop costs about half its thrust.** Needing 75%
+throttle became a comfortable 50% purely by flipping one prop. Check orientation
+and handedness before concluding you need larger props.
+
+**Third: all four DSHOT channels must share one GPIO port** (PA8/PA9/PA10/PA0).
+Putting channel 4 on PC7 forced either a port parameter or a duplicated send
+function, and every such variant broke the previously-working channels.
+
+### Still to identify — nothing below is measured yet
+
+`TRANSLATION_DOCKING.md` Phase 2 covers all of it: static thrust curve per motor,
+translational breakaway force (the five-minute string-and-weights test), effective
+mass, and the yaw disturbance from thrust-line/CoM offset. **Rotation constants get
+re-identified there too**, since the added mass moved the plant — see §17.
+
+### None of the rotation constants transfer
 
 ### None of the rotation constants transfer
 
@@ -1315,13 +1354,14 @@ so these numbers likely overstate the translational case.*
 weight until it moves. Five minutes, replaces the widest uncertainty in the
 sizing.
 
-### Parts selected
+### Parts selected — all now FITTED
 
 | item | choice | note |
 |---|---|---|
-| motors | FEICHAO 2204 2300KV ×4 | ~$30; 420 gf claim corroborated by an EMAX MT2204 bench test |
-| ESC | 4-in-1, 2–6S, PWM/DSHOT | channel matching matters because fan control is open-loop |
-| props | **4-inch preferred** | 5-inch needs 52 mm standoff and must mount within 38 mm of centre to stay inside an 8-inch disc |
+| motors | FEICHAO 2204 2300KV ×4 | ~$30; 420 gf claim (likely at 4S; we run 3S) |
+| ESC | AERO SELFIE 45A 4-in-1, 2–6S | **Bluejay — DSHOT only.** Channel matching matters because fan control is open-loop |
+| props | **HQProp 4043, 4-inch 3-blade** | fitted and working at ~50% throttle. 5-inch would give ~2.4× thrust at the same RPM but needs 52 mm standoff |
+| power | 3S ~12 V 2300 mAh, 10 A fuse, 18 AWG | ⚠️ sized for LOW throttle — prop current goes as throttle³ (~1.5 A/motor at 50%, ~5 A at 75%). **15 A is the ceiling for 18 AWG** |
 
 Prop geometry, 8-inch disc (102 mm radius):
 

@@ -7,6 +7,12 @@ edge of its bandwidth ceiling.
 **Companion to:** `CONTROL_README.md`. This guide assumes the plant is
 identified, the controller is tuned, and the closed-loop envelope has been run.
 
+> **⚠️ THIS MIGRATION IS COMPLETE (tag `rtos-p7-complete`). It is now a REFERENCE
+> document, not the active plan.** The active guide is **`TRANSLATION_DOCKING.md`**
+> (translation, vision, docking). Keep reading this one for: the five-task
+> architecture, the one-writer/one-reader invariants, the measured timing baseline,
+> and **Appendix A's trap table — every one of those traps is still live.**
+
 **No logic analyzer, no oscilloscope.** All timing verification is done in
 firmware and dumped over serial. Phase 1 builds a software scheduler tracer that
 replaces the analyzer.
