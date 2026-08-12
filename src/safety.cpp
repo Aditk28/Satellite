@@ -6,6 +6,8 @@
 
 #define SAFETY_PERIOD_MS      50    /* 20 Hz */
 #define HEARTBEAT_TIMEOUT_MS  300   /* no progress for this long = control is dead */
+#define SUPPLY_ABSENT_V       1.0f  /* below this the motor supply is simply OFF,
+                                       not sagging -- do not trip undervoltage */
 
 static float (*s_wheelVel)(void)          = nullptr;
 static void  (*s_safeStop)(const char*)   = nullptr;
@@ -91,17 +93,32 @@ static void safetyTask(void*) {
         if (fabsf(mA) > s_maxA) s_maxA = fabsf(mA);
 
         /* DEBOUNCED: a threshold must hold for 2 consecutive checks (100 ms).
-           A single noisy INA219 sample must never kill a run. */
-        static int uvStrikes = 0, ocStrikes = 0;
-        if (s_minBusV > 0.0f && busV < s_minBusV) {
-          if (++uvStrikes >= 2 && s_safeStop)
-            s_safeStop("safety: bus undervoltage");
-        } else uvStrikes = 0;
+           A single noisy INA219 sample must never kill a run.
+
+           LATCHED: fire ONCE per excursion, then stay quiet until the condition
+           clears. Without this, every 50 ms check re-fired the stop and the
+           operator got 20 identical messages per second, burying everything else.
+
+           SUPPLY-ABSENT GUARD: a reading below SUPPLY_ABSENT_V means the motor
+           supply simply is not connected (bench-testing on USB), not a collapsing
+           battery. Tripping there is pointless -- there is no power reaching the
+           driver to cut -- and it made the board unusable without the battery. */
+        static int  uvStrikes = 0,     ocStrikes = 0;
+        static bool uvLatched = false, ocLatched = false;
+
+        if (s_minBusV > 0.0f && busV < s_minBusV && busV > SUPPLY_ABSENT_V) {
+          if (++uvStrikes >= 2 && !uvLatched) {
+            uvLatched = true;
+            if (s_safeStop) s_safeStop("safety: bus undervoltage");
+          }
+        } else { uvStrikes = 0; uvLatched = false; }
 
         if (s_maxMilliAmps > 0.0f && fabsf(mA) > s_maxMilliAmps) {
-          if (++ocStrikes >= 2 && s_safeStop)
-            s_safeStop("safety: overcurrent");
-        } else ocStrikes = 0;
+          if (++ocStrikes >= 2 && !ocLatched) {
+            ocLatched = true;
+            if (s_safeStop) s_safeStop("safety: overcurrent");
+          }
+        } else { ocStrikes = 0; ocLatched = false; }
       } else {
         s_pwrFails++;
       }
