@@ -25,7 +25,16 @@ Never propose a solution that requires a scope.
 
 ## Current position
 
-**Phase 0 (safety hardening) is NEXT. Nothing in this guide has been started.**
+**Phase 0 (safety hardening) is COMPLETE WITH ONE DELIBERATE EXCEPTION (2026-08-13).
+Phase 1 (fans into the RTOS, DSHOT via TIM1 + DMA) is NEXT.**
+
+**⚠️ The exception: prop guards were SKIPPED by user decision (B7). The props are and
+will remain EXPOSED.** Everything else in Phase 0 is done — wires are routed clear of
+all four prop discs, the fuse and wiring are confirmed, and the battery disconnect is
+the real e-stop. The compensating mitigations are firmware-side and are now
+**requirements on Phase 1**, not suggestions: a compiled-in `FAN_THROTTLE_MAX` ceiling,
+props-off for any test that does not need thrust, and `fans_stopAll()` in the
+hardware-kill step. See B7 and Step 0.1's Result note.
 
 Everything upstream is DONE and verified on hardware:
 
@@ -40,9 +49,10 @@ Everything upstream is DONE and verified on hardware:
 
 | item | state |
 |---|---|
-| **Fan guards / wire management** | ⚠️ **props are EXPOSED, wires unsecured** — Phase 0, blocking |
+| **Fan guards** | ⚠️ **SKIPPED — props are EXPOSED and will stay that way** (B7). Mitigated in firmware, not mechanically. |
+| Wire management | ✅ done 2026-08-13 — wires separated from all four prop discs |
 | Fans in the RTOS firmware | not started — currently only a standalone bit-bang test sketch |
-| Pi ↔ STM32 link | **no wire run yet** (decision made: wired UART, see B1) |
+| Pi ↔ STM32 link | **no wire run yet** — Pi is powered and the camera is connected, but UART is unrun (decision made: wired UART, see B1). Deferred to Phase 3 / when needed. |
 | AprilTag detection | not started |
 | Translation plant ID | not started |
 | Any translation control | not started |
@@ -140,8 +150,8 @@ These are in addition to `RTOS_migration.md`'s list, which all still applies.
 
 | Phase | State | One-line result |
 |---|---|---|
-| **0 safety hardening** | ⬜ **NEXT** | — |
-| 1 fans into the RTOS (DSHOT + DMA) | ⬜ | — |
+| **0 safety hardening** | ✅ **(2026-08-13)** | Wires cleared, fuse/wiring confirmed, battery disconnect = e-stop. **Prop guards deliberately skipped (B7)** — mitigations moved into Phase 1. |
+| 1 fans into the RTOS (DSHOT + DMA) | ⬜ **NEXT** | — |
 | 2 translation plant ID | ⬜ | — |
 | 3 Pi ↔ STM32 wired link | ⬜ | — |
 | 4 vision: AprilTag pose on the Pi | ⬜ | — |
@@ -368,6 +378,26 @@ can be approached and be stopped by structure before reaching the disc.
 **Trap.** A guard that flexes into the prop is worse than no guard. Check clearance
 with the prop stationary *and* confirm nothing resonates at speed.
 
+**Result (2026-08-13) — SKIPPED, deliberately. See B7.** The user judged the build time
+unavailable and chose to proceed with exposed props. The risk was flagged once and is not
+being re-raised. **The accepted hazard:** four unguarded 4-inch 3-blade props at the
+platform perimeter, at hand height, on a chassis that must be picked up by hand. The
+realistic failure mode is not deliberate contact — it is an unexpected arm or spin-up
+while hands are on the chassis.
+
+**Compensating mitigations, now binding requirements on Phase 1:**
+
+1. **`FAN_THROTTLE_MAX`, compiled in, 30% during bring-up.** Clamp applied inside
+   `fans_setThrottle()` so *every* path is covered, including a runaway control law.
+   Raised only deliberately, when Phase 2 plant ID needs the range.
+2. **Props off for any test that does not need thrust.** DSHOT frame verification,
+   register dumps, DMA bring-up, and all Step 1.3 fault-path provocation run bare.
+3. **The battery disconnect is the e-stop; serial `X` is the convenience.** Confirmed
+   reachable from a standing position without leaning over the platform.
+4. **`fans_stopAll()` drives the pins low as GPIO in the hardware-kill step** — never
+   via the DMA path, which `faults_safeStop()` has already killed interrupts for.
+   (Already the Step 1.3 trap; it is now load-bearing rather than belt-and-braces.)
+
 ## Step 0.2 — Wire management
 
 **Concept.** The user has flagged this: loose wiring near spinning props gets cut,
@@ -386,6 +416,14 @@ dragged into something.
 **Verify.** Spin the platform by hand through 360° in both directions. Nothing
 tugs, snags, or approaches a prop.
 
+**Result (2026-08-13) — DONE.** All wiring separated from the prop discs and routed
+clear; nothing sits near a prop. With guards skipped (B7) this step carries more weight
+than it otherwise would — a severed wire is now the *only* thing standing between loose
+routing and a prop strike, so re-check routing after any rework that disturbs the
+harness. Note the I2C/SSI adjacency warning above remains live: this bus already went
+marginal once from the hardware rework (MPU read drifted 2373 → 2510 µs) and produced
+false 150 rad/s saturation aborts, which is why `WW_MAX_JUMP` rejection exists.
+
 ## Step 0.3 — Emergency stop discipline
 
 **Concept.** `X` currently stops the wheel. Once fans are in the firmware it must
@@ -400,6 +438,18 @@ stop **everything**, and the operator must be able to reach it instantly.
   current goes as throttle³ (~1.5 A/motor at 50%, ~5 A at 75%).
 
 **Verify.** Battery can be disconnected in under a second from a standing position.
+
+**Result (2026-08-13) — DONE.** Battery disconnect confirmed reachable without leaning
+over the platform; it is the real e-stop. Fuse and wiring confirmed unchanged: 10 A
+fitted, 18 AWG, 15 A absolute ceiling. **The Phase-1 requirement is recorded here so it
+cannot be forgotten:** `X`, `faults_safeStop()`, the heartbeat trip, and every power trip
+must zero all four fan channels **first**, before anything else. With guards skipped
+(B7), `FAN_THROTTLE_MAX` joins that list as a compiled-in ceiling rather than a runtime
+setting.
+
+**Also as of 2026-08-13:** the Raspberry Pi is mounted, powered, and connected to its
+camera. The USART6 link to the STM32 is **not run** — deferred to Phase 3 or to whenever
+vision is actually needed. Nothing before Phase 3 depends on it.
 
 **Phase 0 exit:** `git tag trans-p0-safe`
 
@@ -1004,6 +1054,7 @@ write-up more credible, not less. Do the same here.
 | T13 | No retry cap in the state machine | Infinite search/approach cycling — the `MAX_STALL_RETRIES` lesson |
 | T14 | Calibrating the camera at the wrong resolution | Systematic range error |
 | T15 | Fuse/wire sized for low throttle | Prop current goes as throttle³; four fans at 75% ≈ 20 A |
+| T16 | **Props are UNGUARDED (B7)** | There is no mechanical stop between a hand and a 25,000 RPM disc. Any test that arms the fans with the platform within reach is a hazard, not an inconvenience. Props off unless the test needs thrust; `FAN_THROTTLE_MAX` compiled in; battery disconnect is the e-stop. |
 
 Plus **every trap in `RTOS_migration.md` Appendix A** — the one-writer/one-reader
 invariants, `delay()`, watchdogs measuring iterations instead of time, and the rest.
@@ -1020,7 +1071,8 @@ invariants, `delay()`, watchdogs measuring iterations instead of time, and the r
 | **B4** | **LQR first, MPC later** | Three double integrators; the machinery and tuning method already exist from the wheel axis. Gives a working baseline before adding complexity. MPC earns its cost specifically at *terminal docking constraints* and *unidirectional allocation* — add it on the Pi when those bite, per CONTROL_README §17. |
 | **B5** | **Fan ch4 moves PA0 → PA11 for the DMA rewrite** | TIM1_CH1–CH4 are PA8/9/10/11: one timer, one DMA stream, all on GPIOA — which satisfies the same-port constraint (T2) by construction. PA0's timers (TIM2/TIM5) are the motor PWM and µs timebase. |
 | **B6** | **Rotation retune folded into Phase 2** | The user chose to skip a separate rotation retune. Phase 2 must re-identify mass and friction for translation regardless, so rotation constants come along for free. Known open items meanwhile: passive desaturation incomplete, `A_FRICTION` never swept. |
-| **B7** | *(next decision goes here)* | |
+| **B7** | **Prop guards skipped — props stay exposed; safety moved into firmware** | 2026-08-13, user decision. Build time for guards/ducts/a bumper ring was not available, and the alternative was blocking all translation work indefinitely on a fabrication task. Risk flagged once and accepted: four unguarded 4-inch 3-blade props at hand height on a chassis that gets picked up by hand. **The tradeoff is explicit — mechanical containment is replaced by removing the reasons to touch an armed platform:** (1) `FAN_THROTTLE_MAX` compiled in at 30% for bring-up, clamped inside `fans_setThrottle()` so a runaway control law cannot exceed it either; (2) props physically off for any test that does not need thrust — DSHOT/DMA/register verification and all fault-path provocation; (3) battery disconnect is the e-stop, serial `X` is the convenience; (4) `fans_stopAll()` drives pins low as GPIO in the hardware-kill step, never via the already-dead DMA path. Items 1–4 are **binding requirements on Phase 1**, not advice. Cost also noted honestly: a duct would have slightly *increased* static thrust by cutting tip losses, so this trades a small thrust margin away as well. Revisit only if the platform starts being handled by people other than the user. |
+| **B8** | *(next decision goes here)* | |
 
 ---
 

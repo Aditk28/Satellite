@@ -44,9 +44,13 @@ depth matters as much as the demo working.
 
 hardware COMPLETE and tested** — 4 fans on a 4-in-1 ESC, all channels spinning
 
-under DSHOT300; Pi 3B+ and camera mounted. **Active work: `TRANSLATION_DOCKING.md`,
+under DSHOT300; Pi 3B+ mounted, powered, camera connected (UART link to the STM32 not
 
-Phase 0 (safety hardening — props are exposed, wires unsecured).**
+run yet — Phase 3). **Phase 0 (safety hardening) COMPLETE 2026-08-13** with prop guards
+
+deliberately skipped (decision B7) and their mitigations pushed into Phase 1. **Active
+
+work: `TRANSLATION_DOCKING.md` Phase 1 — fans into the RTOS via TIM1 + DMA.**
 
 Two known-open rotation items, deliberately deferred into that guide's Phase 2:
 
@@ -477,11 +481,21 @@ The flywheel stores real energy and the platform is untethered — and there are
 
 **four exposed 4-inch 3-blade props capable of ~25,000 RPM** at the platform's
 
-perimeter, i.e. exactly where you reach to pick it up. Props are currently
+perimeter, i.e. exactly where you reach to pick it up. **Props are UNGUARDED and will
 
-UNGUARDED and wiring is unsecured; `TRANSLATION_DOCKING.md` Phase 0 fixes both and
+stay that way** — guards were deliberately skipped (2026-08-13, `TRANSLATION_DOCKING.md`
 
-blocks everything else. Never propose a test with hands near props or wheel.
+decision B7). Wiring IS secured and routed clear of all four prop discs (Step 0.2 done).
+
+Because there is no mechanical containment, the safety story is entirely firmware and
+
+procedure: **`FAN_THROTTLE_MAX` compiled in (30% for bring-up, clamped inside
+
+`fans_setThrottle()`), props physically off for any test that does not need thrust, the
+
+battery disconnect as the real e-stop, and `fans_stopAll()` driving the pins low as GPIO
+
+in the hardware-kill step.** Never propose a test with hands near props or wheel.
 
 Fan current goes as throttle³ (~1.5 A/motor at 50%, ~5 A at 75%) — the fitted 10 A
 
