@@ -45,6 +45,23 @@ extern "C" {
                    driver.disable()). May be NULL. Runs AFTER the hardware kill. */
 void faults_init(int hwEnablePin, int ledPin, void (*stopHook)(void));
 
+/* Register a kill that runs at the VERY TOP of every fault path — after interrupts
+   are masked, but BEFORE the motor enable pin is pulled low and before stopHook.
+   Added for the translation fans (Phase 1.3): with the props unguarded (decision B7)
+   they are the larger hazard, so if only one actuator kill ever completes it should
+   be that one. Both are a handful of register writes, so the ordering costs
+   nanoseconds either way.
+
+   The hook MUST be safe with interrupts already disabled: no FreeRTOS API, no lock,
+   no unbounded wait. fans_stopAll() is built to that contract.
+
+   Registered as a function pointer rather than faults.cpp calling fans_stopAll()
+   directly, deliberately: this header is C-compatible and dependency-free because
+   FreeRTOSConfig.h (a C header, included by the kernel's C sources) names
+   rtAssertFail and rtRunTimeCounter. Pulling a C++ Arduino module in here would
+   break that. May be NULL. */
+void faults_setHwKillHook(void (*fn)(void));
+
 /* The ONE stop path. Never returns. */
 void faults_safeStop(fault_t reason);
 

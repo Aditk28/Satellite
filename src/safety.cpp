@@ -6,6 +6,9 @@
 
 #define SAFETY_PERIOD_MS      50    /* 20 Hz */
 #define HEARTBEAT_TIMEOUT_MS  300   /* no progress for this long = control is dead */
+/* fanTask runs at 500 Hz, so ~100 frames should land between two of these checks.
+   200 ms of no movement is ~100 missed frames -- unambiguous, not a near miss. */
+#define FAN_STALL_TIMEOUT_MS  200
 #define SUPPLY_ABSENT_V       1.0f  /* below this the motor supply is simply OFF,
                                        not sagging -- do not trip undervoltage */
 
@@ -30,6 +33,14 @@ void safety_arm(void)  { s_armed = true; }
 static float s_minBusV = 0.0f;      /* 0 = trip disabled */
 static float s_maxMilliAmps = 0.0f; /* 0 = trip disabled */
 
+/* Phase 1.3 fanTask liveness (see safety.h). */
+static uint32_t (*s_fanFrames)(void)  = nullptr;
+static bool     (*s_fanRunning)(void) = nullptr;
+
+void safety_setFanMonitor(uint32_t (*fanFrames)(void), bool (*fanRunning)(void)) {
+  s_fanFrames = fanFrames; s_fanRunning = fanRunning;
+}
+
 void safety_setPowerMonitor(bool (*readPower)(float*, float*)) { s_readPower = readPower; }
 void safety_setPowerLimits(float minBusV, float maxMilliAmps) {
   s_minBusV = minBusV; s_maxMilliAmps = maxMilliAmps;
@@ -47,6 +58,9 @@ static void safetyTask(void*) {
   TickType_t last         = xTaskGetTickCount();
   uint32_t   lastKick     = 0;
   TickType_t lastKickTick = last;
+  uint32_t   lastFanFrame = 0;
+  TickType_t lastFanTick  = last;
+  bool       fanLatched   = false;
 
   for (;;) {
     /* If we were starved long enough to fall behind, RESYNC instead of letting
@@ -121,6 +135,24 @@ static void safetyTask(void*) {
         } else { ocStrikes = 0; ocLatched = false; }
       } else {
         s_pwrFails++;
+      }
+    }
+
+    /* ---- 1c. fanTask liveness (Phase 1.3) ---------------------------------
+       Only meaningful while the fans SHOULD be sending: during the ~1 s arming
+       ramp fanRunning() is false, and after a hard kill it is false forever, so
+       neither reads as a stall. Wall-clock, latched -- see safety.h. */
+    if (s_fanFrames && s_fanRunning) {
+      uint32_t fr = s_fanFrames();
+      TickType_t tf = xTaskGetTickCount();
+      if (!s_fanRunning()) {
+        lastFanFrame = fr; lastFanTick = tf; fanLatched = false;
+      } else if (fr != lastFanFrame) {
+        lastFanFrame = fr; lastFanTick = tf; fanLatched = false;
+      } else if (!fanLatched &&
+                 (tf - lastFanTick) > pdMS_TO_TICKS(FAN_STALL_TIMEOUT_MS)) {
+        fanLatched = true;
+        if (s_safeStop) s_safeStop("safety: fanTask stalled (DSHOT frames stopped)");
       }
     }
 

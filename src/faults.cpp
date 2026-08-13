@@ -26,12 +26,17 @@ __attribute__((section(".noinit"))) static fault_record_t g_fault;
 static int  g_enablePin = -1;
 static int  g_ledPin    = -1;
 static void (*g_stopHook)(void) = 0;
+/* Deliberately NOT cleared by faults_init: it is registered in setup() right after
+   fans_init(), which runs before hwSetup() (where faults_init is called). */
+static void (*g_hwKillHook)(void) = 0;
 
 void faults_init(int hwEnablePin, int ledPin, void (*stopHook)(void)) {
   g_enablePin = hwEnablePin;
   g_ledPin    = ledPin;
   g_stopHook  = stopHook;
 }
+
+void faults_setHwKillHook(void (*fn)(void)) { g_hwKillHook = fn; }
 
 /* ---- helpers ------------------------------------------------------------- */
 static const char* reasonName(fault_t r) {
@@ -73,7 +78,11 @@ static void faults_halt(fault_t reason) __attribute__((noreturn));
 static void faults_halt(fault_t reason) {
   taskDISABLE_INTERRUPTS();
 
-  /* 1) hardware kill FIRST — independent of any SimpleFOC object state */
+  /* 0) the BIGGEST hazard first. With the props unguarded (B7) the fans outrank the
+        flywheel, so they go before the driver enable. The hook must not use any
+        FreeRTOS API — interrupts are already masked here. */
+  if (g_hwKillHook) g_hwKillHook();
+  /* 1) hardware kill — independent of any SimpleFOC object state */
   if (g_enablePin >= 0) { pinMode(g_enablePin, OUTPUT); digitalWrite(g_enablePin, LOW); }
   /* 2) graceful stop if the sketch registered one */
   if (g_stopHook) g_stopHook();

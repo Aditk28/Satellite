@@ -26,14 +26,24 @@ Never propose a solution that requires a scope.
 ## Current position
 
 **Phase 0 COMPLETE with one deliberate exception (below). Phase 1 IN PROGRESS —
-Step 1.1 PASSED 2026-08-13, Step 1.2 (`fans.*` + `fanTask`) is NEXT.**
+Steps 1.1, 1.2 and 1.3 PASSED 2026-08-13. Step 1.4 (manual fan commands) is NEXT,
+and it is the last step before the `trans-p1-fans` tag.**
 
-**Step 1.1 result in one line:** DSHOT300 via TIM1 + DMA burst is proven on hardware in
-the standalone `fandma` sketch — all four channels spin, 22,278 frames with 0 overruns,
-every register verified against the arithmetic. **Hardware is done for Phase 1:** fan
+**Where the fans stand:** DSHOT300 via TIM1 + DMA burst is proven standalone (`fandma`,
+22,278 frames / 0 overruns) **and** integrated into the RTOS firmware as `fans.*` +
+`fanTask` (prio 2, 500 Hz, sole fan writer). The ESC arms on boot, `overruns` stays 0,
+and the FOC tick / `ctrl period` / `loopFOC` figures are unchanged — fans cost the
+control loop nothing, as the priority model predicted. **Hardware for Phase 1 is done:**
 ch4 moved A0 → CN10-14 (PA11); ch1–3 unchanged because D7/D8/D2 *are* PA8/PA9/PA10.
-Step 1.2 ports it into `fans.*` + `fanTask` inside `rtos_main.cpp`, where the deferred
-gate (`M`: FOC tick 238–261 µs, ctrl period MAX ≈ 5006 µs) finally gets run.
+
+**Safety paths are done (1.3):** `X`, `stopMotor()`, every `faults_safeStop()` path and
+the new fanTask stall watchdog all kill the fans, and the fault path kills them *ahead*
+of the wheel (B10). `R` re-arms.
+
+**⚠️ What is still NOT true:** there is no way to command fan throttle from serial, so
+the fans arm and sit at DSHOT 0 forever. That is Step 1.4 — and it is the first time
+this project will command real thrust from the RTOS firmware, so it is the first step
+where `FAN_THROTTLE_MAX` and the props-off rule actually bite.
 
 **⚠️ The exception: prop guards were SKIPPED by user decision (B7). The props are and
 will remain EXPOSED.** Everything else in Phase 0 is done — wires are routed clear of
@@ -170,7 +180,7 @@ These are in addition to `RTOS_migration.md`'s list, which all still applies.
 | Phase | State | One-line result |
 |---|---|---|
 | **0 safety hardening** | ✅ **(2026-08-13)** | Wires cleared, fuse/wiring confirmed, battery disconnect = e-stop. **Prop guards deliberately skipped (B7)** — mitigations moved into Phase 1. |
-| 1 fans into the RTOS (DSHOT + DMA) | 🟡 **IN PROGRESS** | **1.1 ✅ (2026-08-13)** — TIM1+DMA burst proven standalone (`fandma`), all 4 channels spin, 22k frames / 0 overruns, ch4 moved to PA11. **1.2 next.** |
+| 1 fans into the RTOS (DSHOT + DMA) | 🟡 **IN PROGRESS** | **1.1 ✅** TIM1+DMA burst proven standalone (`fandma`), ch4 → PA11. **1.2 ✅** `fans.*` + `fanTask` prio 2, sole fan writer. **1.3 ✅** hw-kill hook ahead of the wheel, `X`/`stopMotor`/`R`/stall-watchdog; found+fixed frame-aborts (99→0) and a latent boot double-writer; ctrl period 4999/5000/5001. **1.4 next** (manual fan commands). |
 | 2 translation plant ID | ⬜ | — |
 | 3 Pi ↔ STM32 wired link | ⬜ | — |
 | 4 vision: AprilTag pose on the Pi | ⬜ | — |
@@ -614,6 +624,61 @@ uint32_t fans_frames(void);                 // diagnostics for G
 **Trap — arming.** ESCs need a stream of DSHOT 0 before accepting throttle. Do this
 in `fans_init()` and do not accept throttle commands until it completes.
 
+**Result (2026-08-13) — PASSED, with a defect found later at Step 1.3.**
+`src/fans.h` + `src/fans.cpp`, `fanTask` prio 2 at 500 Hz, `fans_init()` called
+pre-scheduler from `setup()`, two status lines added to `G`. All six build
+environments compile. On hardware the ESC arms, `frames` advances, and the deferred
+Step-1.1 gate passes — FOC tick dt 241–259 µs, `ctrl period` mean 4999 / MAX 5002 µs,
+`loopFOC` 32/32/45 µs, all unchanged or slightly better than the migration baseline.
+
+> **⚠️ CORRECTION (2026-08-13).** This note originally claimed **`overruns=0`**. That
+> was false — the first `G` of the Step 1.3 session showed **`overruns=99`**, and it
+> had been 99 since boot. The claim was written from a verbal "everything checked out"
+> rather than from transcribed figures. Root cause and fix are in the Step 1.3 result
+> note. **Process lesson, worth more than the bug:** do not write a specific measured
+> number into this guide unless it was actually read off the terminal. A wrong number
+> in the permanent record is worse than no number, because the next session trusts it
+> and stops looking.
+
+**Four design points worth keeping:**
+
+1. **Two arrays, not one.** A DSHOT frame is a *set* of four values clocked out
+   together. Each `uint16_t` store is atomic on Cortex-M4 but four of them are not
+   atomic **as a set** — a preemption mid-write puts a torn allocation on the wire.
+   So requests land in `s_req[]` and `fanTask` snapshots them into its own
+   `dshotValue[]` under a critical section.
+2. **That critical section masks the FOC tick, and that is unavoidable.**
+   `taskENTER_CRITICAL()` writes `BASEPRI = configMAX_SYSCALL_INTERRUPT_PRIORITY`
+   (`5<<4 = 0x50`), which blocks every exception at priority value ≥ 0x50 — and TIM9
+   is at exactly 5. It *must* be, because its ISR calls `vTaskNotifyGiveFromISR` and
+   anything above the syscall ceiling would corrupt the kernel (RTOS Trap 3). Cost is
+   ~30 cycles ≈ **170 ns against a 250 µs tick, 0.07%**. Paid deliberately rather than
+   hand-waved.
+3. **Arming runs ON the task, not in `fans_init()`.** The standalone sketch armed with
+   `for(500){send; delay(2);}`; `delay()` is Trap T8/RTOS-19 and would have starved
+   `telemTask`, so the boot output would never have been written out. The task paces
+   its own ramp with `vTaskDelayUntil`. Throttle requests before arming completes are
+   **rejected and counted** (`fans_rejects()`), not silently dropped.
+4. **`fans_stopAll()` uses no FreeRTOS API at all** — no lock, no blocking, no
+   unbounded wait — because it has to work when called from an ISR or from
+   `faults_safeStop()`, which has already disabled interrupts. It drives PA8–PA11 low
+   as plain GPIO. **Order matters: BSRR before MODER.** Writing BSRR while the pin is
+   still in AF mode updates ODR (harmlessly disconnected from the pad); switching
+   MODER to output then connects an already-low ODR. Reverse it and the pad briefly
+   drives whatever ODR was holding.
+
+**Kept from Step 1.1 rather than optimised:** `dshotSendFrame()` still stops TIM1 and
+restarts from `CNT=0` every frame instead of leaving it free-running and re-arming
+only the DMA. Free-running is marginally cheaper and is what Betaflight does, but
+stop/restart is the version with 22k proven frames behind it and the cost is a handful
+of register writes per 2 ms.
+
+**Not tested, deliberately: wheel unwind after `T90`.** `claude.md` asks for an unwind
+check after anything touching timing, but rotation control is not currently consistent
+enough post-hardware-change for that observation to mean anything — passive
+desaturation is already known dead (B6). Deferred to Phase 2 with the rest of the
+rotation work rather than recorded as a meaningless pass.
+
 ## Step 1.3 — Fans in every safety path
 
 **Concept.** The safety architecture currently only knows about the wheel. Fans are
@@ -622,8 +687,13 @@ now the larger hazard and must be wired into the same paths.
 **Do.**
 - `stopMotor()` → also `fans_stopAll()`.
 - `faults_safeStop()` → fans off in the **hardware-kill** step, before anything else.
-- `safetyTask` → add fan-related checks; extend the power trip thresholds, since
-  four fans change the current envelope completely.
+- `safetyTask` → add fan-related checks. ~~extend the power trip thresholds~~ —
+  **this instruction was WRONG, corrected 2026-08-13, see B9.** The INA219 sits on the
+  **wheel supply**, so it cannot see fan current at all; raising the current trip
+  would only weaken the wheel's own protection in exchange for nothing. Thresholds
+  stay at 10.0 V / 2500 mA. The *undervoltage* threshold does need re-measuring once
+  fans draw real current — **that moves to Phase 2**, where it can be set from data
+  instead of guessed.
 - `X` fast path in `commsTask` → zero fans immediately, alongside `motor.target = 0`.
 - Heartbeat failure → fans off.
 
@@ -635,6 +705,88 @@ now the larger hazard and must be wired into the same paths.
 **Trap.** `faults_safeStop()` disables interrupts first. If fan shutdown depends on
 DMA still running, it will not happen. **Drive the fan pins low as GPIO in the
 hardware-kill step** rather than relying on the DMA path.
+
+**Result (2026-08-13) — PASSED on the stop paths, and it surfaced two defects from
+1.2 that are now fixed.**
+
+Wired up: `faults_setHwKillHook(fans_stopAll)` (B10) runs at the top of `faults_halt()`
+before the DRV8313 enable; `stopMotor()` hard-kills fans; `commsEmergencyStop()` (the
+`X` fast path on commsTask) hard-kills in microseconds; `R` calls `fans_rearm()`;
+`safetyTask` gained a wall-clock, latched fanTask-stall watchdog. Power thresholds
+deliberately unchanged — **the guide's instruction there was wrong, see B9.**
+
+Verified on hardware: `X` → `fans: KILLED` with `frames` **frozen** (1819 → 1819 across
+several seconds, which is the real proof the task stopped sending rather than merely
+zeroing throttle). `R` → re-arm message, then `fans: armed`, `frames` climbing again
+(6279 → 9466). An unrecognised command `q` → `!! STOP` and `fans: KILLED`, confirming
+the existing "any unrecognised input stops the motor" rule now covers the props.
+`M` after all of it: `ctrl period` mean 4999 / MAX **5002** µs, FOC tick 241–259 µs,
+`loopFOC` 32/32/45 — no regression from the added stop-path work.
+
+**Heartbeat/assert provocation: NOT TESTED, by choice.** The hw-kill hook is therefore
+verified by inspection only. Recorded rather than glossed: the one fault path exercised
+in anger is the recoverable stop, not `faults_halt()`.
+
+**Defect 1 — `overruns=99`, present since 1.2 and mis-recorded as 0.** 99 of the first
+~698 frames, then **one** in the next ~8,700. A boot-window phenomenon, and the timer
+audits prove why: both show `TIM1 CEN=0 DIER=0x0`, so `fanTask` had not executed at all
+yet — `controlTask` is inside `hwSetup()`, where SimpleFOC's `_delay()` becomes Arduino
+`delay()` and busy-spins at prio 3, starving prio 2 (Trap T8/RTOS-19, biting indirectly
+through a library this time).
+
+The mechanism was **the resync guard being too loose**. After starvation
+`vTaskDelayUntil` returns immediately once per missed period; the guard only resynced
+past 8 ms of backlog, so 2–7 ms windows produced 2–3 **back-to-back** frames. A frame
+needs ~60 µs of timer time to drain, so each burst found the previous transfer still in
+flight — and the original code's response was to **abort it mid-frame** and start a new
+one, putting a truncated CRC-failing frame on the wire for no benefit.
+
+Two fixes: **never catch up** (fans want a steady stream, not replayed history — resync
+whenever the deadline has already passed), and **skip rather than abort** when a
+transfer is in flight, with a 4-attempt stuck-detector that force-restarts so a
+genuinely wedged DMA cannot wedge silently.
+
+*Severity, honestly: not a hazard.* A truncated frame fails the ESC's DSHOT CRC and the
+next good frame corrects 2 ms later — it armed fine throughout. But it is corrupt
+traffic on the wire, and under real throttle a burst of rejected frames is precisely how
+T12 (motor stops mid-manoeuvre) happens.
+
+**Defect 2 — a latent Trap 17 / B15 violation introduced in 1.2.** `telem_print()`
+before `telem_activate()` writes the port **directly from the calling task**. Arming
+completes ~1 s after the scheduler starts, still inside `hwSetup()` while `controlTask`
+is direct-writing boot output — so `fanTask` was a **second concurrent writer into
+non-reentrant `HardwareSerial`**. It interleaved harmlessly the one time it shipped,
+which is exactly what that trap says makes a partial single-writer worse than none.
+Fixed with a new `telem_isActive()`: the announcement is deferred until telemTask owns
+the ports. **Any future task that wants to print during boot must gate on it.**
+
+**Post-fix verification (2026-08-13, figures read off the terminal):**
+
+```
+fans: armed  frames=599   overruns=0     <- first G after boot (was 99)
+fans: armed  frames=3737  overruns=0     <- still 0
+"fans: armed" now prints AFTER the boot banner (i.e. after telem_activate)
+
+M! then M, clean 10 s window:
+  loopFOC       32 / 32 / 34      (migration baseline MAX was 45)
+  ctrl period   4999 / 5000 / 5001   (migration baseline 4994 / 5000 / 5006)
+  FOC tick dt   239 - 261 us      (baseline 238 - 261)
+  control law   2415 mean  -- ENCLOSES the MPU read; real compute
+                = st_law - st_mpu = 2415 - 2399 = 16 us (documented ~14)
+fanTask stack: 182 of 384 words used at peak (the String in the arm message)
+```
+
+Timing is at or slightly better than the pre-fan baseline on every line, which settles
+the Step-1.1 deferred gate properly rather than by construction.
+
+**Three log readings that look alarming and are not** — recorded so they are not chased
+again: (1) `control law mean=2415 µs` *encloses* the MPU6050 read, so the real compute
+is `st_law − st_mpu` ≈ 16 µs, per RTOS B6. (2) A `ctrl period min` of 3571 µs appears
+if `M` is run without `M!` first, because the window then spans `hwSetup()`; on a clean
+window it is 4999. (3) The timer audit prints **TIM2/TIM3 at "50000.0 Hz"** because it
+divides by `ARR+1` without accounting for centre-aligned mode (`CR1=0xC1` counts up
+*and* down) — the real PWM rate is the documented 25 kHz. Pre-existing quirk in
+`hw_timers.cpp`, unrelated to fans.
 
 ## Step 1.4 — Manual fan commands in the main firmware
 
@@ -1125,6 +1277,9 @@ write-up more credible, not less. Do the same here.
 | T14 | Calibrating the camera at the wrong resolution | Systematic range error |
 | T15 | Fuse/wire sized for low throttle | Prop current goes as throttle³; four fans at 75% ≈ 20 A |
 | T16 | **Props are UNGUARDED (B7)** | There is no mechanical stop between a hand and a 25,000 RPM disc. Any test that arms the fans with the platform within reach is a hazard, not an inconvenience. Props off unless the test needs thrust; `FAN_THROTTLE_MAX` compiled in; battery disconnect is the e-stop. |
+| T17 | **`vTaskDelayUntil` "catching up" after starvation** | Returns immediately once per missed period, firing a burst of back-to-back iterations. For a periodic *emitter* like `fanTask` that burst aborts its own in-flight DMA transfers — 99 corrupt DSHOT frames inside the `hwSetup()` window. Resync whenever the deadline has already passed: a missed frame is gone, not owed. Sibling of RTOS Trap 20 (the watchdog version of the same bug). |
+| T18 | **`telem_print()` from a second task during boot** | Before `telem_activate()` it writes the port *directly from the calling task*. Any task printing during `hwSetup()` becomes a second concurrent writer into non-reentrant `HardwareSerial` — invariant B15 / RTOS Trap 17. Gate on `telem_isActive()` and defer. It will interleave harmlessly for a long time before it doesn't. |
+| T19 | **Trusting a number you did not read off the terminal** | The 1.2 result note recorded `overruns=0` from a verbal "everything checked out"; it was 99 and had been since boot. A wrong number in the guide is worse than no number — the next session trusts it and stops looking. |
 
 Plus **every trap in `RTOS_migration.md` Appendix A** — the one-writer/one-reader
 invariants, `delay()`, watchdogs measuring iterations instead of time, and the rest.
@@ -1143,7 +1298,9 @@ invariants, `delay()`, watchdogs measuring iterations instead of time, and the r
 | **B6** | **Rotation retune folded into Phase 2** | The user chose to skip a separate rotation retune. Phase 2 must re-identify mass and friction for translation regardless, so rotation constants come along for free. Known open items meanwhile: passive desaturation incomplete, `A_FRICTION` never swept. |
 | **B7** | **Prop guards skipped — props stay exposed; safety moved into firmware** | 2026-08-13, user decision. Build time for guards/ducts/a bumper ring was not available, and the alternative was blocking all translation work indefinitely on a fabrication task. Risk flagged once and accepted: four unguarded 4-inch 3-blade props at hand height on a chassis that gets picked up by hand. **The tradeoff is explicit — mechanical containment is replaced by removing the reasons to touch an armed platform:** (1) `FAN_THROTTLE_MAX` compiled in at 30% for bring-up, clamped inside `fans_setThrottle()` so a runaway control law cannot exceed it either; (2) props physically off for any test that does not need thrust — DSHOT/DMA/register verification and all fault-path provocation; (3) battery disconnect is the e-stop, serial `X` is the convenience; (4) `fans_stopAll()` drives pins low as GPIO in the hardware-kill step, never via the already-dead DMA path. Items 1–4 are **binding requirements on Phase 1**, not advice. Cost also noted honestly: a duct would have slightly *increased* static thrust by cutting tip losses, so this trades a small thrust margin away as well. Revisit only if the platform starts being handled by people other than the user. |
 | **B8** | **Step 1.1 split: prove TIM1+DMA standalone (`fan_dma_test.cpp`, env `fandma`) before integrating** | 2026-08-13. The guide's Step 1.1 Verify mixes a driver question ("each channel spins via the new path") with an RTOS question ("`M` shows FOC tick still 238–261 µs"). Split them: 1.1 proves the driver alone, 1.2 integrates into `fans.*`/`fanTask` and runs the `M` gate there. Reasoning: `fan_test.cpp` is the confirmed-good bit-bang reference and the verbatim rule says don't edit it, so the DMA path needs its own file regardless. More importantly a new DMA driver has ~6 independently-configurable register blocks (GPIO AF, TIM timebase, CCMRx/CCER, BDTR/MOE, DCR burst window, DMA2_S5) and **every one of them fails identically — the pin doesn't move.** Bisecting that with the wheel, FOC, telemetry and five tasks in the picture is strictly harder than bisecting it alone, and the same board can then A/B bit-bang vs DMA by changing `-e`. Cost: one throwaway file + one env. Accepted downside: the FOC-noninterference gate defers to 1.2 — acceptable because it is inherently an RTOS measurement that cannot be taken standalone. Also decided: **no DMA interrupt at all** — the frame is re-armed by polling `DMA_SxCR.EN`, which sidesteps the STM32duino strong-`IRQHandler` collision trap (Appendix A #2 / RTOS trap 13b) rather than working around it. |
-| **B9** | *(next decision goes here)* | |
+| **B9** | **Power trip thresholds NOT changed for the fans — the guide's Step 1.3 instruction was wrong** | 2026-08-13. Step 1.3 said to "extend the power trip thresholds, since four fans change the current envelope completely." That is based on a false premise: **the INA219 is on the wheel supply, not the fan supply** (`CONTROL_README` §1 "bus voltage and current on the motor supply"; this guide's own inventory "wheel-supply V/I"). Consequences: (a) the **2500 mA current trip cannot see fan current at all**, so raising it would not extend any protection — it would only weaken the wheel's own overcurrent trip in exchange for nothing; (b) the **10.0 V undervoltage trip *does* see fan draw indirectly**, because the fans share the battery and their current sags the pack. Whether four fans at 30% pull the bus under 10.0 V depends on pack internal resistance and state of charge, **neither of which has been measured**. Picking a new number now would be exactly the mistake `safety.cpp`'s own comments warn against ("a wrong guess means nuisance safe-stops on a spinning flywheel"). **Both thresholds left as-is; undervoltage re-measurement moved to Phase 2**, alongside the thrust curve, where fans will finally be drawing real current. One good side effect banked now: an undervoltage trip goes through `stopMotor()`, which after this step stops the wheel **and** the fans — a collapsing pack should stop everything, and until now it would not have. |
+| **B10** | **Fan kill runs BEFORE the wheel kill in every fault path, via a registered hook** | 2026-08-13. `faults_halt()` now calls a `faults_setHwKillHook()` function pointer immediately after masking interrupts and *before* pulling the DRV8313 enable low. Ordering: with the props unguarded (B7) the fans are the larger hazard, and if only one actuator kill ever completes it should be that one — both are a handful of register writes, so the ordering costs nanoseconds either way. Implemented as a **function pointer rather than `#include "fans.h"` in `faults.cpp`** deliberately: `faults.h` is C-compatible and dependency-free *because* `FreeRTOSConfig.h` (a C header pulled into the kernel's C sources) names `rtAssertFail` and `rtRunTimeCounter`, and including a C++ Arduino module there would break that property. The hook contract is "safe with interrupts already disabled" — no FreeRTOS API, no lock, no unbounded wait — which is what `fans_stopAll()` was built to. Guarded by `s_hwReady` so a fault firing before `fans_init()` cannot poke TIM1 with its APB clock still gated. **`stopMotor()` uses the HARD kill, not throttle-to-zero**, so recovery needs `R` and a ~1 s re-arm; a soft stop would leave the ESC armed and still depending on the DMA path to keep working, which is the wrong guarantee for a stop path. |
+| **B11** | *(next decision goes here)* | |
 
 ---
 

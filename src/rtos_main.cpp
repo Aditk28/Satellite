@@ -149,6 +149,7 @@
 #include "safety.h"          // Phase 5: independent watchdog task
 #include "i2c_bus.h"         // Phase 5.2: I2C mutex (control MPU + safety INA219)
 #include "commands.h"        // Phase 6: commsTask owns serial RX
+#include "fans.h"            // Translation 1.2: fanTask is the SOLE fan writer
 #include <Adafruit_INA219.h>
 
 // ------------------------- hardware -------------------------
@@ -362,6 +363,14 @@ static inline float signf(float x) { return (x > 0.0f) ? 1.0f : ((x < 0.0f) ? -1
 void printBoth(const String &s) { telem_print(s); }
 
 void stopMotor(const String &why) {
+  // Phase 1.3: fans FIRST -- with the props unguarded (B7) they outrank the wheel.
+  // This is the HARD kill (pins low as GPIO, latched), not "throttle to zero": a
+  // soft stop would leave the ESC armed and still depending on the DMA path to keep
+  // working. `R` re-arms, which costs ~1 s -- the right price for a stop.
+  // Note the knock-on: handleCommand's default case calls this, so ANY unrecognised
+  // serial input now kills the fans too. That is the existing "a confused operator
+  // should not leave a flywheel spinning" rule, and it applies harder to props.
+  fans_stopAll();
   controllerEnabled = false;
   ctrlMode = CTRL_IDLE;
   capturing = false;
@@ -380,7 +389,11 @@ static void  safetyStop(const char* why)   { stopMotor(String(why)); }
 // queue. An aligned 32-bit float store is atomic on Cortex-M4, so focTask picks it
 // up within one tick (<=250 us) instead of waiting up to a full 5 ms control
 // period. handleLine() still runs the full stop when the control task drains it.
-static void commsEmergencyStop(void) { motor.target = 0.0f; }
+// Phase 1.3: fans die here too. fans_stopAll() is lock-free register writes with no
+// FreeRTOS API, so it is safe on this path, and it drives the pins low in
+// MICROSECONDS -- comfortably better than the "within one frame period" the guide
+// asks for. handleLine() still runs the full stopMotor() when control drains it.
+static void commsEmergencyStop(void) { motor.target = 0.0f; fans_stopAll(); }
 
 // Called from safetyTask (prio 2). Takes the I2C mutex around the transaction ONLY.
 // Longer timeout than the control path (5 ms): safety is not deadline-critical and
@@ -452,6 +465,16 @@ void printGains() {
   printBoth("comms: rx bytes=" + String(commands_rxBytes())
             + "  drops=" + String(commands_drops())
             + "  stack free (words): " + String(commands_stackFreeWords()));
+  // Translation 1.2. The health signature is overruns=0 with frames climbing at
+  // ~500/s: together they say every DSHOT frame drained well inside its 2 ms slot.
+  printBoth(String("fans: ") + (fans_killed() ? "KILLED" : (fans_armed() ? "armed" : "arming"))
+            + "  frames=" + String(fans_frames())
+            + "  overruns=" + String(fans_overruns())
+            + "  rejects=" + String(fans_rejects())
+            + "  cap=" + String(FAN_THROTTLE_MAX, 0) + "%"
+            + "  stack free (words): " + String(fans_stackFreeWords()));
+  printBoth("fans pct: " + String(fans_pct(1), 1) + " / " + String(fans_pct(2), 1)
+            + " / " + String(fans_pct(3), 1) + " / " + String(fans_pct(4), 1));
   {
     float mnV, mxV, mxA; uint32_t pf;
     if (safety_powerStats(&mnV, &mxV, &mxA, &pf))
@@ -918,7 +941,11 @@ void handleLine(String s) {
     }
     case 'R':
       controllerEnabled = true; ctrlMode = CTRL_IDLE;
-      printBoth("controller re-enabled (IDLE)");
+      // Phase 1.3: undo the hard kill. Re-runs the hardware init (AF mode + MOE) and
+      // makes fanTask repeat its ~1 s zero ramp before it will accept throttle again.
+      // No-op if the fans were not killed. Watch for "fans: armed" before commanding.
+      fans_rearm();
+      printBoth("controller re-enabled (IDLE); fans re-arming (~1 s)");
       break;
     default:
       // Unrecognised input stops the motor rather than being ignored.
@@ -1173,6 +1200,23 @@ void setup() {
   // Phase 6: commsTask (prio 2) becomes the SOLE serial READER. Created before the
   // control task; harmless if bytes arrive early, they just queue.
   commands_init(Serial, hc05Serial, commsEmergencyStop);
+
+  // Phase 1.2 (translation): fanTask (prio 2) becomes the SOLE fan writer. Touches
+  // only TIM1 + DMA2_S5 + PA8..PA11 -- nothing SimpleFOC, the encoder or I2C owns.
+  // All four channels start at DSHOT 0 and the task spends its first ~1 s sending
+  // zero frames to arm the ESC before it will accept any throttle at all.
+  fans_init();
+
+  // Phase 1.3: fans into EVERY fault path, ahead of the wheel. faults_halt() calls
+  // this after masking interrupts and before pulling the DRV8313 enable low, so
+  // assert / stack-overflow / malloc-fail / heartbeat / wheel-sat all kill the props
+  // first. fans_stopAll() takes no lock and calls no FreeRTOS API, which is exactly
+  // the contract that path requires.
+  faults_setHwKillHook(fans_stopAll);
+
+  // Phase 1.3: safetyTask watches fanTask for a stall. Not a hazard (ESCs disarm when
+  // frames stop) but it IS a silent loss of translation authority, so it gets caught.
+  safety_setFanMonitor(fans_frames, fans_armedAndLive);
 
   configASSERT(xTaskCreate(controlTask, "ctrl", 768, NULL, 3, &hControl) == pdPASS);
   vTaskSetThreadLocalStoragePointer(hControl, 0, (void*)(uintptr_t)TRACE_ID_CTRL);

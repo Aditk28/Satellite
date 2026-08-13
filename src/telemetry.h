@@ -44,6 +44,14 @@ void telem_activate();
 // Queue a line. Direct-writes before activation. Never blocks; drops + counts if full.
 void telem_print(const String& s);
 
+// True once telemTask owns the ports. Before activation telem_print() writes the
+// port DIRECTLY FROM THE CALLING TASK, which is only safe while exactly one task is
+// producing output -- during boot that is the control task running hwSetup(). Any
+// OTHER task that wants to print during boot must gate on this, or it becomes a
+// second concurrent writer into a non-reentrant driver (invariant B15 / Trap 17).
+// fanTask defers its "armed" message this way.
+bool telem_isActive();
+
 // Run fn() on telemTask (which owns the ports). Never blocks; drops + counts if full.
 void telem_run(void (*fn)());
 

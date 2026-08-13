@@ -54,6 +54,7 @@ void telem_init(Print& usb, Print& bt) {
 }
 
 void telem_activate() { s_active = true; }
+bool telem_isActive() { return s_active; }
 
 void telem_print(const String& s) {
   // Boot path: telemTask can't drain until the control loop yields, so write

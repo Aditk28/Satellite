@@ -66,6 +66,24 @@ void safety_setPowerMonitor(bool (*readPower)(float* busV, float* mA));
    force a reset. */
 void safety_setPowerLimits(float minBusV, float maxMilliAmps);
 
+/* Phase 1.3 (translation) — fanTask liveness.
+     fanFrames  : monotonic DSHOT frame counter (fans_frames()).
+     fanRunning : true only while fans SHOULD be sending (armed and not hard-killed).
+
+   A wedged fanTask is not itself a hazard -- ESCs disarm when frames stop, so the
+   fans stop by themselves, which is the protocol giving us a fail-safe for free.
+   But silently losing translation authority mid-manoeuvre IS a control failure, so
+   it gets detected and reported. Response is the RECOVERABLE stop, not
+   faults_safeStop: the dangerous thing has already stopped itself, so latching the
+   board into a blink-forever loop would be disproportionate.
+
+   Measured in WALL-CLOCK time, never in iterations -- same reasoning as the control
+   heartbeat (Trap 20): if this task is ever starved, vTaskDelayUntil returns
+   immediately once per missed period and N "consecutive" checks span microseconds.
+   Latched so it fires once per excursion rather than 20x/second.
+   Pass NULL for either to disable. */
+void safety_setFanMonitor(uint32_t (*fanFrames)(void), bool (*fanRunning)(void));
+
 /* Diagnostics for G. */
 uint32_t safety_checks(void);      /* safety task iterations completed */
 uint32_t safety_stackFreeWords(void);
