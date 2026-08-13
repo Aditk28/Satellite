@@ -25,8 +25,15 @@ Never propose a solution that requires a scope.
 
 ## Current position
 
-**Phase 0 (safety hardening) is COMPLETE WITH ONE DELIBERATE EXCEPTION (2026-08-13).
-Phase 1 (fans into the RTOS, DSHOT via TIM1 + DMA) is NEXT.**
+**Phase 0 COMPLETE with one deliberate exception (below). Phase 1 IN PROGRESS —
+Step 1.1 PASSED 2026-08-13, Step 1.2 (`fans.*` + `fanTask`) is NEXT.**
+
+**Step 1.1 result in one line:** DSHOT300 via TIM1 + DMA burst is proven on hardware in
+the standalone `fandma` sketch — all four channels spin, 22,278 frames with 0 overruns,
+every register verified against the arithmetic. **Hardware is done for Phase 1:** fan
+ch4 moved A0 → CN10-14 (PA11); ch1–3 unchanged because D7/D8/D2 *are* PA8/PA9/PA10.
+Step 1.2 ports it into `fans.*` + `fanTask` inside `rtos_main.cpp`, where the deferred
+gate (`M`: FOC tick 238–261 µs, ctrl period MAX ≈ 5006 µs) finally gets run.
 
 **⚠️ The exception: prop guards were SKIPPED by user decision (B7). The props are and
 will remain EXPOSED.** Everything else in Phase 0 is done — wires are routed clear of
@@ -51,7 +58,7 @@ Everything upstream is DONE and verified on hardware:
 |---|---|
 | **Fan guards** | ⚠️ **SKIPPED — props are EXPOSED and will stay that way** (B7). Mitigated in firmware, not mechanically. |
 | Wire management | ✅ done 2026-08-13 — wires separated from all four prop discs |
-| Fans in the RTOS firmware | not started — currently only a standalone bit-bang test sketch |
+| Fans in the RTOS firmware | **in progress** — TIM1+DMA driver proven standalone (`fandma`, Step 1.1 ✅); not yet ported into `rtos_main.cpp` (Step 1.2) |
 | Pi ↔ STM32 link | **no wire run yet** — Pi is powered and the camera is connected, but UART is unrun (decision made: wired UART, see B1). Deferred to Phase 3 / when needed. |
 | AprilTag detection | not started |
 | Translation plant ID | not started |
@@ -145,13 +152,25 @@ These are in addition to `RTOS_migration.md`'s list, which all still applies.
 7. **Fuse and wire are sized for low throttle.** 18 AWG → 15 A fuse maximum, 10 A
    fitted. Prop current goes as throttle³ (~1.5 A per motor at 50%, ~5 A at 75%),
    so four fans at high throttle will blow it. Raise wire gauge before fuse rating.
+8. **The DSHOT beep command (cmd 1, the `B` key) does not work on this ESC and never
+   has** — no chirp, on the bit-bang path or the DMA path. Not investigated, and it
+   does not need to be: the beep was only ever a *proxy* for "is the ESC decoding our
+   frames," and motors spinning on command proves that far more strongly. **Do not
+   spend time debugging `B`.** If you ever want a spin-free decode check, use a
+   throttle value below the commutation floor rather than the beacon commands.
+9. **Arduino header vs morpho pins are the SAME NET, not two nets shorted.** `D7`/`D8`/
+   `D2` *are* `PA8`/`PA9`/`PA10` — one MCU pin brought out at two connector positions.
+   Only `PA11` is morpho-exclusive (CN10-14), which is why ch4 needed a female–female
+   Dupont coupler while ch1–3 needed nothing at all. **CN10-14's neighbours in the odd
+   column are PA6 and PA7 — two motor PWM phases.** Miscount by one row and the ESC
+   signal lands on the motor driver.
 
 ## Status checklist
 
 | Phase | State | One-line result |
 |---|---|---|
 | **0 safety hardening** | ✅ **(2026-08-13)** | Wires cleared, fuse/wiring confirmed, battery disconnect = e-stop. **Prop guards deliberately skipped (B7)** — mitigations moved into Phase 1. |
-| 1 fans into the RTOS (DSHOT + DMA) | ⬜ **NEXT** | — |
+| 1 fans into the RTOS (DSHOT + DMA) | 🟡 **IN PROGRESS** | **1.1 ✅ (2026-08-13)** — TIM1+DMA burst proven standalone (`fandma`), all 4 channels spin, 22k frames / 0 overruns, ch4 moved to PA11. **1.2 next.** |
 | 2 translation plant ID | ⬜ | — |
 | 3 Pi ↔ STM32 wired link | ⬜ | — |
 | 4 vision: AprilTag pose on the Pi | ⬜ | — |
@@ -496,9 +515,16 @@ DMA stream can drive all four fans from a single interleaved buffer. That is the
 target design.
 
 **⚠️ Pin consequence.** TIM1_CH1–CH4 are **PA8, PA9, PA10, PA11**. Channels 1–3
-already match. **Channel 4 must move from PA0 to PA11** (CN10 pin 14, morpho — male
-header, so it needs a female jumper or a solder joint). PA0 cannot be used because
-its timers (TIM2_CH1, TIM5_CH1) are the motor PWM and the µs timebase.
+already match. **Channel 4 must move from PA0 to PA11 = CN10 pin 14** on the ST morpho
+header. The morpho headers are **male pins**, so this needs a *female* Dupont end —
+no soldering. (Worth stating only because the Arduino headers CN5/6/8/9 are female
+sockets, so the lead currently plugged into A0 has the wrong gender on it.)
+
+**PA11 is forced, not preferred.** TIM1_CH4 maps only to PA11 and PE14, and the F446RE
+is LQFP64 — there is no GPIOE. Every other GPIOA pin with a usable timer is taken:
+PA0/PA1 → TIM2_CH1/TIM5_CH1 (motor PWM + µs timebase), PA2/PA3 → ST-LINK VCP and
+TIM9 (the FOC tick), PA5/PA6/PA7 → motor PWM, PA15 → TIM2_CH1. PA11 is the only pin
+that satisfies "one timer *and* one GPIO port" at the same time.
 
 **Trap 1 — do not lose the same-port lesson.** Critical fact #2 exists because
 splitting channels across ports broke everything. With TIM1 CH1–4 all four are on
@@ -517,7 +543,51 @@ This exact blind spot cost hours during fan bring-up.
 - Register dump shows the arithmetic above.
 - Each channel spins its motor at 10% via the new path.
 - **`M` shows FOC tick dt still 238–261 µs and `ctrl period` MAX ≈ 5006 µs.** This
-  is the gate: fans must cost the control loop nothing.
+  is the gate: fans must cost the control loop nothing. **→ deferred to Step 1.2 by
+  B8** — it is an RTOS measurement and cannot be taken from the standalone sketch.
+
+**Result (2026-08-13) — PASSED.** Built as `src/fan_dma_test.cpp`, env `fandma`
+(standalone, raw CMSIS, no FreeRTOS/SimpleFOC — decision B8). Hardware change was
+exactly one wire: fan ch4 signal A0/PA0 → **CN10 pin 14 = PA11**, via a female–female
+Dupont as a coupler since PA11 appears on no Arduino header. ch1–3 needed nothing —
+D7/D8/D2 *are* PA8/PA9/PA10, the same MCU nets brought out at two connector positions.
+
+**All four channels spin under the DMA path.** Register dump verified end to end:
+
+```
+TIM1 clock 180000000 Hz   PSC=0 ARR=599 -> bit 3.3333 us (300 kHz)
+CR1  =0x85     CEN + URS + ARPE
+CCMR1=CCMR2=0x6868        PWM mode 1 + preload, all four channels
+CCER =0x1111   CCxE set, CCxNE CLEAR  <- complementary outputs stay off the
+                                          motor phases and the encoder bus
+BDTR =0x8000   MOE=1
+DCR  =0x30d    DBA=13 (CCR1), DBL=4 transfers
+DIER =0x100    UDE
+AFRH =0x1111   PA8..PA11 on AF1;  MODER[23:16]=0xAA
+DMA2_S5 CR=0x0C025440  CHSEL=6  DIR=1  MINC=1  PSIZE=MSIZE=2 (32-bit)
+        PAR=0x4001004C = TIM1_BASE+0x4C = DMAR   M0AR=0x20000470 (SRAM)
+        EN=0  NDTR=0   <- previous frame fully drained
+frames=22278  overruns=0
+```
+
+**The health signature to re-check after any change here:** `EN=0` with `NDTR=0` at
+rest, and `overruns` pinned at 0. Together they say every frame drained well inside the
+2 ms period. `overruns` incrementing would mean the timer has stopped or the DMA is
+being re-armed before it finishes.
+
+**Known non-working, deliberately not chased: the `B` beep command (DSHOT cmd 1)
+produces no chirp.** It never worked, on the bit-bang path either, so it is not a
+regression and not a DMA problem. Not investigated — and it does not need to be,
+because the beep was only ever a *proxy* for "is the ESC decoding our frames," and four
+motors spinning on command answers that far more strongly than a chirp would.
+**Do not spend time on `B` in a future session.**
+
+**One bug found and fixed in the dump itself** (not the driver): the bit-rate line
+printed `1e6f/bit_us` with `bit_us` in microseconds, yielding Hz under a `kHz` label —
+it read `300000.0 kHz`. Timing was always correct; the label was not. Fixed to
+`1e3f/bit_us`. Worth noting because this dump is the *instrument* for the rest of
+Phase 1 (Trap T6 — a meter cannot verify pulse width), and a mislabelled instrument is
+how a future session gets misled.
 
 ## Step 1.2 — `fans.*` module and `fanTask`
 
@@ -1072,7 +1142,8 @@ invariants, `delay()`, watchdogs measuring iterations instead of time, and the r
 | **B5** | **Fan ch4 moves PA0 → PA11 for the DMA rewrite** | TIM1_CH1–CH4 are PA8/9/10/11: one timer, one DMA stream, all on GPIOA — which satisfies the same-port constraint (T2) by construction. PA0's timers (TIM2/TIM5) are the motor PWM and µs timebase. |
 | **B6** | **Rotation retune folded into Phase 2** | The user chose to skip a separate rotation retune. Phase 2 must re-identify mass and friction for translation regardless, so rotation constants come along for free. Known open items meanwhile: passive desaturation incomplete, `A_FRICTION` never swept. |
 | **B7** | **Prop guards skipped — props stay exposed; safety moved into firmware** | 2026-08-13, user decision. Build time for guards/ducts/a bumper ring was not available, and the alternative was blocking all translation work indefinitely on a fabrication task. Risk flagged once and accepted: four unguarded 4-inch 3-blade props at hand height on a chassis that gets picked up by hand. **The tradeoff is explicit — mechanical containment is replaced by removing the reasons to touch an armed platform:** (1) `FAN_THROTTLE_MAX` compiled in at 30% for bring-up, clamped inside `fans_setThrottle()` so a runaway control law cannot exceed it either; (2) props physically off for any test that does not need thrust — DSHOT/DMA/register verification and all fault-path provocation; (3) battery disconnect is the e-stop, serial `X` is the convenience; (4) `fans_stopAll()` drives pins low as GPIO in the hardware-kill step, never via the already-dead DMA path. Items 1–4 are **binding requirements on Phase 1**, not advice. Cost also noted honestly: a duct would have slightly *increased* static thrust by cutting tip losses, so this trades a small thrust margin away as well. Revisit only if the platform starts being handled by people other than the user. |
-| **B8** | *(next decision goes here)* | |
+| **B8** | **Step 1.1 split: prove TIM1+DMA standalone (`fan_dma_test.cpp`, env `fandma`) before integrating** | 2026-08-13. The guide's Step 1.1 Verify mixes a driver question ("each channel spins via the new path") with an RTOS question ("`M` shows FOC tick still 238–261 µs"). Split them: 1.1 proves the driver alone, 1.2 integrates into `fans.*`/`fanTask` and runs the `M` gate there. Reasoning: `fan_test.cpp` is the confirmed-good bit-bang reference and the verbatim rule says don't edit it, so the DMA path needs its own file regardless. More importantly a new DMA driver has ~6 independently-configurable register blocks (GPIO AF, TIM timebase, CCMRx/CCER, BDTR/MOE, DCR burst window, DMA2_S5) and **every one of them fails identically — the pin doesn't move.** Bisecting that with the wheel, FOC, telemetry and five tasks in the picture is strictly harder than bisecting it alone, and the same board can then A/B bit-bang vs DMA by changing `-e`. Cost: one throwaway file + one env. Accepted downside: the FOC-noninterference gate defers to 1.2 — acceptable because it is inherently an RTOS measurement that cannot be taken standalone. Also decided: **no DMA interrupt at all** — the frame is re-armed by polling `DMA_SxCR.EN`, which sidesteps the STM32duino strong-`IRQHandler` collision trap (Appendix A #2 / RTOS trap 13b) rather than working around it. |
+| **B9** | *(next decision goes here)* | |
 
 ---
 
