@@ -1,5 +1,6 @@
 #include "fans.h"
 #include "telemetry.h"
+#include "timebase.h"      /* us_now() -- real elapsed time, not tick granularity */
 #include <STM32FreeRTOS.h>
 #include <task.h>
 
@@ -64,7 +65,16 @@ static volatile uint32_t s_frames    = 0;
 static volatile uint32_t s_overruns  = 0;
 static volatile uint32_t s_rejects   = 0;
 static uint32_t          s_stuck     = 0;   /* consecutive in-flight skips */
+static volatile uint32_t s_skips       = 0; /* benign: emitted inside the last frame */
+static          uint32_t s_lastFrameUs = 0; /* TIM5 us stamp of the last emission */
+/* Step 1.4 overrun diagnostic -- see the comment in dshotSendFrame(). */
+static volatile uint32_t s_stuckNDTR    = 0;
+static volatile uint32_t s_stuckNDTRmin = 0xFFFFFFFF;
+static volatile uint32_t s_stuckNDTRmax = 0;
+static volatile uint32_t s_stuckCEN     = 0;
 static volatile bool     s_announce  = false; /* arming message owed to telemTask */
+static volatile uint32_t s_lastCmdMs = 0;     /* last throttle request, ms (dead-man) */
+static volatile bool     s_timedOut  = false; /* timeout message owed to telemTask */
 
 /* ---- build a DSHOT frame (value + telemetry bit + CRC) ---------------------
    VERBATIM from fan_dma_test.cpp, itself verbatim from fan_test.cpp.          */
@@ -180,6 +190,22 @@ static void dshotHwInit(void) {
    deliberately: this is the version with 22k proven frames behind it, and the
    cost is a handful of register writes every 2 ms.                            */
 static void dshotSendFrame(void) {
+  /* ---- expected case: emitted too soon after the last one -------------------
+     vTaskDelayUntil schedules from the WAKE time, but the frame goes out when the
+     task gets the CPU, and those differ by up to a tick (see FAN_FRAME_MS). So two
+     emissions can land tens of microseconds apart even though the schedule is a
+     correct 3 ms. That is normal and benign -- a skipped frame simply means the ESC
+     gets the next one a few ms later -- so it is counted as a SKIP, not a fault.
+
+     Gated on the TIM5 microsecond timebase deliberately. The original version used
+     tick arithmetic, which cannot see a 50 us reality at 1 ms granularity, and that
+     blind spot is exactly what made this look like an unexplained "overrun". */
+  uint32_t now = us_now();
+  if (s_lastFrameUs && (uint32_t)(now - s_lastFrameUs) < FRAME_MIN_GAP_US) {
+    s_skips++;
+    return;
+  }
+
   /* Previous frame still in flight? SKIP this one and let it finish.
      A frame needs ~60 us of timer time to drain, so this can only happen if we were
      called back-to-back -- and the original code's response (abort the transfer and
@@ -192,6 +218,17 @@ static void dshotSendFrame(void) {
      timer is not advancing the DMA at all (CEN cleared, clock gated, ARR clobbered),
      and skipping forever would wedge the fans silently. Force a full restart instead. */
   if (DMA2_Stream5->CR & DMA_SxCR_EN) {
+    /* Reaching here means >= FRAME_MIN_GAP_US has genuinely elapsed and the transfer
+       STILL has not drained -- a 60 us frame that has had 100+ us. That is a real
+       anomaly (timer stopped, clock gated, ARR clobbered), unlike the benign skip
+       above, and this counter should sit at 0. NDTR + CEN are kept because they are
+       what discriminated the benign case from a real one in the first place:
+         NDTR small, CEN=1 -> frame merely still clocking (now handled by the skip)
+         NDTR large, CEN=0 -> timer genuinely not advancing the DMA */
+    s_stuckNDTR = DMA2_Stream5->NDTR;
+    s_stuckCEN  = (TIM1->CR1 & TIM_CR1_CEN) ? 1 : 0;
+    if (s_stuckNDTR > s_stuckNDTRmax) s_stuckNDTRmax = s_stuckNDTR;
+    if (s_stuckNDTR < s_stuckNDTRmin) s_stuckNDTRmin = s_stuckNDTR;
     s_overruns++;
     if (++s_stuck < 4) return;
     DMA2_Stream5->CR &= ~DMA_SxCR_EN;
@@ -216,6 +253,7 @@ static void dshotSendFrame(void) {
   TIM1->CNT  = 0;
   TIM1->CR1 |= TIM_CR1_CEN;
 
+  s_lastFrameUs = now;
   s_frames++;
 }
 
@@ -279,6 +317,24 @@ static void fanTask(void*) {
                   + String(FAN_THROTTLE_MAX, 0) + "%)");
     }
 
+    /* Dead-man timeout (see FAN_CMD_TIMEOUT_MS in fans.h). Only meaningful while
+       something is actually spinning: if all four are already zero there is nothing
+       to time out, and we must not spam. */
+    bool spinning = false;
+    for (int ch = 1; ch <= 4; ch++) if (s_req[ch] > 48) spinning = true;
+    if (spinning &&
+        (uint32_t)(xTaskGetTickCount() - s_lastCmdMs) > pdMS_TO_TICKS(FAN_CMD_TIMEOUT_MS)) {
+      taskENTER_CRITICAL();
+      for (int ch = 1; ch <= 4; ch++) { s_req[ch] = 0; s_pct[ch] = 0.0f; }
+      taskEXIT_CRITICAL();
+      s_timedOut = true;
+    }
+    if (s_timedOut && telem_isActive()) {
+      s_timedOut = false;
+      telem_print("fans: TIMEOUT -- no throttle command for "
+                  + String(FAN_CMD_TIMEOUT_MS / 1000) + " s, all channels zeroed");
+    }
+
     /* Snapshot the request set atomically. taskENTER_CRITICAL writes BASEPRI =
        configMAX_SYSCALL_INTERRUPT_PRIORITY (5<<4 = 0x50), which masks every
        exception at priority value >= 0x50 -- including TIM9 at exactly 5, so the
@@ -321,6 +377,7 @@ void fans_setThrottle(int ch, float pct) {
 
   s_pct[ch] = pct;
   s_req[ch] = pctToDshot(pct);
+  s_lastCmdMs = xTaskGetTickCount();      /* pet the dead-man */
 }
 
 void fans_setAll(float f1, float f2, float f3, float f4) {
@@ -339,6 +396,7 @@ void fans_setAll(float f1, float f2, float f3, float f4) {
   taskENTER_CRITICAL();
   for (int ch = 1; ch <= 4; ch++) { s_pct[ch] = pc[ch]; s_req[ch] = out[ch]; }
   taskEXIT_CRITICAL();
+  s_lastCmdMs = xTaskGetTickCount();      /* pet the dead-man */
 }
 
 void fans_stopAll(void) {
@@ -380,8 +438,17 @@ bool     fans_armed(void)     { return s_armed; }
 bool     fans_killed(void)    { return s_killed; }
 uint32_t fans_frames(void)    { return s_frames; }
 uint32_t fans_overruns(void)  { return s_overruns; }
+uint32_t fans_skips(void)     { return s_skips; }
 uint32_t fans_rejects(void)   { return s_rejects; }
 float    fans_pct(int ch)     { return (ch >= 1 && ch <= 4) ? s_pct[ch] : 0.0f; }
+
+void fans_overrunDetail(uint32_t* lastNDTR, uint32_t* minNDTR, uint32_t* maxNDTR,
+                        uint32_t* cenWasSet) {
+  if (lastNDTR)  *lastNDTR  = s_stuckNDTR;
+  if (minNDTR)   *minNDTR   = (s_stuckNDTRmin == 0xFFFFFFFF) ? 0 : s_stuckNDTRmin;
+  if (maxNDTR)   *maxNDTR   = s_stuckNDTRmax;
+  if (cenWasSet) *cenWasSet = s_stuckCEN;
+}
 
 uint32_t fans_stackFreeWords(void) {
   return s_task ? (uint32_t)uxTaskGetStackHighWaterMark(s_task) : 0;

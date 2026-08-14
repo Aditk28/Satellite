@@ -48,9 +48,21 @@ under DSHOT300; Pi 3B+ mounted, powered, camera connected (UART link to the STM3
 
 run yet — Phase 3). **Phase 0 (safety hardening) COMPLETE 2026-08-13** with prop guards
 
-deliberately skipped (decision B7) and their mitigations pushed into Phase 1. **Active
+deliberately skipped (decision B7) and their mitigations pushed into Phase 1.
 
-work: `TRANSLATION_DOCKING.md` Phase 1 — fans into the RTOS via TIM1 + DMA.**
+**Phase 1 COMPLETE 2026-08-13, tag `trans-p1-fans`** — fans are in the RTOS firmware:
+
+DSHOT300 on TIM1 + DMA burst, `fanTask` prio 2 = sole fan writer, fans killed ahead of
+
+the wheel in every fault path, `S<n>`/`L<pct>` manual commands, 30% compiled ceiling and
+
+a 10 s dead-man auto-zero. Control loop unaffected (ctrl period 4999/5000/5001 µs).
+
+**Active work: `TRANSLATION_DOCKING.md` Phase 2 — translation plant identification**
+
+(thrust curve, breakaway force, effective mass, yaw coupling). This is also where the
+
+rotation constants get re-identified (B6).
 
 Two known-open rotation items, deliberately deferred into that guide's Phase 2:
 
@@ -152,13 +164,31 @@ attribute it to FreeRTOS.
 
 | Raspberry Pi 3B+ (1 GB) | AprilTag vision | mounted; link = wired UART (USART6) |
 
-**Fan DSHOT pins — all must stay on ONE GPIO port:** ch1 PA8/D7, ch2 PA9/D8,
+**Fan DSHOT pins — all on GPIOA and all on TIM1:** ch1 **PA8**/D7 (TIM1_CH1), ch2
 
-ch3 PA10/D2, ch4 **PA0/A0** (NOT D9/PC7). Splitting across ports broke every
+**PA9**/D8 (CH2), ch3 **PA10**/D2 (CH3), ch4 **PA11 = CN10 pin 14** (CH4). Splitting
 
-channel, repeatedly. Currently bit-banged in `fan_test.cpp` only; the RTOS
+across GPIO ports broke every channel, repeatedly; TIM1_CH1–CH4 satisfy one-timer,
 
-version moves to TIM1+DMA and ch4 to PA11.
+one-port by construction. **ch4 moved from PA0 to PA11 in Phase 1** — PA11 is on no
+
+Arduino header, so it needs a female Dupont (or an F–F jumper as a coupler onto the
+
+male morpho pin). Its neighbours at CN10-13/15 are PA6/PA7, two motor PWM phases —
+
+miscount a row and the ESC signal lands on the motor driver.
+
+Driven by `fanTask` via **TIM1 + DMA2 Stream 5 Channel 6 (TIM1_UP) burst mode**: `DBA`
+
+points at CCR1, `DBL`=4, so one update event per DSHOT bit moves four words into
+
+CCR1–CCR4. No DMA interrupt — the frame is re-armed by polling `DMA_SxCR.EN`, which
+
+avoids the STM32duino strong-`IRQHandler` collision entirely. The old bit-bang survives
+
+only in `fan_test.cpp` (env `fantest`); it masks interrupts ~53 µs per frame and must
+
+never enter the RTOS build.
 
 **Planned Pi link:** USART6, PC6 (TX) / PC7 (RX) / GND. 3.3 V both sides.
 

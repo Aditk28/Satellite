@@ -807,9 +807,15 @@ ported **verbatim** — the migration changed structure, not behaviour.
 |---|---|---|---|
 | `focTask` | 4 | 250 µs (4 kHz) | `loopFOC()` + `move()` — commutation only |
 | `controlTask` | 3 | 5 ms (200 Hz) | gyro read, control law, capture buffer, command execution |
-| `safetyTask` | 2 | 50 ms (20 Hz) | independent watchdog: wheel overspeed, heartbeat, INA219 power |
+| `safetyTask` | 2 | 50 ms (20 Hz) | independent watchdog: wheel overspeed, heartbeat, INA219 power, fanTask stall |
 | `commsTask` | 2 | 2 ms poll | serial RX + line assembly — **sole reader** |
+| `fanTask` | 2 | 3 ms (333 Hz) | DSHOT300 on TIM1 + DMA burst — **sole fan writer** |
 | `telemTask` | 1 | event | **all** serial output — **sole writer** |
+
+`fanTask` was added by `TRANSLATION_DOCKING.md` Phase 1 (tag `trans-p1-fans`). It cost
+the control loop nothing — measured ctrl period 4999 / 5000 / 5001 µs afterwards, at or
+better than the pre-fan baseline — because it sits below control and FOC and shares no
+mutex, bus or port with them.
 
 One TIM9 interrupt at 4 kHz notifies `focTask` every tick and `controlTask` every 20th
 (`CTRL_DIVISOR`), so control is phase-locked to commutation with no drift between clocks.
@@ -859,6 +865,14 @@ gyro read; it now runs at a flat 4 kHz straight through it.
 | `U` | System report: per-task CPU % and stack high-water marks |
 | `E` | Encoder diagnostic — motor off, stream shaft angle/velocity to hand-turn the wheel |
 | `V<V>` | Manual constant-voltage drive + unlimited encoder stream; any key stops |
+| `S<n>` | **Fans:** select channel 1–4, or `S0` for all four |
+| `L<pct>` | **Fans:** throttle the selection. `L0` = off but still armed. Clamped to `FAN_THROTTLE_MAX` = 30%, and auto-zeroes after 10 s with no refresh |
+
+**Fan safety.** `X` and every fault path hard-kill the fans **before** the wheel — the
+props are unguarded by choice (`TRANSLATION_DOCKING.md` B7), so they are the larger
+hazard. A hard kill drives PA8–PA11 low as GPIO rather than trusting the DMA path, and
+latches; `R` re-arms (~1 s). The 30% ceiling is applied inside `fans_setThrottle()`, so
+a runaway control law is bound by it too.
 
 **Any unrecognised input stops the motor.** Deliberate — a confused operator
 should not leave a flywheel spinning.

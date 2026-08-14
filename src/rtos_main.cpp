@@ -467,14 +467,24 @@ void printGains() {
             + "  stack free (words): " + String(commands_stackFreeWords()));
   // Translation 1.2. The health signature is overruns=0 with frames climbing at
   // ~500/s: together they say every DSHOT frame drained well inside its 2 ms slot.
+  // skips = benign (frame emitted inside the previous one's 60 us, release jitter);
+  // overruns = REAL anomaly, should be 0. See fans.h for why they are separate.
   printBoth(String("fans: ") + (fans_killed() ? "KILLED" : (fans_armed() ? "armed" : "arming"))
             + "  frames=" + String(fans_frames())
+            + "  skips=" + String(fans_skips())
             + "  overruns=" + String(fans_overruns())
             + "  rejects=" + String(fans_rejects())
             + "  cap=" + String(FAN_THROTTLE_MAX, 0) + "%"
             + "  stack free (words): " + String(fans_stackFreeWords()));
   printBoth("fans pct: " + String(fans_pct(1), 1) + " / " + String(fans_pct(2), 1)
             + " / " + String(fans_pct(3), 1) + " / " + String(fans_pct(4), 1));
+  if (fans_overruns()) {
+    uint32_t nl, nmin, nmax, cen;
+    fans_overrunDetail(&nl, &nmin, &nmax, &cen);
+    // NDTR of 72 = nothing transferred; small (1-3) = frame ended short (desync).
+    printBoth("fan overrun detail: NDTR last=" + String(nl) + " min=" + String(nmin)
+              + " max=" + String(nmax) + " (of 72)  TIM1 CEN was " + String(cen));
+  }
   {
     float mnV, mxV, mxA; uint32_t pf;
     if (safety_powerStats(&mnV, &mxV, &mxA, &pf))
@@ -778,6 +788,9 @@ void controlUpdate(float dt) {
 }
 
 // =====================================================================
+// Translation 1.4: which fan the L command drives. 0 = all four, 1-4 = one channel.
+static int fanSel = 0;
+
 void handleLine(String s) {
   s.trim();
   if (s.length() == 0) return;
@@ -880,6 +893,37 @@ void handleLine(String s) {
       telem_run(printSystemReport);
       break;
     case 'X': stopMotor("operator"); break;
+    // ---- Translation 1.4: manual fan commands --------------------------------
+    // Raw throttle only. A true thrust-VECTOR command is deferred to Phase 6.3:
+    // converting force to throttle needs the square-law inversion
+    // throttle = sqrt(F/F_max), and F_max comes from the Phase 2.1 thrust curve,
+    // which does not exist yet. Raw throttle is what Phase 2 needs to MEASURE it.
+    case 'S': {
+      int n = (int)v;
+      if (n < 0 || n > 4) { printBoth("fan select must be 0 (all) or 1-4"); break; }
+      fanSel = n;
+      printBoth("fan select: " + String(n == 0 ? "ALL" : String(n)));
+      break;
+    }
+    case 'L': {
+      if (fans_killed()) {
+        printBoth("fans are KILLED -- send R to re-arm first");
+        break;
+      }
+      if (!fans_armed()) {
+        printBoth("fans still arming (~1 s from boot) -- wait for 'fans: armed'");
+        break;
+      }
+      if (fanSel == 0) fans_setAll(v, v, v, v);      // one frame, all four
+      else             fans_setThrottle(fanSel, v);
+      // Report what was ACTUALLY applied, not what was asked for -- the clamp to
+      // FAN_THROTTLE_MAX lives in the setter, so echoing v would hide it.
+      printBoth("fans -> " + String(fans_pct(1), 1) + " / " + String(fans_pct(2), 1)
+                + " / " + String(fans_pct(3), 1) + " / " + String(fans_pct(4), 1)
+                + " %   (cap " + String(FAN_THROTTLE_MAX, 0) + "%, auto-zero after "
+                + String(FAN_CMD_TIMEOUT_MS / 1000) + " s idle)");
+      break;
+    }
     case 'E': {
       // Encoder diagnostic. Motor OFF (zero torque) so the wheel hand-turns
       // safely. Reads the CACHED angle/velocity focTask refreshes every 250us --
@@ -1061,6 +1105,9 @@ static void hwSetup() {
   printBoth("          G status | B rebias | M timing | M! reset timing | X stop | R resume");
   printBoth("          E encoder-diag (motor off) | V<volts> manual drive + encoder stream");
   printBoth("          U system report (per-task CPU % + stack high-water)");
+  printBoth("  FANS:   S<n> select fan (0=all, 1-4) | L<pct> throttle the selection");
+  printBoth("          L0 = fans off (stays armed).  X = hard kill, R = re-arm.");
+  printBoth("          PROPS OFF unless the test needs thrust -- guards are skipped.");
   printBoth("Start at K_theta=19.1 K_omega=14.0, then work down the gain table.");
   printBoth("Mode is IDLE -- send H0 or T<deg> to engage.");
 

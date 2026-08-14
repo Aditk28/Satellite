@@ -39,8 +39,39 @@
 */
 
 #define FAN_THROTTLE_MAX  30.0f   /* percent. Bring-up ceiling -- see B7.      */
-#define FAN_FRAME_MS      2       /* resend period; ESCs disarm if frames stop */
-#define FAN_ARM_FRAMES    500     /* ~1 s of DSHOT 0 before throttle is taken  */
+/* Resend period. 3 ms, not 2, and the extra millisecond is load-bearing.
+
+   vTaskDelayUntil schedules from the WAKE time, but a frame is emitted when the task
+   actually gets the CPU -- and those differ by up to a tick, because controlTask
+   (prio 3) holds the CPU ~2.4 ms of every 5 ms for its MPU read and commsTask shares
+   priority 2. At a 2 ms period a task released at tick N but running at N+0.95 emits,
+   then wakes at N+2 and emits again only ~50 us later -- inside the 60 us the previous
+   frame needs to clock out. Measured: NDTR 4..16 of 72 with CEN=1, i.e. the transfer
+   was 1-4 bursts from done. At 3 ms the same jitter leaves ~600 us of margin.
+
+   333 Hz is still an order of magnitude above anything the ESC needs; BLHeli_S/Bluejay
+   disarm on the order of 250 ms of silence. */
+#define FAN_FRAME_MS      3
+#define FAN_ARM_FRAMES    350     /* ~1 s of DSHOT 0 before throttle is taken  */
+
+/* A frame needs 18 bit periods = 60 us to clock out. Emitting another inside that
+   window would abort it, so we skip instead. Measured against the TIM5 microsecond
+   timebase, NOT tick arithmetic -- the whole bug this replaces was tick granularity
+   hiding a 50 us reality. 100 us gives margin over the 60 us frame. */
+#define FRAME_MIN_GAP_US  100
+
+/* Dead-man timeout on commanded throttle, milliseconds. If nothing calls
+   fans_setThrottle()/fans_setAll() for this long while a fan is spinning, fanTask
+   zeroes all four and says so.
+
+   WHY: with the props unguarded (B7) a fan left running because the operator got
+   distracted is precisely the hazard a guard would have covered. This is the cheapest
+   available substitute.
+
+   WHY IT COSTS NOTHING IN CLOSED LOOP: a controller calls fans_setAll() every cycle,
+   which refreshes the timer continuously. It can only fire on a MANUAL command that
+   nobody is tending -- which is exactly the case it exists for. */
+#define FAN_CMD_TIMEOUT_MS 10000
 
 /* Configure TIM1 + DMA2_Stream5 + PA8..PA11, and create fanTask (prio 2).
    Call ONCE, pre-scheduler, from setup(). Touches nothing SimpleFOC owns:
@@ -78,7 +109,24 @@ bool     fans_armedAndLive(void);
 bool     fans_armed(void);
 bool     fans_killed(void);
 uint32_t fans_frames(void);
-uint32_t fans_overruns(void);      /* DMA had not drained when the next frame came */
+/* Frames NOT emitted because the previous one was still clocking out. BENIGN and
+   expected: release jitter means two emissions can land microseconds apart even on a
+   correct schedule. A skipped frame just means the ESC gets the next one a few ms
+   later. Non-zero here is normal; watch the RATE, not the count. */
+uint32_t fans_skips(void);
+
+/* Transfers that had still not drained after FRAME_MIN_GAP_US had genuinely elapsed --
+   a 60 us frame given 100+ us. Unlike a skip this is a REAL anomaly (timer stopped,
+   clock gated, ARR clobbered). This one should be 0. */
+uint32_t fans_overruns(void);
 uint32_t fans_rejects(void);       /* throttle requests refused (not armed / killed) */
 uint32_t fans_stackFreeWords(void);
+
+/* Step 1.4 overrun diagnostic. NDTR observed at the moment a transfer was found
+   still in flight, which discriminates the two candidate causes: LARGE means the
+   timer was not advancing the DMA (fanTask preempted mid-frame), SMALL (1..3) means
+   frame desync from a stale update request. cenWasSet says whether TIM1 was even
+   running. Reported by G; delete once the cause is fixed and confirmed. */
+void fans_overrunDetail(uint32_t* lastNDTR, uint32_t* minNDTR, uint32_t* maxNDTR,
+                        uint32_t* cenWasSet);
 float    fans_pct(int ch);         /* last accepted request, percent */
