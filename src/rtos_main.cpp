@@ -202,6 +202,7 @@ static const float GYRO_SIGN   = -1.0f;    // aligns gyro with wheel convention
 
 // ------------------- control loop timing -------------------
 static stat_t st_foc, st_move, st_mpu, st_ina, st_law, st_telem, st_period;
+static stat_t st_adc;   // Phase 2: ESC current-sense ADC read, added to the 200 Hz path
 
 // ------------------- runtime-tunable gains -------------------
 // Start conservative (3.0 s row) and work down using P/D over serial --
@@ -323,6 +324,27 @@ float omega_w    = 0.0f;    // wheel rate, rad/s
 unsigned long wwRejects = 0;// count of rejected wheel-velocity glitches (see sense)
 float target     = 0.0f;    // commanded heading, rad
 float gyroBias   = 0.0f;    // dps, measured at startup
+
+// ---- Phase 2 (translation plant ID) ----------------------------------------
+// We identify the translational plant in ACCELERATION units, never force units:
+//     x_ddot = A(throttle) - A_c*sign(v)
+// Mass, thrust-in-grams and breakaway-in-grams all cancel and are never needed --
+// the same reasoning that let CONTROL_README work in A_1/A_2/A_FRICTION and never
+// pin down J_w or J_p (see its section 3). A(throttle) and A_c are both directly
+// measurable from the accelerometer that has been sitting unused on the I2C bus.
+#define ESC_CUR_PIN A4      // = PC1, the 4-in-1 ESC's current-sense pad
+float accelBiasX = 0.0f, accelBiasY = 0.0f;  // m/s^2, measured with the gyro bias
+float accel_x = 0.0f, accel_y = 0.0f;        // m/s^2, bias-removed, BODY frame
+uint16_t escCurRaw = 0;                      // ESC current sense, raw ADC counts
+// Declared up here rather than beside the rest of the thrust-step state because
+// stopMotor() -- which is defined well above it -- must be able to abort a run.
+static bool transActive = false;
+// Marks a capture as a plant-ID run. The post-capture transition in controlStep()
+// was written for heading steps and drops into CTRL_HOLD; for translation runs that
+// engaged the wheel AND started the HOLD telemetry stream, which kept telem_busy()
+// true so the NEXT capture was refused by the buffer-lifetime guard. Observed as
+// "after the first test it doesn't capture the rest" (2026-08-14).
+static bool capTranslation = false;
 float lastAlpha  = 0.0f;
 bool  stallHold = false;
 unsigned long stallStartMs = 0;
@@ -343,10 +365,21 @@ unsigned long lastTelemMs   = 0;
 unsigned long cap_t[MAX_CAP];
 float cap_target[MAX_CAP], cap_theta[MAX_CAP], cap_wp[MAX_CAP];
 float cap_ww[MAX_CAP], cap_alpha[MAX_CAP], cap_u[MAX_CAP];
+// Phase 2: three more columns on the SAME buffer rather than a second one.
+// +18 KB of the ~58 KB free, and it keeps one buffer, one dump and one CSV format.
+// Rotation captures get them too, which is free and occasionally informative.
+float cap_ax[MAX_CAP], cap_ay[MAX_CAP];
+uint16_t cap_cur[MAX_CAP];
 int   capN = 0;
 bool  capturing = false;
 unsigned long capStartMs = 0;
 #define CAPTURE_MS 6000
+// Phase 2: capture window and label are per-run now, because a translation capture
+// wants a different length and needs a different metadata line for the parser.
+uint32_t    capWindowMs  = CAPTURE_MS;
+const char* capModeName  = "heading_step";
+float       capThrottle  = 0.0f;   // recorded in the metadata line
+int         capFanSel    = 0;
 
 int stepCount = 0;
 
@@ -371,6 +404,7 @@ void stopMotor(const String &why) {
   // serial input now kills the fans too. That is the existing "a confused operator
   // should not leave a flywheel spinning" rule, and it applies harder to props.
   fans_stopAll();
+  transActive = false;          // Phase 2: X aborts a thrust step mid-sequence
   controllerEnabled = false;
   ctrlMode = CTRL_IDLE;
   capturing = false;
@@ -413,6 +447,7 @@ static bool safetyReadPower(float* busV, float* mA) {
 void measureGyroBias() {
   const int N = 200;
   float sum = 0.0f;
+  float sumAx = 0.0f, sumAy = 0.0f;   // Phase 2: accel bias, same at-rest window
   for (int i = 0; i < N; i++) {
     // Under the mutex: `B` re-runs this AFTER the watchdog is armed, so safetyTask
     // may be reading the INA219 on the same bus. Generous timeout -- this is a
@@ -420,7 +455,9 @@ void measureGyroBias() {
     // sample would bias the average.
     sensors_event_t a, g, t;
     if (i2c_lock(20)) { mpu.getEvent(&a, &g, &t); i2c_unlock(); }
-    sum += g.gyro.z * 180.0f / PI;
+    sum   += g.gyro.z * 180.0f / PI;
+    sumAx += a.acceleration.x;
+    sumAy += a.acceleration.y;
     safety_kick();                   // ~1 s loop: keep the heartbeat alive
     // vTaskDelay, NOT delay(): Arduino delay() busy-spins on yield(), which only
     // yields to equal-or-higher priority -- it would starve safetyTask (2) and
@@ -428,7 +465,15 @@ void measureGyroBias() {
     vTaskDelay(pdMS_TO_TICKS(5));
   }
   gyroBias = sum / N;
+  // Phase 2: the accelerometer measures SPECIFIC force, so any residual table tilt
+  // shows up here as a constant offset (Step 2.3 Trap 1). Removing the at-rest
+  // average removes the tilt component along with the sensor's own zero-g bias --
+  // which is why this must be measured with the platform genuinely still and level.
+  accelBiasX = sumAx / N;
+  accelBiasY = sumAy / N;
   printBoth("[GYRO] bias = " + String(gyroBias, 4) + " dps");
+  printBoth("[ACCEL] bias = " + String(accelBiasX, 4) + " / " + String(accelBiasY, 4)
+            + " m/s^2  (includes any residual tilt)");
 }
 
 // The smallest heading error the controller can actually close, set by the
@@ -474,6 +519,7 @@ void printGains() {
             + "  skips=" + String(fans_skips())
             + "  overruns=" + String(fans_overruns())
             + "  rejects=" + String(fans_rejects())
+            + "  budget-scaled=" + String(fans_budgetHits())
             + "  cap=" + String(FAN_THROTTLE_MAX, 0) + "%"
             + "  stack free (words): " + String(fans_stackFreeWords()));
   printBoth("fans pct: " + String(fans_pct(1), 1) + " / " + String(fans_pct(2), 1)
@@ -506,17 +552,36 @@ void dumpCaptureTo(Print &out) {
   out.print(stepCount);
   out.print("/");
   out.print(stepCount);
-  out.print(": heading step to ");
-  out.print(degrees(target), 1);
-  out.println(" deg) ---");
-  out.print("mode=heading_step target_deg="); out.print(degrees(target), 3);
+  // The label becomes the FILENAME (capture_calibration.py sanitises it), so it has
+  // to describe the run. A plant-ID label of "heading step to 0.0 deg" is not just
+  // unhelpful, it collided across every run.
+  out.print(": ");
+  if (capTranslation) {
+    out.print(capModeName);
+    if (capFanSel > 0) { out.print(" fan"); out.print(capFanSel); }
+    else if (capThrottle > 0.0f) out.print(" all");
+    if (capThrottle > 0.0f) { out.print(" at "); out.print(capThrottle, 0); out.print(" pct"); }
+  } else {
+    out.print("heading step to ");
+    out.print(degrees(target), 1);
+    out.print(" deg");
+  }
+  out.println(") ---");
+  out.print("mode="); out.print(capModeName);
+  out.print(" target_deg="); out.print(degrees(target), 3);
   out.print(" K_theta=");  out.print(K_theta, 3);
   out.print(" K_omega=");  out.print(K_omega, 3);
   out.print(" ff=");       out.print(ffFrac, 3);
   out.print(" deadzone_deg="); out.print(degrees(deadzone), 3);
   out.print(" gyro_bias_dps="); out.print(gyroBias, 4);
+  // Phase 2 fields. accel_bias is what was subtracted, so a parser can undo it;
+  // fan_pct/fan_sel say what thrust was commanded during this run.
+  out.print(" accel_bias_x="); out.print(accelBiasX, 4);
+  out.print(" accel_bias_y="); out.print(accelBiasY, 4);
+  out.print(" fan_pct=");      out.print(capThrottle, 1);
+  out.print(" fan_sel=");      out.print(capFanSel);
   out.println(" stop_reason=fixed_window");
-  out.println("t_us,target_deg,theta_deg,omega_p,omega_w,alpha,u");
+  out.println("t_us,target_deg,theta_deg,omega_p,omega_w,alpha,u,ax,ay,iadc");
   for (int i = 0; i < capN; i++) {
     out.print(cap_t[i]);                    out.print(",");
     out.print(degrees(cap_target[i]), 3);   out.print(",");
@@ -524,7 +589,10 @@ void dumpCaptureTo(Print &out) {
     out.print(cap_wp[i], 4);                out.print(",");
     out.print(cap_ww[i], 3);                out.print(",");
     out.print(cap_alpha[i], 3);             out.print(",");
-    out.println(cap_u[i], 4);
+    out.print(cap_u[i], 4);                 out.print(",");
+    out.print(cap_ax[i], 4);                out.print(",");
+    out.print(cap_ay[i], 4);                out.print(",");
+    out.println(cap_cur[i]);
   }
   out.println("--- capture end ---");
 }
@@ -587,6 +655,7 @@ void printTimingStats() {
     stat_print(o, "INA219 read",  &st_ina);   // no samples: no INA219 here
     stat_print(o, "control law",  &st_law);   // incl. MPU; compute = law - MPU
     stat_print(o, "telem row",    &st_telem);
+    stat_print(o, "ESC cur ADC",  &st_adc);   // Phase 2: added to the 200 Hz path
     stat_print(o, "ctrl period",  &st_period);   // control-release interval (~5000 us)
     uint32_t fmn, fmx; focTick_jitter(&fmn, &fmx);
     o.print("FOC tick dt (us): min="); o.print(fmn); o.print(" max="); o.println(fmx);
@@ -612,10 +681,31 @@ void controlUpdate(float dt) {
     i2c_unlock();                                    // release IMMEDIATELY after
     gyro_dps = (g.gyro.z * 180.0f / PI) - gyroBias;
     gyro_dps_prev = gyro_dps;
+    // Phase 2: the accel arrives in the SAME transaction we already pay 2.4 ms for,
+    // so reading it is free. Body frame, bias removed. On an I2C failure we simply
+    // hold the previous sample, like the gyro.
+    accel_x = a.acceleration.x - accelBiasX;
+    accel_y = a.acceleration.y - accelBiasY;
   } else {
     gyro_dps = gyro_dps_prev;                        // degrade: hold last good
   }
   omega_p = GYRO_SIGN * gyro_dps * PI / 180.0f;     // rad/s, model convention
+
+  // Phase 2: ESC current sense (4-in-1 total, not per channel). Raw counts -- the
+  // mV/A scaling is unknown without the ESC datasheet, and deliberately not guessed:
+  // every use here is a RATIO (channel matching, curve shape), where it cancels.
+  //
+  // DECIMATED TO 20 Hz. Measured cost of analogRead() here was 100 us mean / 102 MAX,
+  // which is NOT conversion time (12-bit is 1-3 us) -- STM32duino re-initialises the
+  // ADC peripheral on every call. At 200 Hz that was 2% of the CPU for a signal whose
+  // bandwidth is fan spin-up, tens of ms. Every 10th cycle costs 0.2% and loses
+  // nothing; the held value is what the capture logs in between.
+  // If this ever needs to be fast, configure ADC1 once and read DR directly (~1 us).
+  static uint8_t adcDiv = 0;
+  if (++adcDiv >= 10) {
+    adcDiv = 0;
+    TIME_BLOCK(st_adc, { escCurRaw = (uint16_t)analogRead(ESC_CUR_PIN); });
+  }
 
   // Wheel velocity, with a physical-plausibility reject. The wheel cannot change
   // speed faster than ~A_1*V_max = ~455 rad/s^2 = ~2.3 rad/s per 5 ms cycle, so a
@@ -791,6 +881,45 @@ void controlUpdate(float dt) {
 // Translation 1.4: which fan the L command drives. 0 = all four, 1-4 = one channel.
 static int fanSel = 0;
 
+// Apply throttle to whatever S selected. Called every control cycle during a
+// translation run, which also pets the fan dead-man (B12) exactly the way a closed
+// loop will in Phase 6 -- so the run cannot be cut short by the 10 s timeout.
+static void applyFanStep(float pct) {
+  if (fanSel == 0) fans_setAll(pct, pct, pct, pct);
+  else             fans_setThrottle(fanSel, pct);
+}
+
+// One place to start any capture, so the window and the metadata line can never
+// disagree with what is actually being recorded.
+static void startCapture(const char* mode, uint32_t windowMs, float pct, int sel,
+                         bool translation) {
+  // stepCount MUST advance for every capture, not just O/T/C. capture_calibration.py
+  // names each file from the "test N/M: label" marker and opens it with "w", so two
+  // captures emitting the same marker silently overwrite each other -- which is what
+  // made every plant-ID run land in test00_heading_step_to_0_0_deg.csv (2026-08-14).
+  stepCount++;
+  capN = 0;
+  capModeName = mode;
+  capWindowMs = windowMs;
+  capThrottle = pct;
+  capFanSel   = sel;
+  capTranslation = translation;
+  capStartMs  = millis();
+  capturing   = true;
+}
+
+// ---- Phase 2 translation plant ID: the automatic thrust step -----------------
+// One command produces BOTH quantities the model needs, from one capture:
+//   thrust phase : x_ddot = A(throttle) - A_c   (platform accelerating)
+//   coast  phase : x_ddot = -A_c                (fans off, still moving)
+// so A_c comes out of the tail of the very run that measures A(throttle), and the
+// two are measured under identical surface/battery conditions instead of in
+// separate sessions.
+static float    transPct     = 0.0f;
+static uint32_t transPreMs   = 500;    // quiet baseline before thrust
+static uint32_t transHoldMs  = 1000;   // thrust
+static uint32_t transTotalMs = 4000;   // remainder is coast-down
+
 void handleLine(String s) {
   s.trim();
   if (s.length() == 0) return;
@@ -800,7 +929,10 @@ void handleLine(String s) {
   // Phase 3 buffer-lifetime guard: a capture writes cap_*, and a queued dump
   // READS cap_* from telemTask. Starting a new capture mid-dump would rewrite the
   // buffer underneath it. Refuse rather than corrupt -- the dump is a few seconds.
-  if ((c == 'T' || c == 'O' || c == 'C') && telem_busy()) {
+  // 'Y' and 'I' are captures too and MUST be in this guard -- omitting them let a
+  // second Y reset capN while the first dump was still streaming out of cap_*,
+  // which silently lost the run (observed 2026-08-13).
+  if ((c == 'T' || c == 'O' || c == 'C' || c == 'Y' || c == 'I') && telem_busy()) {
     printBoth("busy: previous capture still dumping -- wait, then resend");
     return;
   }
@@ -813,9 +945,8 @@ void handleLine(String s) {
       // the source and reflash BEFORE closing the loop.
       openVolts = constrain(v, -3.0f, 3.0f);
       theta = 0.0f;
-      capN = 0; capturing = true; capStartMs = millis();
+      startCapture("heading_step", CAPTURE_MS, 0.0f, 0, false);
       openStartMs = millis();
-      stepCount++;
       ctrlMode = CTRL_OPEN; controllerEnabled = true;
       printBoth("OPEN-LOOP pulse " + String(openVolts, 2) + "V for "
                 + String(OPEN_PULSE_MS) + "ms, capturing...");
@@ -824,8 +955,7 @@ void handleLine(String s) {
     case 'T':
       parked = false; stallCount = 0; stallHold = false; stallStartMs = 0;
       target = wrapPi(radians(v));
-      capN = 0; capturing = true; capStartMs = millis();
-      stepCount++;
+      startCapture("heading_step", CAPTURE_MS, 0.0f, 0, false);
       ctrlMode = CTRL_STEP; controllerEnabled = true;
       printBoth("STEP -> " + String(v, 1) + " deg, capturing...");
       break;
@@ -844,9 +974,8 @@ void handleLine(String s) {
       // Compensation-only test: spin up at V, then alpha = 0. Watch omega_w.
       openVolts = constrain(v, -3.0f, 3.0f);
       theta = 0.0f;
-      capN = 0; capturing = true; capStartMs = millis();
+      startCapture("heading_step", CAPTURE_MS, 0.0f, 0, false);
       openStartMs = millis();
-      stepCount++;
       ctrlMode = CTRL_COMP; controllerEnabled = true;
       printBoth("COMP test " + String(openVolts, 2) + "V spin-up, compFrac="
                 + String(compFrac, 2) + ", capturing...");
@@ -877,6 +1006,7 @@ void handleLine(String s) {
       // `M!` resets all accumulators so the next window starts clean (run a
       // T90 + H0 first, then M! and repeat if you want a fresh worst-case).
       if (s.length() > 1 && s.charAt(1) == '!') {
+        stat_reset(&st_adc);
         stat_reset(&st_foc);   stat_reset(&st_move);  stat_reset(&st_mpu);
         stat_reset(&st_ina);   stat_reset(&st_law);   stat_reset(&st_telem);
         stat_reset(&st_period);
@@ -893,6 +1023,86 @@ void handleLine(String s) {
       telem_run(printSystemReport);
       break;
     case 'X': stopMotor("operator"); break;
+    case 'J': {
+      // DSHOT special command to the S-selected channel. 20=dir NORMAL,
+      // 21=dir REVERSED, 7/8=dir 1/2, 12=SAVE (required to persist any of them).
+      int cmd = (int)v;
+      if (fanSel < 1 || fanSel > 4) {
+        printBoth("J needs a single channel selected first -- send S1..S4 (not S0)");
+        break;
+      }
+      if (!fans_sendCommand(fanSel, (uint16_t)cmd, 10)) {
+        printBoth("ESC command refused: needs fans armed, not killed, nothing "
+                  "spinning, cmd 1-47, and no burst already running");
+        break;
+      }
+      printBoth("ESC cmd " + String(cmd) + " -> fan" + String(fanSel)
+                + " x10 frames (motors held at 0)");
+      break;
+    }
+    // ---- Phase 2: translation plant identification ---------------------------
+    case 'Y': {
+      // Passive capture -- fans untouched. This is the HAND-PUSH coast-down, and
+      // it is the cleanest measurement in the whole phase: no props spinning, no
+      // rig, no force units. Push the platform during the window; Coulomb friction
+      // gives a CONSTANT deceleration, so A_c falls out of a straight-line fit.
+      uint32_t ms = (v > 0.0f) ? (uint32_t)v : 5000;
+      if (ms > 7000) ms = 7000;              // MAX_CAP 1500 @200 Hz = 7.5 s
+      // Wheel OFF for plant ID -- its reaction torque yaws the platform, and yaw
+      // contaminates the accelerometer twice over (body-frame rotation, plus
+      // lever-arm terms because the IMU is not at the CoM). Deliberately does NOT
+      // touch the fans, so this needs no X/R dance to set up.
+      motor.target = 0.0f; controllerEnabled = false; ctrlMode = CTRL_IDLE;
+      startCapture("coast_down", ms, 0.0f, 0, true);
+      printBoth("COAST capture " + String(ms) + " ms -- push the platform now.");
+      printBoth("  (fans untouched; wheel is whatever mode it was in)");
+      break;
+    }
+    case 'Q': {
+      // Step 2.4 -- yaw coupling. Same thrust step as I, but with heading control
+      // ENGAGED. A fan whose thrust line misses the CoM applies a constant yaw
+      // torque; to hold heading against it the wheel must keep accelerating, so
+      // d(omega_w)/dt during the thrust phase IS the disturbance torque, in the
+      // wheel-acceleration units the rotation controller already works in.
+      if (!fans_armed() || fans_killed()) {
+        printBoth("fans not ready -- send R to re-arm");
+        break;
+      }
+      transPct    = v;
+      transActive = true;
+      // Hold the CURRENT heading, so the wheel starts from zero error and every
+      // rad/s it banks is attributable to the fan rather than to a slew.
+      target = theta;
+      parked = false; stallCount = 0; stallHold = false; stallStartMs = 0;
+      ctrlMode = CTRL_HOLD; controllerEnabled = true;
+      startCapture("yaw_coupling", transTotalMs, v, fanSel, true);
+      printBoth("YAW COUPLING " + String(v, 1) + "% on "
+                + String(fanSel == 0 ? "ALL" : String(fanSel))
+                + " -- heading control ACTIVE, wheel will spin up to fight the torque");
+      printBoth("  watch omega_w: if it walks toward " + String(WHEEL_SAT_LIMIT, 0)
+                + " rad/s the thrust line needs MECHANICAL correction. X aborts.");
+      break;
+    }
+    case 'I': {
+      // Automatic thrust step on the S-selected fan(s): quiet, thrust, coast.
+      if (!fans_armed() || fans_killed()) {
+        printBoth("fans not ready (armed=" + String(fans_armed())
+                  + " killed=" + String(fans_killed()) + ") -- R to re-arm");
+        break;
+      }
+      // Wheel OFF -- same reasoning as Y. Fans untouched (they must stay armed).
+      motor.target = 0.0f; controllerEnabled = false; ctrlMode = CTRL_IDLE;
+      transPct    = v;
+      transActive = true;
+      startCapture("thrust_step", transTotalMs, v, fanSel, true);
+      printBoth("THRUST STEP " + String(v, 1) + "% on "
+                + String(fanSel == 0 ? "ALL" : String(fanSel))
+                + " -- " + String(transPreMs) + "ms quiet / " + String(transHoldMs)
+                + "ms thrust / " + String(transTotalMs - transPreMs - transHoldMs)
+                + "ms coast");
+      printBoth("  KEEP CLEAR. X aborts.");
+      break;
+    }
     // ---- Translation 1.4: manual fan commands --------------------------------
     // Raw throttle only. A true thrust-VECTOR command is deferred to Phase 6.3:
     // converting force to throttle needs the square-law inversion
@@ -1108,6 +1318,12 @@ static void hwSetup() {
   printBoth("  FANS:   S<n> select fan (0=all, 1-4) | L<pct> throttle the selection");
   printBoth("          L0 = fans off (stays armed).  X = hard kill, R = re-arm.");
   printBoth("          PROPS OFF unless the test needs thrust -- guards are skipped.");
+  printBoth("  ESC:    J<cmd> DSHOT command to the S-selected fan (20/21=dir, 12=SAVE)");
+  printBoth("          reverse fan4 permanently:  S4 -> J21 -> J12 -> power-cycle");
+  printBoth("  PLANT:  Y<ms> coast capture (hand push, fans idle) | I<pct> thrust step");
+  printBoth("          I uses the S selection: quiet/thrust/coast, then auto-dumps.");
+  printBoth("          Q<pct> yaw-coupling step -- same, but heading control ACTIVE");
+  printBoth("          (I = wheel OFF for plant ID.  Q = wheel ON to measure yaw.)");
   printBoth("Start at K_theta=19.1 K_omega=14.0, then work down the gain table.");
   printBoth("Mode is IDLE -- send H0 or T<deg> to engage.");
 
@@ -1128,6 +1344,18 @@ static void controlStep() {
 
   TIME_BLOCK(st_law, { controlUpdate(dt); });
 
+  // ---- Phase 2 thrust-step sequencer ---------------------------------------
+  // Driven off the capture clock so the phase boundaries land at known sample
+  // indices in the CSV -- the analysis can then slice thrust vs coast without
+  // having to detect the transition from noisy data.
+  if (transActive) {
+    uint32_t el = millis() - capStartMs;
+    if (el < transPreMs)                        applyFanStep(0.0f);
+    else if (el < transPreMs + transHoldMs)     applyFanStep(transPct);
+    else                                        applyFanStep(0.0f);
+    if (el >= transTotalMs) { transActive = false; applyFanStep(0.0f); }
+  }
+
   if (capturing) {
     if (capN < MAX_CAP) {
       cap_t[capN]      = now;
@@ -1137,9 +1365,12 @@ static void controlStep() {
       cap_ww[capN]     = omega_w;
       cap_alpha[capN]  = lastAlpha;
       cap_u[capN]      = lastU;
+      cap_ax[capN]     = accel_x;
+      cap_ay[capN]     = accel_y;
+      cap_cur[capN]    = escCurRaw;
       capN++;
     }
-    if (capN >= MAX_CAP || (millis() - capStartMs) >= CAPTURE_MS) {
+    if (capN >= MAX_CAP || (millis() - capStartMs) >= capWindowMs) {
       capturing = false;
       // PHASE 3 PAYOFF: hand the frozen buffer to telemTask instead of writing it
       // here. The control task returns to its 200 Hz cadence immediately; the ~11 s
@@ -1147,15 +1378,26 @@ static void controlStep() {
       // releases. The capture buffer stays untouched until the dump finishes --
       // the T/O/C commands refuse to start a new capture while telem_busy().
       telem_run(dumpCapture);
-      // After an OPEN-LOOP pulse, return to IDLE -- do NOT engage the
-      // closed loop, since the whole point was to verify the sign first.
-      bool wasOpen = (ctrlMode == CTRL_OPEN || ctrlMode == CTRL_COMP);
-      ctrlMode = wasOpen ? CTRL_IDLE : CTRL_HOLD;
-      if (wasOpen)
-        printBoth("open-loop capture done, back to IDLE. Check: positive volts "
-                  "should give POSITIVE wheel and NEGATIVE theta.");
-      else
-        printBoth("capture done, now HOLDing. Adjust gains and send T again.");
+      if (capTranslation) {
+        // Phase 2 plant ID: stay IDLE. Falling into HOLD here engaged the wheel
+        // (contaminating the accelerometer with reaction torque) and started the
+        // HOLD telemetry stream, which held telem_busy() and made the buffer
+        // guard refuse the NEXT run. Wheel stays off; fans stay armed at zero.
+        ctrlMode = CTRL_IDLE;
+        controllerEnabled = false;
+        motor.target = 0.0f;
+        printBoth("plant-ID capture done. Wheel OFF, fans idle -- ready for the next run.");
+      } else {
+        // After an OPEN-LOOP pulse, return to IDLE -- do NOT engage the
+        // closed loop, since the whole point was to verify the sign first.
+        bool wasOpen = (ctrlMode == CTRL_OPEN || ctrlMode == CTRL_COMP);
+        ctrlMode = wasOpen ? CTRL_IDLE : CTRL_HOLD;
+        if (wasOpen)
+          printBoth("open-loop capture done, back to IDLE. Check: positive volts "
+                    "should give POSITIVE wheel and NEGATIVE theta.");
+        else
+          printBoth("capture done, now HOLDing. Adjust gains and send T again.");
+      }
     }
   }
 

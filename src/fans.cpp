@@ -49,6 +49,9 @@ static uint32_t dmaBuf[BUF_WORDS];
    SET; fanTask snapshots s_req -> dshotValue under a critical section so a frame
    can never carry a torn allocation. */
 static uint16_t dshotValue[5] = { 0, 0, 0, 0, 0 };   /* 0 = disarmed          */
+/* Per-channel telemetry-request bit. Always false for throttle; SET for a special
+   command, which is what tells the ESC "this 21 is command 21, not throttle 21". */
+static bool     dshotTelem[5] = { false, false, false, false, false };
 static volatile uint16_t s_req[5] = { 0, 0, 0, 0, 0 };
 static volatile float    s_pct[5] = { 0, 0, 0, 0, 0 };
 
@@ -64,6 +67,7 @@ static volatile bool     s_hwReady   = false;
 static volatile uint32_t s_frames    = 0;
 static volatile uint32_t s_overruns  = 0;
 static volatile uint32_t s_rejects   = 0;
+static volatile uint32_t s_budgetHits = 0;  /* sets scaled down by the current budget */
 static uint32_t          s_stuck     = 0;   /* consecutive in-flight skips */
 static volatile uint32_t s_skips       = 0; /* benign: emitted inside the last frame */
 static          uint32_t s_lastFrameUs = 0; /* TIM5 us stamp of the last emission */
@@ -74,6 +78,11 @@ static volatile uint32_t s_stuckNDTRmax = 0;
 static volatile uint32_t s_stuckCEN     = 0;
 static volatile bool     s_announce  = false; /* arming message owed to telemTask */
 static volatile uint32_t s_lastCmdMs = 0;     /* last throttle request, ms (dead-man) */
+/* DSHOT special-command burst, serviced by fanTask so it stays the sole fan writer. */
+static volatile int      s_escCmdCh   = 0;
+static volatile uint16_t s_escCmdVal  = 0;
+static volatile uint16_t s_escCmdLeft = 0;
+static volatile bool     s_escCmdDone = false;
 static volatile bool     s_timedOut  = false; /* timeout message owed to telemTask */
 
 /* ---- build a DSHOT frame (value + telemetry bit + CRC) ---------------------
@@ -95,7 +104,7 @@ static uint16_t dshotFrame(uint16_t value, bool telem) {
    pipeline, which is why 16 data bits need 18 entries to fully flush.           */
 static void buildBuffer(void) {
   uint16_t f[5];
-  for (int ch = 1; ch <= 4; ch++) f[ch] = dshotFrame(dshotValue[ch], false);
+  for (int ch = 1; ch <= 4; ch++) f[ch] = dshotFrame(dshotValue[ch], dshotTelem[ch]);
 
   for (int b = 0; b < DSHOT_BITS; b++) {
     uint16_t mask = (uint16_t)(1U << (15 - b));        /* MSB first           */
@@ -317,6 +326,26 @@ static void fanTask(void*) {
                   + String(FAN_THROTTLE_MAX, 0) + "%)");
     }
 
+    /* ESC special-command burst. Runs ON fanTask so the sole-writer rule holds, and
+       takes priority over throttle: everything else is forced to 0 for the duration,
+       because a special command is only honoured with the motor stopped. */
+    if (s_escCmdLeft > 0) {
+      for (int ch = 1; ch <= 4; ch++) { dshotValue[ch] = 0; dshotTelem[ch] = false; }
+      dshotValue[s_escCmdCh] = s_escCmdVal;
+      dshotTelem[s_escCmdCh] = true;          /* command, not throttle */
+      dshotSendFrame();
+      if (--s_escCmdLeft == 0) {
+        dshotValue[s_escCmdCh] = 0;
+        dshotTelem[s_escCmdCh] = false;
+        s_escCmdDone = true;
+      }
+      continue;
+    }
+    if (s_escCmdDone && telem_isActive()) {
+      s_escCmdDone = false;
+      telem_print("fans: ESC command sent (motors held at 0 during the burst)");
+    }
+
     /* Dead-man timeout (see FAN_CMD_TIMEOUT_MS in fans.h). Only meaningful while
        something is actually spinning: if all four are already zero there is nothing
        to time out, and we must not spam. */
@@ -365,6 +394,30 @@ static uint16_t pctToDshot(float pct) {
   return (pct <= 0.0f) ? 48 : (uint16_t)(48.0f + pct * (2047.0f - 48.0f) / 100.0f);
 }
 
+/* Estimated per-motor current, cube law anchored on the one measurement we have
+   (~1.5 A at 50%). Only ever used for the SET budget below -- a rough model is
+   adequate for "would this set blow the fuse", and it is explicitly replaced by the
+   measured ESC current once its scaling is known. */
+static float estMotorAmps(float pct) {
+  float r = pct / 50.0f;
+  return FAN_AMPS_AT_50PCT * r * r * r;
+}
+
+/* Scale a commanded set down together if its estimated total exceeds the budget.
+   Scaling rather than refusing: a controller must always get SOME thrust vector back,
+   and proportional scaling preserves the DIRECTION it asked for, which a per-channel
+   clamp would silently rotate. Returns the factor applied (1.0 = untouched). */
+static float applyCurrentBudget(float pc[5]) {
+  float total = 0.0f;
+  for (int ch = 1; ch <= 4; ch++) total += estMotorAmps(pc[ch]);
+  if (total <= FAN_CURRENT_BUDGET_A || total <= 0.0f) return 1.0f;
+  /* current ~ pct^3, so to cut current by k we scale throttle by cbrt(k) */
+  float k = powf(FAN_CURRENT_BUDGET_A / total, 1.0f / 3.0f);
+  for (int ch = 1; ch <= 4; ch++) pc[ch] *= k;
+  s_budgetHits++;
+  return k;
+}
+
 void fans_setThrottle(int ch, float pct) {
   if (ch < 1 || ch > 4) return;
   if (!s_armed || s_killed) { s_rejects++; return; }
@@ -375,8 +428,16 @@ void fans_setThrottle(int ch, float pct) {
   if (pct < 0.0f) pct = 0.0f;
   if (pct > FAN_THROTTLE_MAX) pct = FAN_THROTTLE_MAX;
 
-  s_pct[ch] = pct;
-  s_req[ch] = pctToDshot(pct);
+  /* Budget the resulting SET, not just this channel -- four "legal" channels can
+     still exceed the fuse (T15). Built from the current requests plus this one. */
+  float pc[5];
+  for (int c = 1; c <= 4; c++) pc[c] = s_pct[c];
+  pc[ch] = pct;
+  applyCurrentBudget(pc);
+
+  taskENTER_CRITICAL();
+  for (int c = 1; c <= 4; c++) { s_pct[c] = pc[c]; s_req[c] = pctToDshot(pc[c]); }
+  taskEXIT_CRITICAL();
   s_lastCmdMs = xTaskGetTickCount();      /* pet the dead-man */
 }
 
@@ -390,13 +451,29 @@ void fans_setAll(float f1, float f2, float f3, float f4) {
     if (p < 0.0f) p = 0.0f;
     if (p > FAN_THROTTLE_MAX) p = FAN_THROTTLE_MAX;
     pc[ch]  = p;
-    out[ch] = pctToDshot(p);
   }
+  applyCurrentBudget(pc);                  /* scales the SET, preserving direction */
+  for (int ch = 1; ch <= 4; ch++) out[ch] = pctToDshot(pc[ch]);
   /* Publish as a SET so the four values reach the wire in the same frame. */
   taskENTER_CRITICAL();
   for (int ch = 1; ch <= 4; ch++) { s_pct[ch] = pc[ch]; s_req[ch] = out[ch]; }
   taskEXIT_CRITICAL();
   s_lastCmdMs = xTaskGetTickCount();      /* pet the dead-man */
+}
+
+bool fans_sendCommand(int ch, uint16_t cmd, uint16_t reps) {
+  if (ch < 1 || ch > 4)        return false;
+  if (cmd < 1 || cmd > 47)     return false;   /* 0 = stop, 48+ = throttle */
+  if (!s_armed || s_killed)    return false;
+  if (s_escCmdLeft > 0)        return false;   /* one burst at a time */
+  /* A special command is only honoured with the motor stopped -- refuse rather than
+     send it into a spinning motor, where it would be ignored at best. */
+  for (int c = 1; c <= 4; c++) if (s_req[c] > 48) return false;
+
+  s_escCmdCh   = ch;
+  s_escCmdVal  = cmd;
+  s_escCmdLeft = reps ? reps : 10;
+  return true;
 }
 
 void fans_stopAll(void) {
@@ -439,6 +516,7 @@ bool     fans_killed(void)    { return s_killed; }
 uint32_t fans_frames(void)    { return s_frames; }
 uint32_t fans_overruns(void)  { return s_overruns; }
 uint32_t fans_skips(void)     { return s_skips; }
+uint32_t fans_budgetHits(void){ return s_budgetHits; }
 uint32_t fans_rejects(void)   { return s_rejects; }
 float    fans_pct(int ch)     { return (ch >= 1 && ch <= 4) ? s_pct[ch] : 0.0f; }
 

@@ -25,8 +25,27 @@ Never propose a solution that requires a scope.
 
 ## Current position
 
-**Phase 0 COMPLETE (one deliberate exception, below). Phase 1 COMPLETE 2026-08-13,
-tag `trans-p1-fans`. Phase 2 (translation plant identification) is NEXT.**
+**Phase 0 COMPLETE (one exception, below). Phase 1 COMPLETE, tag `trans-p1-fans`.
+Phase 2 IN PROGRESS — Steps 2.1 + 2.2 DONE 2026-08-14, 2.3 dropped (B14).
+Step 2.4 (yaw coupling) is NEXT and is the last one before the Phase 2 tag.**
+
+**The translational plant, identified — 66 runs over 5 sessions:**
+
+```
+x_ddot = A(throttle) - A_c*sign(v)        <- mass and force never needed (B14)
+A(throttle) = 2.1e-4 * pct^2  m/s^2       A(60%) = 0.76
+A_c         = 0.26 m/s^2                  breakaway at ~35% throttle
+GO / NO-GO  = 2.9x single fan, 4.2x diagonal      -> PASS ("comfortable")
+```
+
+Fans 1–3 match within 7%. **Fan 4 had a reversed spin direction** — found by
+measurement, fixed over DSHOT with zero hardware contact (B17), verified back to spec
+(0.577 ±6% at 55%). `FAN_THROTTLE_MAX` was raised 30% → 60% with a total-current
+budget added alongside it, so four channels can no longer sum past the fuse (T15).
+
+⚠️ **The dominant error source is a within-session mobility drift of ~+30%** — runs get
+stronger as a session goes on. It invalidates any cross-session comparison; anything
+comparing motors must be interleaved in one session, or use the current sensor.
 
 **Where the fans stand — all of Phase 1 is on hardware:** DSHOT300 via TIM1 + DMA burst,
 driven by `fanTask` (prio 2, 333 Hz, **sole fan writer**). Fans are in every fault path
@@ -39,13 +58,13 @@ control is `S<n>` (select 1–4, 0 = all) and `L<pct>` (throttle), clamped at
 **Hardware for Phase 1 is done:** ch4 moved A0 → CN10-14 (PA11); ch1–3 needed nothing
 because D7/D8/D2 *are* PA8/PA9/PA10.
 
-**⚠️ Two things Phase 2 must deal with immediately:**
-1. **`FAN_THROTTLE_MAX = 30%` will constrain the 2.1 thrust sweep** (which wants 0→60%).
-   Raise it deliberately, in `fans.h`, and treat that as a safety decision — it is a
-   B7 mitigation, not a convenience constant.
-2. **The 10 s dead-man will zero a fan mid-measurement** unless each sweep step
-   refreshes the command. Either re-issue `L` within 10 s per point or raise
-   `FAN_CMD_TIMEOUT_MS`.
+**Two operational gotchas, both still live:**
+1. **`stepCount` resets on reboot**, so capture filenames restart at `test01` and can
+   overwrite an earlier run with the same fan+throttle label. Start a fresh
+   `capture_calibration.py` folder after any reset. (It came within one identical
+   fan+throttle pair of costing data on 2026-08-14.)
+2. **The 10 s dead-man zeroes a fan** if nothing refreshes the command. `I`/`Q` refresh
+   every control cycle so they are safe; a manual `L` left alone is not.
 
 **One datapoint already banked for B9:** with fans spinning, bus voltage dipped to
 **11.98 V** (idle 12.30–12.40). Still far above the 10.0 V trip, but it is the first
@@ -188,7 +207,7 @@ These are in addition to `RTOS_migration.md`'s list, which all still applies.
 |---|---|---|
 | **0 safety hardening** | ✅ **(2026-08-13)** | Wires cleared, fuse/wiring confirmed, battery disconnect = e-stop. **Prop guards deliberately skipped (B7)** — mitigations moved into Phase 1. |
 | 1 fans into the RTOS (DSHOT + DMA) | ✅ **(2026-08-13)** `trans-p1-fans` | Four DSHOT channels on TIM1+DMA burst, `fanTask` prio 2 = sole fan writer, fans in every fault path *ahead* of the wheel, `S`/`L` manual commands, 30% ceiling + 10 s dead-man. Control loop untouched: ctrl period 4999/5000/5001 µs. |
-| 2 translation plant ID | ⬜ **NEXT** | — |
+| 2 translation plant ID | 🟡 **2.1/2.2 ✅ 2.3 dropped** | `A(pct)=2.1e-4·pct²` (66 runs), `A_c≈0.26`, **go/no-go PASS at 2.9×**. Fans 1–3 matched to 7%; fan 4's reversed direction found and fixed over DSHOT. **2.4 (yaw coupling) NEXT.** |
 | 3 Pi ↔ STM32 wired link | ⬜ | — |
 | 4 vision: AprilTag pose on the Pi | ⬜ | — |
 | 5 estimator: fuse tag + IMU | ⬜ | — |
@@ -896,6 +915,24 @@ rotation axis for free.
 **None of the rotation constants transfer.** `A_1`, `A_2`, `compFrac`, `K_HOLD` are
 all properties of the wheel loop and have no fan analogue.
 
+> ### ⚠️ THIS PHASE WAS REFORMULATED — read B14 before following the steps below
+>
+> Steps 2.1–2.3 as originally written measure **force** (scale rig, string-and-pulley,
+> effective mass). That was abandoned: the motors cannot easily be dismounted, and more
+> importantly **the controller never needs force or mass.** Working in acceleration
+> units, `ẍ = A(throttle) − A_c·sign(v)`, makes `m`, `F` and `F_c` cancel out — exactly
+> as `CONTROL_README` §3 avoided ever pinning down `J_w` or `J_p`.
+>
+> | step | as written | as actually done |
+> |---|---|---|
+> | 2.1 | thrust in gf, scale rig | **`A(throttle)` in m/s², from the IMU** ✅ |
+> | 2.2 | breakaway in gf, string + weights | **`A_c` from motion-onset throttle** ✅ |
+> | 2.3 | effective mass from step response | **DROPPED** — was only ever a route to `A` |
+> | 2.4 | yaw coupling | unchanged, still to do |
+>
+> The go/no-go is unaffected: `F_thrust/F_breakaway` becomes `A_max/A_c`, the identical
+> ratio. **Do not "restore" the force measurements** — they were removed deliberately.
+
 ## Step 2.1 — Static thrust curve
 
 **Concept.** Fans are open-loop: no RPM, no thrust feedback. The only way to know
@@ -918,6 +955,51 @@ throttle = sqrt(F_desired / F_max)
 curve shifts as the pack drains. This is the fan analogue of the wheel's `K'`.
 **Trap 2.** The scale must measure *thrust*, not the motor's weight. Mount so the
 thrust axis is vertical and tare with the motor mounted but stopped.
+
+**Result (2026-08-14) — DONE, in acceleration units (B14). 66 runs over 5 sessions.**
+
+Method: `I<pct>` commands an automatic thrust step on the `S`-selected fan — 500 ms
+quiet, 1000 ms thrust, 2500 ms coast — logging body-frame accel at 200 Hz. `A` is
+extracted as the **vector difference between the thrust-phase and coast-phase mean
+acceleration**, which is the key trick: `a_thr = A − A_c`, `a_cst = −A_c`, so
+`A = a_thr − a_cst` and **any constant accelerometer bias cancels identically.**
+
+Analysed in the **body frame, never rotated by θ** — a fan is bolted to the platform
+and so is the IMU, so thrust is body-fixed and heading is irrelevant (absent tilt, B15).
+
+```
+fan 1, pooled, moving runs only:
+  pct   n    A (m/s^2)         k = A/pct^2
+   50  14   0.495 +/- 0.148     1.98e-4
+   55   5   0.678 +/- 0.203     2.24e-4
+   60   5   0.762 +/- 0.163     2.12e-4
+
+  -->  A(throttle) = 2.1e-4 * pct^2   m/s^2      A(60%) = 0.76
+```
+
+**The square law holds where motion is reliable.** Two independent sessions agreed on
+`k` to within their scatter, which is the strongest evidence the model form is right.
+
+⚠️ **Fit `k` on ≥50% data only.** The 35/40/45% rows return `k` = 1.47–1.79e-4, but
+that is an artifact: those runs sit on the stiction threshold, so several are
+*detected-but-degenerate* — motion so brief that the thrust and coast windows barely
+populate and `A` collapses toward 0. They bias the mean down, not the physics.
+
+**Channel matching at 50%: `fan1 0.495 (n=14) · fan2 0.485 (n=3) · fan3 0.519 (n=3)`
+— within 7%.** Fans 1–3 are well matched.
+
+**Fan 4 had a reversed spin direction** and did not break stiction at all. Fixed
+**in firmware over DSHOT** (`S4` → `J21` → `J12` → power-cycle) with no hardware
+contact — see B17. After the fix: `55% → 0.541 / 0.578 / 0.611` (mean 0.577, ±6%, the
+tightest cluster in the whole dataset) and `60% → 0.572`. **The backwards-prop
+hypothesis is dead** — half thrust would have shown ~0.38 against fan 1's 0.76.
+
+**Trap that bit twice — within-session mobility drift, ~+30%.** Runs get *stronger*
+through a session (ball transfers freeing up, and/or a swept track through the dust).
+It is the largest single error source and it **invalidates any cross-session channel
+comparison**: fan 1 first appeared 33% weaker than fans 2/3 purely because it was
+measured first, and its pooled n=14 mean later landed exactly between them. Anything
+comparing motors must run **in one session, interleaved**, or use the current sensor.
 
 ## Step 2.2 — Translational breakaway force
 
@@ -942,7 +1024,54 @@ breakaway force is the single number that determines whether this is controllabl
 **Trap.** Test on the **cleaned** table. The user already observed a curved
 translation path attributed to dust. Surface condition is a real plant parameter here.
 
-## Step 2.3 — Step-response identification
+**Result (2026-08-14) — DONE, by motion onset instead of string-and-weights.**
+
+Rather than measuring a force, `A_c` is read off the throttle at which the platform
+**just breaks loose** — at onset, `A(throttle_break) = A_c` exactly. This is a
+*motion-detection* measurement, so **accelerometer bias is irrelevant to it**, which
+makes it the most trustworthy number in the phase. It is the same logic as
+`CONTROL_README` §14 run 5 (net displacement, not peak rate) moved to the new axis.
+
+```
+fan 1, fraction of runs that moved, all sessions pooled:
+   25%  0/1        45%   5/5
+   30%  1/1        50%  14/14
+   35%  5/7  <--   55%   5/5
+   40%  7/7        60%   5/5
+```
+
+Clean threshold at **35%**, reliable from 40% up → **`A_c ≈ A(35%) ≈ 0.26 m/s²`**.
+The stochastic band at 35% (5 of 7) is the translational twin of §6's "whether it
+moves is effectively random" — you are sitting on stiction, exactly as theory predicts.
+
+### The go/no-go — **PASS**
+
+```
+A_max (60%)  = 0.76 m/s^2
+A_c          = 0.26 m/s^2
+ratio        = 2.9x   single fan, cardinal push
+             = 4.2x   diagonal (two fans, each contributing cos45)
+```
+
+Right at the **"comfortable"** 3× boundary and well clear of the 2× stop-line.
+**Translation control is viable**, with a friction deadband to design around —
+structurally the same problem the rotation axis solved with Coulomb feedforward, so
+the architecture transfers even though none of the constants do.
+
+**Open, carried into Phase 6:** the coast-phase deceleration *rises* with throttle
+(0.15 at 30% → ~0.35 at 50%), which pure Coulomb should not do. Suggests a viscous
+term on top — the rotation axis showed the same signature (R² 0.918 Coulomb alone vs
+0.951 with both). Not modelled yet; revisit if the feedforward misbehaves at speed.
+
+## Step 2.3 — Step-response identification — ❌ **DROPPED (B14)**
+
+**Not done, deliberately.** Its goal was *effective mass*, which was only ever a route
+to `A(throttle)` in force units. Working in acceleration units gets `A` directly from
+Steps 2.1/2.2, so mass is never needed by anything downstream — allocation, the LQR
+gains, and the go/no-go all work without it. The original text is kept below for the
+record; **do not run it thinking Phase 2 is incomplete without it.**
+
+<details><summary>original Step 2.3 (superseded)</summary>
 
 **Concept.** With thrust and friction known, get the dynamics: apply a known thrust
 step and measure the acceleration response.
@@ -957,6 +1086,14 @@ the Coulomb model beats a viscous one (as it did for rotation, 0.918 vs 0.826 R�
 component. Level check first; a small tilt appears as constant acceleration.
 **Trap 2 — the platform rotates.** Accel is in the body frame; you must rotate into
 the world frame using `θ`, or restrict tests to a held heading.
+
+</details>
+
+*(Note on that last trap, since it misled once: for a **body-fixed fan** you should
+**not** rotate into the world frame. Thrust and the IMU are both bolted to the
+platform, so the measurement is naturally body-frame and heading drops out. Rotating
+by a drifting `θ` only injects error. Rotation matters for Phase 7's frame transform,
+not for this identification.)*
 
 ## Step 2.4 — Yaw coupling
 
@@ -1371,6 +1508,9 @@ write-up more credible, not less. Do the same here.
 | T19 | **Trusting a number you did not read off the terminal** | The 1.2 result note recorded `overruns=0` from a verbal "everything checked out"; it was 99 and had been since boot. A wrong number in the guide is worse than no number — the next session trusts it and stops looking. |
 | T20 | **`vTaskDelayUntil` schedules from the WAKE time, not from when the task runs** | Release jitter (a higher-prio task holding the CPU, or an equal-prio peer) means two *emissions* can land microseconds apart even though the *schedule* is correct. Cost 1,565 phantom "overruns" at a 2 ms fan period. For anything that emits into hardware with a minimum spacing, gate on a real microsecond timebase, not on ticks — 1 ms granularity structurally cannot see a 50 µs reality. Distinct from T17, which is about catching up *after* starvation. |
 | T21 | **A counter that conflates an expected artifact with a fault** | Worse than no counter: it burns a debugging session and then trains you to ignore it. Split benign (`fans_skips`) from real (`fans_overruns`) and state which one is allowed to be non-zero. |
+| T22 | **A new capture type added to a single-capture-type code path** | Three separate bugs from one assumption (2026-08-14): `Y`/`I` missing from the `telem_busy()` buffer-lifetime guard; the post-capture transition dropping plant-ID runs into `CTRL_HOLD` (engaging the wheel *and* holding `telem_busy` so the next run was refused); and `stepCount` only incrementing in `O`/`T`/`C`. **Grep every use of the capture state before adding a fourth type.** |
+| T23 | **The capture LABEL is the filename, and the script overwrites** | `capture_calibration.py` builds `test{N:02d}_{label}.csv` from the `--- capture start (test N/M: label) ---` marker and opens it `"w"`. Two captures emitting the same marker silently overwrite — presenting as "it only saves the first one" while the script honestly reports N files written. Every capture must emit a **unique N and a descriptive label**. |
+| T24 | **Diagnosing a tooling symptom without opening the tool** | Cost two wrong firmware diagnoses before `capture_calibration.py` was actually read; the answer was one line in it. When the user says "the file didn't save", read the writer first. T7, again. |
 
 Plus **every trap in `RTOS_migration.md` Appendix A** — the one-writer/one-reader
 invariants, `delay()`, watchdogs measuring iterations instead of time, and the rest.
@@ -1394,7 +1534,11 @@ invariants, `delay()`, watchdogs measuring iterations instead of time, and the r
 | **B11** | **Manual fan commands are RAW THROTTLE; the thrust-vector command moves to Phase 6.3** | 2026-08-13. Step 1.4 asked for "a thrust-vector command", but force→throttle needs `throttle = sqrt(F/F_max)` and `F_max` comes from the Step 2.1 thrust curve, which does not exist. Implementing it now would mean inventing a calibration constant, and would put allocation logic in a bring-up command rather than beside the opposing-pair idle-bias handling in 6.3 where it belongs. Raw throttle (`S<n>` select, `L<pct>` level) is also exactly what Phase 2 needs in order to *measure* the curve. |
 | **B12** | **Dead-man timeout on commanded throttle (10 s), added beyond the guide** | 2026-08-13. With the props unguarded (B7), a fan left spinning because the operator was distracted is the specific hazard a guard would have covered — so `fanTask` zeroes all four if nothing calls `fans_setThrottle`/`fans_setAll` for `FAN_CMD_TIMEOUT_MS`. Chosen over a hardware interlock (none available) and over trusting operator discipline. **Free in closed loop**: a controller refreshes every cycle, so it can only fire on an untended manual command. ⚠️ Phase 2.1's thrust sweep must refresh within 10 s per step or raise the constant. |
 | **B13** | **`skips` and `overruns` are separate counters; fan period 2 ms → 3 ms** | 2026-08-13, after the Step 1.4 overrun investigation (full write-up under Step 1.4). `vTaskDelayUntil` schedules from the wake time but frames are emitted when the task gets the CPU, so release jitter can put two emissions ~50 µs apart on a correct 3 ms schedule — inside the 60 µs a frame needs to clock out. That is benign (the ESC just gets the next frame), so it is now counted as a **skip**, gated on the **TIM5 microsecond timebase** rather than tick arithmetic — 1 ms granularity cannot see a 50 µs event, which is precisely why it looked mysterious. `overruns` is reserved for "still not drained after 100 µs genuinely elapsed", a real fault, and must be 0. Period raised to 3 ms to turn ~−10 µs of jitter margin into ~600 µs; 333 Hz is still far above the ESC's ~250 ms disarm timeout. **Method note worth keeping:** two competing hypotheses predicted different `NDTR` values, so two register reads settled it in one flash cycle instead of an argument — T7 applied to my own reasoning. |
-| **B14** | *(next decision goes here)* | |
+| **B14** | **Phase 2 identifies the plant in ACCELERATION units; mass and force are never measured** | 2026-08-13, user decision after reviewing four options. The motors cannot easily be dismounted, so the scale rig (2.1 as written), the pendulum, and the string-and-pulley were all impractical. Reformulated: `ẍ = A(throttle) − A_c·sign(v)`, and **`m`, `F` and `F_c` cancel out** — the controller only ever needs `A(throttle)` and `A_c`, both directly measurable from the accelerometer already on the bus. Same reasoning that let `CONTROL_README` §3 work in `A_1`/`A_2`/`A_FRICTION` and deliberately never pin down `J_w` or `J_p`. **Nothing is lost:** the 2.2 go/no-go becomes `A_max/A_c` (identical ratio), allocation becomes `throttle = sqrt(A/A_max)`, and the LQR gains lose the mass term entirely because the control output is an acceleration — exactly as on the wheel axis. Effective mass (old 2.3) is dropped as a goal; it was only ever a route to `A`. **Do not "fix" the missing absolute force numbers.** |
+| **B15** | **No table tilt — asserted by the user, not measured** | 2026-08-13. The measured accel bias magnitude (0.177–0.181 m/s², stable to 2% across a power cycle) corresponds to ~1.05° of tilt-equivalent *if* it were tilt, which would be 3× the 0.3° planning figure §18 warns about and comparable to friction itself. A `B` → rotate 180° → `B` test would separate world-fixed tilt from body-fixed sensor bias in 30 s. **The user has confidently asserted the table is level and declined the test; treated as sensor zero-g offset (16 mg, well inside MPU6050 spec) and not pursued further.** Recorded only so that if translation later shows a persistent directional drift that no controller seems to fix, this is the first thing to re-examine. |
+| **B16** | **Single-fan (`S1`) thrust steps, not all-four** | 2026-08-13. The four fans are opposing pairs (§18: "only one fan works for N/S/E/W; a diagonal splits across two"), so `S0` + a thrust step is **near-zero net thrust** — the pairs fight each other, producing heat and current and almost no motion. Per-motor curves need one fan at a time anyway. `S0` is kept for a different job: four motors drawing at a known throttle with the platform stationary is the clean way to answer the fuse/current question (T15) before raising `FAN_THROTTLE_MAX` above 30%. |
+| **B17** | **Fan 4 spin direction reversed in ESC firmware over DSHOT, not by touching hardware** | 2026-08-14. Three motors spun one way and one the other against 2 CW + 2 CCW props, so one fan had prop handedness mismatched to its rotation — costing ~half thrust (T3), and fan 4 could not break stiction at all. Fixed by sending DSHOT special commands from the firmware: `S4` → `J21` (SPIN_DIRECTION_REVERSED ×10) → `J12` (SAVE_SETTINGS ×10) → power-cycle. Implemented as a **general command primitive** (`fans_sendCommand`, serial `J<cmd>`) rather than a one-shot, because this ESC's DSHOT command table is demonstrably incomplete — the beep command has never worked on it — so being able to try 21, then 8, then 7 and observe was the point. **Command 21 worked.** Protocol details that are load-bearing: the telemetry-request bit must be SET to distinguish a command from a throttle value, the motor must be stopped, and the command must be repeated (~10 frames). Chosen over swapping props (hardware contact, and it only moves the mismatch) and over swapping phase wires (most invasive). **Verified by measurement, not just by eye:** fan 4 went from not moving at 40% to 0.577 ±6% at 55%. |
+| **B18** | *(next decision goes here)* | |
 
 ---
 

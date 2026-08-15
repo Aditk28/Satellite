@@ -38,7 +38,26 @@
   ---------------------------------------------------------------------------
 */
 
-#define FAN_THROTTLE_MAX  30.0f   /* percent. Bring-up ceiling -- see B7.      */
+/* Per-channel ceiling, percent. Raised 30 -> 60 on 2026-08-14 because one fan at
+   <=30% does not break translational stiction, so Phase 2 cannot measure a thrust
+   curve at all below this. Still a B7 safety mitigation, not a convenience knob:
+   raise it deliberately and with a reason, never to make a test pass.
+
+   Justification for 60: single fan at 50% is ~1.5 A by the cube law, and the platform
+   was already run at ~50% during bring-up on this same 10 A fuse (CONTROL_README 18). */
+#define FAN_THROTTLE_MAX  60.0f
+
+/* ...but the per-channel cap alone is NOT enough, and this is the trap it closes.
+   Prop current goes as throttle^3 (T15): four channels at 60% is ~10.4 A, which blows
+   the fitted 10 A fuse even though every individual channel is "within limits". So
+   the commanded SET is also budgeted, and scaled down together if it would exceed
+   this. 7 A = 70% of the fuse, leaving headroom for the wheel on the same pack.
+
+   The cube-law estimate is a stopgap. The ESC current sense is now wired to A4, so
+   once its mV/A scaling is known this should be replaced by the MEASURED current --
+   at which point safetyTask can trip on it instead of the controller guessing. */
+#define FAN_CURRENT_BUDGET_A  7.0f
+#define FAN_AMPS_AT_50PCT     1.5f   /* per motor, from CONTROL_README 18 / claude.md */
 /* Resend period. 3 ms, not 2, and the extra millisecond is load-bearing.
 
    vTaskDelayUntil schedules from the WAKE time, but a frame is emitted when the task
@@ -88,6 +107,30 @@ void fans_setThrottle(int ch, float pct);
    the same frame, which matters once these come from a thrust allocation. */
 void fans_setAll(float f1, float f2, float f3, float f4);
 
+/* Send a DSHOT SPECIAL COMMAND (value 1..47) to one channel, `reps` times, with all
+   other channels held at 0. Returns false if the fans are not in a state where a
+   command is meaningful (not armed, hard-killed, or something is still spinning).
+
+   WHY A PRIMITIVE AND NOT A ONE-SHOT "reverse fan 4": this ESC's DSHOT command
+   support is known to be incomplete -- the beep command (1) has never produced a
+   chirp on it -- so the useful thing is to be able to try a command, observe, and
+   try a different one. It is also reusable for other ESC settings later.
+
+   The commands that matter here:
+       20  spin direction NORMAL          21  spin direction REVERSED
+        7  spin direction 1                8  spin direction 2
+       12  SAVE SETTINGS  <-- required to make any of the above persist
+
+   Protocol notes, both load-bearing:
+     - Special commands are only honoured while the motor is STOPPED, which is why
+       every other channel is forced to 0 and this refuses if anything is spinning.
+     - The telemetry-request bit must be SET for a command frame (a plain throttle
+       frame clears it). That is what distinguishes "command 21" from "throttle 21".
+     - Commands must be REPEATED to be accepted (6-10 frames is the usual figure),
+       and a save needs a gap afterwards for the EEPROM write. At the 3 ms frame
+       period, 10 reps is 30 ms; the gap comes free from typing the next command. */
+bool fans_sendCommand(int ch, uint16_t cmd, uint16_t reps);
+
 /* HARD KILL. Callable from ANY context including an ISR and faults_safeStop()
    (which runs with interrupts already disabled), so it uses NO FreeRTOS API, takes
    no lock, and never blocks. Stops the DMA, stops the counter, clears MOE, and
@@ -120,6 +163,7 @@ uint32_t fans_skips(void);
    clock gated, ARR clobbered). This one should be 0. */
 uint32_t fans_overruns(void);
 uint32_t fans_rejects(void);       /* throttle requests refused (not armed / killed) */
+uint32_t fans_budgetHits(void);    /* sets scaled down by the total-current budget */
 uint32_t fans_stackFreeWords(void);
 
 /* Step 1.4 overrun diagnostic. NDTR observed at the moment a transfer was found
