@@ -56,7 +56,9 @@ static volatile uint16_t s_req[5] = { 0, 0, 0, 0, 0 };
 static volatile float    s_pct[5] = { 0, 0, 0, 0, 0 };
 
 static TaskHandle_t      s_task      = nullptr;
-static volatile bool     s_armed     = false;
+static volatile bool     s_armed     = false;   /* fully ready: ramp AND config done */
+static          bool     s_rampDone  = false;   /* the ~1 s zero ramp has finished   */
+static          int      s_cfgCh     = 0;       /* channel being configured, 0 = none */
 static volatile bool     s_killed    = false;
 /* Set once dshotHwInit() has enabled the TIM1/DMA2/GPIOA clocks. fans_stopAll() is
    wired into faults_safeStop(), which can fire arbitrarily early -- e.g. a
@@ -304,10 +306,31 @@ static void fanTask(void*) {
        Trap 8/19: it busy-spins on yield() and silently starves every lower-priority
        task -- here that would be telemTask, so the boot output would never get
        written out. vTaskDelayUntil above paces this instead, at no cost. */
-    if (!s_armed) {
+    if (!s_rampDone) {
       for (int ch = 1; ch <= 4; ch++) dshotValue[ch] = 0;
       dshotSendFrame();
-      if (++armCount >= FAN_ARM_FRAMES) { s_armed = true; s_announce = true; }
+      if (++armCount >= FAN_ARM_FRAMES) s_rampDone = true;
+      continue;
+    }
+
+    /* BOOT CONFIG: re-apply spin direction to any channel in FAN_REVERSE_MASK.
+       Runs once, after the arming ramp and BEFORE throttle is accepted, because the
+       ESC only honours a special command with the motor stopped -- which is exactly
+       the state the ramp leaves it in. See FAN_REVERSE_MASK in fans.h for why this
+       is redone every boot instead of saved in the ESC. */
+    if (!s_armed) {
+      int next = 0;
+      for (int ch = s_cfgCh + 1; ch <= 4; ch++)
+        if (FAN_REVERSE_MASK & (1 << (ch - 1))) { next = ch; break; }
+      if (next) {
+        s_cfgCh      = next;
+        s_escCmdCh   = next;
+        s_escCmdVal  = DSHOT_CMD_DIR_REVERSED;
+        s_escCmdLeft = FAN_CFG_REPS;
+      } else {
+        s_armed    = true;      /* ramp + config both done: throttle now accepted */
+        s_announce = true;
+      }
       continue;
     }
 
@@ -322,8 +345,13 @@ static void fanTask(void*) {
        which is precisely why that trap says a partial version is worse than none. */
     if (s_announce && telem_isActive()) {
       s_announce = false;
-      telem_print("fans: armed (" + String(FAN_ARM_FRAMES) + " zero frames sent, cap "
-                  + String(FAN_THROTTLE_MAX, 0) + "%)");
+      String rev = "";
+      for (int ch = 1; ch <= 4; ch++)
+        if (FAN_REVERSE_MASK & (1 << (ch - 1))) rev += String(ch) + " ";
+      telem_print("fans: armed (" + String(FAN_ARM_FRAMES) + " zero frames, cap "
+                  + String(FAN_THROTTLE_MAX, 0) + "%)"
+                  + (rev.length() ? ("  direction REVERSED applied to fan " + rev
+                                     + "(re-done every boot: ESC ignores SAVE)") : ""));
     }
 
     /* ESC special-command burst. Runs ON fanTask so the sole-writer rule holds, and
@@ -506,8 +534,10 @@ void fans_rearm(void) {
   if (!s_killed) return;
   dshotHwInit();          /* restores AF mode on PA8..PA11 and re-sets MOE */
   buildBuffer();
-  s_armed  = false;       /* fanTask repeats the ~1 s zero ramp before accepting */
-  s_killed = false;
+  s_armed    = false;     /* fanTask repeats the ~1 s zero ramp before accepting */
+  s_rampDone = false;
+  s_cfgCh    = 0;         /* and re-applies the boot direction config */
+  s_killed   = false;
 }
 
 bool     fans_armedAndLive(void) { return s_armed && !s_killed; }

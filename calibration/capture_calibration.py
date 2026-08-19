@@ -119,11 +119,20 @@ def main():
     parser = argparse.ArgumentParser(description="Capture the calibration sweep's CSV output into per-test files.")
     parser.add_argument("--port", default=None, help="Serial port, e.g. COM5 or /dev/ttyACM0")
     parser.add_argument("--baud", type=int, default=115200, help="Baud rate (default 115200, matches the firmware)")
-    parser.add_argument("--outdir", default=None, help="Output folder (default: timestamped calibration_run_* folder)")
+    parser.add_argument("--outdir", default=None, help="Output folder (default: calibration/runs/run_<timestamp>/)")
     args = parser.parse_args()
 
     port = args.port or pick_port()
-    outdir = args.outdir or f"calibration_run_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    # Default output lives in calibration/runs/ next to this script, NOT in the
+    # project root -- 25 timestamped folders had accumulated there by Phase 2.
+    # Resolved from __file__ so it lands in the same place whether you run this
+    # from the project root or from calibration/.
+    if args.outdir:
+        outdir = args.outdir
+    else:
+        runs_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "runs")
+        outdir = os.path.join(
+            runs_dir, f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
     os.makedirs(outdir, exist_ok=True)
 
     print(f"Opening {port} at {args.baud} baud...")

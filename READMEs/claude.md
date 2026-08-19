@@ -36,49 +36,34 @@ depth matters as much as the demo working.
 
 ## 2. Current state
 
-**Rotation control is written, tuned, and working.** Plant fully identified over
+**Phases 0, 1 and 2 of `TRANSLATION_DOCKING.md` are COMPLETE** (tags `trans-p1-fans`,
+`trans-p2-plantid`). The RTOS migration was completed before them (`rtos-p7-complete`).
 
-8 calibration runs (~150 trials). Closed-loop envelope tested ±30° to ±180°.
+**Rotation control: re-identified and retuned 2026-08-19. 0.47 deg mean final error
+over +-5 to +-180 deg, every slew in ONE move, wheel returning fully to rest.**
+This supersedes every earlier performance figure — those were on the lighter,
+pre-translation platform and are no longer comparable.
 
-**RTOS migration COMPLETE** (all 7 phases, `rtos-p7-complete`). **Translation
+**Translation plant: identified in ACCELERATION units** (mass and force cancel — see
+guide decision B14). `A(throttle) = 2.1e-4*pct^2 m/s^2`, `A_c = 0.26 m/s^2`, breakaway
+~35% throttle, thrust-to-friction ratio **2.9x — PASS**. **No translation controller
+is written yet**; that is Phase 6.
 
-hardware COMPLETE and tested** — 4 fans on a 4-in-1 ESC, all channels spinning
+**Firmware: six FreeRTOS tasks.** `fanTask` (prio 2, 333 Hz) is the sole fan writer,
+driving four DSHOT300 channels over TIM1 + DMA burst. Fans are killed ahead of the
+wheel in every fault path. Fan 4's spin direction is re-applied at every boot because
+this ESC silently ignores DSHOT SAVE_SETTINGS. Control loop measured 4999/5000/5001 us
+with fans running — they cost it nothing.
 
-under DSHOT300; Pi 3B+ mounted, powered, camera connected (UART link to the STM32 not
+**Yaw coupling measured:** thrust-line offset, 2-3 rad/s^2, wheel peaks 4-12 rad/s.
+Small enough that no mechanical correction is needed.
 
-run yet — Phase 3). **Phase 0 (safety hardening) COMPLETE 2026-08-13** with prop guards
+**NEXT: Phase 3 — the Pi <-> STM32 wired UART link (USART6, PC6/PC7).** The Pi is
+mounted, powered and connected to its camera; the three wires are not run.
 
-deliberately skipped (decision B7) and their mitigations pushed into Phase 1.
-
-**Phase 1 COMPLETE 2026-08-13, tag `trans-p1-fans`** — fans are in the RTOS firmware:
-
-DSHOT300 on TIM1 + DMA burst, `fanTask` prio 2 = sole fan writer, fans killed ahead of
-
-the wheel in every fault path, `S<n>`/`L<pct>` manual commands, 30% compiled ceiling and
-
-a 10 s dead-man auto-zero. Control loop unaffected (ctrl period 4999/5000/5001 µs).
-
-**Active work: `TRANSLATION_DOCKING.md` Phase 2 — translation plant identification**
-
-(thrust curve, breakaway force, effective mass, yaw coupling). This is also where the
-
-rotation constants get re-identified (B6).
-
-Two known-open rotation items, deliberately deferred into that guide's Phase 2:
-
-passive desaturation no longer completes (plant shifted with the added mass —
-
-fails on the OLD firmware too, so not an RTOS defect), and `A_FRICTION` was never
-
-swept on hardware.
-
-**Active work: migrating the super-loop to FreeRTOS.** Phases 0–2 complete (the
-
-controller now runs as a single FreeRTOS task, `src/rtos_main.cpp`, env `rtos`,
-
-with no regression). **RTOS migration COMPLETE** — all seven phases done and verified on hardware (3 and 4 were
-swapped). Five tasks: focTask (4), controlTask (3), safetyTask (2), commsTask (2),
-telemTask (1). Next major work is the combined hardware retune, then translation. See §6.
+**Raw calibration data** lives in `calibration/runs/`, one folder per experiment named
+by what it established, indexed in `calibration/runs/INDEX.md`.
+`capture_calibration.py` writes new runs there automatically.
 
 ### Tuned constants — RE-IDENTIFIED AND RETUNED 2026-08-19
 

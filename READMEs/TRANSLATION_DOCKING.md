@@ -25,81 +25,50 @@ Never propose a solution that requires a scope.
 
 ## Current position
 
-**Phase 0 COMPLETE (one exception, below). Phase 1 COMPLETE, tag `trans-p1-fans`.
-Phase 2 IN PROGRESS — Steps 2.1 + 2.2 DONE 2026-08-14, 2.3 dropped (B14).
-Step 2.4 (yaw coupling) is NEXT and is the last one before the Phase 2 tag.**
+**Phases 0, 1 and 2 are COMPLETE. Phase 3 (Pi ↔ STM32 wired link) is NEXT.**
+Tags: `trans-p1-fans`, `trans-p2-plantid`.
 
-**The translational plant, identified — 66 runs over 5 sessions:**
+**Both plants are identified and the rotation axis is retuned and working:**
 
 ```
-x_ddot = A(throttle) - A_c*sign(v)        <- mass and force never needed (B14)
-A(throttle) = 2.1e-4 * pct^2  m/s^2       A(60%) = 0.76
-A_c         = 0.26 m/s^2                  breakaway at ~35% throttle
-GO / NO-GO  = 2.9x single fan, 4.2x diagonal      -> PASS ("comfortable")
+TRANSLATION (acceleration units -- mass and force cancel, B14)
+  x_ddot = A(throttle) - A_c*sign(v)
+  A(throttle) = 2.1e-4 * pct^2  m/s^2      A(60%) = 0.76
+  A_c         = 0.26 m/s^2                 breakaway ~35% throttle
+  GO/NO-GO    = 2.9x single fan, 4.2x diagonal   -> PASS
+
+ROTATION (re-identified 2026-08-15, retuned 2026-08-19)
+  A_1 47.9   A_2 4.97   a 0.098   K' 9.64   compFrac 0.90
+  K_theta 216   K_omega 52  (zeta 0.54, NOT 0.7 -- friction already damps)
+  ffFrac 0.95   A_static 60   A_moving 34   A_viscous 0
+  deadzone 1.5/0.8 deg   ALPHA_STALL_MAX 70   WHEEL_SAT_LIMIT 55
+  --> 0.47 deg mean over +-5 to +-180 deg, EVERY slew in one move,
+      wheel returns fully to rest
 ```
 
-Fans 1–3 match within 7%. **Fan 4 had a reversed spin direction** — found by
-measurement, fixed over DSHOT with zero hardware contact (B17), verified back to spec
-(0.577 ±6% at 55%). `FAN_THROTTLE_MAX` was raised 30% → 60% with a total-current
-budget added alongside it, so four channels can no longer sum past the fuse (T15).
+**Yaw coupling (2.4):** thrust-line offset, 2–3 rad/s², wheel peaks 4–12 rad/s.
+Small enough that **no mechanical correction is needed** — the Phase-7 saturation
+warning is retired.
 
-⚠️ **The dominant error source is a within-session mobility drift of ~+30%** — runs get
-stronger as a session goes on. It invalidates any cross-session comparison; anything
-comparing motors must be interleaved in one session, or use the current sensor.
+**Firmware state:** six FreeRTOS tasks. `fanTask` (prio 2, 333 Hz) is the sole fan
+writer; fans are killed ahead of the wheel in every fault path; fan 4's spin direction
+is re-applied automatically at every boot because this ESC ignores SAVE_SETTINGS.
+Control loop measured at 4999/5000/5001 µs throughout — fans cost it nothing.
 
-**Where the fans stand — all of Phase 1 is on hardware:** DSHOT300 via TIM1 + DMA burst,
-driven by `fanTask` (prio 2, 333 Hz, **sole fan writer**). Fans are in every fault path
-and go down *ahead* of the wheel (B10); `X` kills in microseconds, `R` re-arms. Manual
-control is `S<n>` (select 1–4, 0 = all) and `L<pct>` (throttle), clamped at
-`FAN_THROTTLE_MAX = 30%` inside the setter, with a 10 s dead-man auto-zero (B12).
-**The control loop is untouched:** ctrl period 4999 / 5000 / 5001 µs, FOC tick
-239–261 µs — at or better than the pre-fan baseline.
-
-**Hardware for Phase 1 is done:** ch4 moved A0 → CN10-14 (PA11); ch1–3 needed nothing
-because D7/D8/D2 *are* PA8/PA9/PA10.
-
-**Two operational gotchas, both still live:**
-1. **`stepCount` resets on reboot**, so capture filenames restart at `test01` and can
-   overwrite an earlier run with the same fan+throttle label. Start a fresh
-   `capture_calibration.py` folder after any reset. (It came within one identical
-   fan+throttle pair of costing data on 2026-08-14.)
-2. **The 10 s dead-man zeroes a fan** if nothing refreshes the command. `I`/`Q` refresh
-   every control cycle so they are safe; a manual `L` left alone is not.
-
-**One datapoint already banked for B9:** with fans spinning, bus voltage dipped to
-**11.98 V** (idle 12.30–12.40). Still far above the 10.0 V trip, but it is the first
-direct evidence that *undervoltage* is the threshold fans actually move — re-measure it
-under real load in Phase 2, as B9 requires.
-
-**⚠️ The exception: prop guards were SKIPPED by user decision (B7). The props are and
-will remain EXPOSED.** Everything else in Phase 0 is done — wires are routed clear of
-all four prop discs, the fuse and wiring are confirmed, and the battery disconnect is
-the real e-stop. The compensating mitigations are firmware-side and are now
-**requirements on Phase 1**, not suggestions: a compiled-in `FAN_THROTTLE_MAX` ceiling,
-props-off for any test that does not need thrust, and `fans_stopAll()` in the
-hardware-kill step. See B7 and Step 0.1's Result note.
-
-Everything upstream is DONE and verified on hardware:
-
-- **Rotation control** — working, tuned, closed-loop envelope tested ±30° to ±180°.
-- **RTOS migration** — COMPLETE, all seven phases, tagged `rtos-p7-complete`.
-  Five tasks, deadlines proven by response-time analysis, 27% CPU idle.
-- **Translation hardware** — 4× 2204 2300KV motors on a 45A 4-in-1 ESC, all four
-  channels confirmed spinning under DSHOT300. Props fitted.
-- **Vision hardware** — Raspberry Pi 3B+ (1 GB) and camera mounted and wired.
+**Data:** every raw capture is in `calibration/runs/`, renamed by what it established
+and indexed in `calibration/runs/INDEX.md`. `capture_calibration.py` writes new runs
+there automatically.
 
 ## What is NOT done
 
 | item | state |
 |---|---|
 | **Fan guards** | ⚠️ **SKIPPED — props are EXPOSED and will stay that way** (B7). Mitigated in firmware, not mechanically. |
-| Wire management | ✅ done 2026-08-13 — wires separated from all four prop discs |
-| Fans in the RTOS firmware | **in progress** — TIM1+DMA driver proven standalone (`fandma`, Step 1.1 ✅); not yet ported into `rtos_main.cpp` (Step 1.2) |
-| Pi ↔ STM32 link | **no wire run yet** — Pi is powered and the camera is connected, but UART is unrun (decision made: wired UART, see B1). Deferred to Phase 3 / when needed. |
-| AprilTag detection | not started |
-| Translation plant ID | not started |
-| Any translation control | not started |
-| Combined retune (rotation) | deliberately deferred — see "the retune question" below |
+| Pi ↔ STM32 link | **no wire run yet** — Pi is powered and the camera is connected, but the UART is unrun. **This is Phase 3, and it is next.** |
+| AprilTag detection | not started (Phase 4) |
+| Any translation CONTROL | not started (Phase 6) — the plant is identified, no controller written |
+| Fan 2 thrust | ⚠️ produced no measurable thrust in the 2.4 runs. **Spin it and watch before Phase 7 relies on it.** |
+| ESC current sense | wired to A4 and reading, but only 0–3 counts at 10-bit. Needs `analogReadResolution(12)` + oversampling to be useful for channel matching. |
 
 ## Decisions already made (do not relitigate — see Appendix B)
 
@@ -207,8 +176,8 @@ These are in addition to `RTOS_migration.md`'s list, which all still applies.
 |---|---|---|
 | **0 safety hardening** | ✅ **(2026-08-13)** | Wires cleared, fuse/wiring confirmed, battery disconnect = e-stop. **Prop guards deliberately skipped (B7)** — mitigations moved into Phase 1. |
 | 1 fans into the RTOS (DSHOT + DMA) | ✅ **(2026-08-13)** `trans-p1-fans` | Four DSHOT channels on TIM1+DMA burst, `fanTask` prio 2 = sole fan writer, fans in every fault path *ahead* of the wheel, `S`/`L` manual commands, 30% ceiling + 10 s dead-man. Control loop untouched: ctrl period 4999/5000/5001 µs. |
-| 2 translation plant ID | 🟡 **2.1/2.2/2.3′ ✅** | Translation: `A(pct)=2.1e-4·pct²` (66 runs), `A_c≈0.26`, **go/no-go PASS at 2.9×**; fan 4's reversed direction found and fixed over DSHOT. **Rotation re-identified and retuned (2.3′): 0.47° mean, one-move slews to ±180°, wheel returns to rest.** **2.4 (yaw coupling) NEXT — last step before the tag.** |
-| 3 Pi ↔ STM32 wired link | ⬜ | — |
+| 2 translation plant ID | ✅ **(2026-08-19)** `trans-p2-plantid` | `A(pct)=2.1e-4·pct²`, `A_c≈0.26`, **go/no-go 2.9× PASS**. Rotation re-identified + retuned: **0.47° mean, ±180° in one move, wheel returns to rest**. Yaw coupling is thrust-line offset, small (2–3 rad/s²) — no mechanical correction needed. |
+| 3 Pi ↔ STM32 wired link | ⬜ **NEXT** | — |
 | 4 vision: AprilTag pose on the Pi | ⬜ | — |
 | 5 estimator: fuse tag + IMU | ⬜ | — |
 | 6 translation control (LQR, x/y) | ⬜ | — |
@@ -1152,8 +1121,10 @@ yaw disturbance torque.
 heading against one fan, the thrust line needs mechanical correction — no control
 law fixes a persistent torque with a momentum-limited actuator.
 
-**Phase 2 exit:** `git tag trans-p2-plantid`. Update `CONTROL_README` §3 with every
-new constant and correct the rotation constants that moved.
+**Phase 2 exit:** `git tag trans-p2-plantid`. ✅ **DONE 2026-08-19.**
+`CONTROL_README` §12 carries every new constant and the four findings behind the
+rotation retune; `claude.md` §2 carries the summary. Raw captures are indexed in
+`calibration/runs/INDEX.md`.
 
 ---
 

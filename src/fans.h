@@ -92,6 +92,22 @@
    nobody is tending -- which is exactly the case it exists for. */
 #define FAN_CMD_TIMEOUT_MS 10000
 
+/* Channels that must have SPIN_DIRECTION_REVERSED applied at EVERY boot.
+   Bit (ch-1): bit3 = fan 4.
+
+   WHY AT BOOT RATHER THAN SAVED IN THE ESC: DSHOT command 12 (SAVE_SETTINGS) does
+   not stick on this ESC. Command 21 takes effect immediately and works, but the save
+   is silently ignored, so the reversal is lost on every power cycle -- which matches
+   what we already know about this ESC's incomplete DSHOT command table (the beep,
+   command 1, has never worked either). Re-applying at boot costs ~30 ms and removes
+   the failure mode entirely: fan 4 spun backwards through part of a Step 2.4 session
+   before anyone noticed, which cost those runs.
+
+   Set to 0 if the ESC is ever reflashed with firmware that honours SAVE_SETTINGS. */
+#define FAN_REVERSE_MASK   0x08
+#define DSHOT_CMD_DIR_REVERSED 21
+#define FAN_CFG_REPS       10
+
 /* Configure TIM1 + DMA2_Stream5 + PA8..PA11, and create fanTask (prio 2).
    Call ONCE, pre-scheduler, from setup(). Touches nothing SimpleFOC owns:
    TIM2/TIM3 (motor PWM), SPI2 (encoder) and I2C1 are all untouched, and DMA1/DMA2
