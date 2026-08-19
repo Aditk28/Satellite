@@ -15,6 +15,7 @@ static TaskHandle_t      s_task    = nullptr;
 static Stream*           s_usb     = nullptr;
 static Stream*           s_bt      = nullptr;
 static void            (*s_emergency)(void) = nullptr;
+static void            (*s_auxPoll)(void)   = nullptr;
 static volatile uint32_t s_rxBytes = 0;
 static volatile uint32_t s_drops   = 0;
 
@@ -57,6 +58,9 @@ static void commsTask(void*) {
     vTaskDelay(pdMS_TO_TICKS(POLL_PERIOD_MS));
     pump(s_usb, bufU);
     pump(s_bt,  bufB);
+    /* Phase 3: the Pi pose link. Deliberately NOT pump()ed -- it is a binary
+       stream and must never reach line assembly or the X fast path. */
+    if (s_auxPoll) s_auxPoll();
   }
 }
 
@@ -74,6 +78,8 @@ bool commands_next(String& out) {
   out = String(m.line);
   return true;
 }
+
+void commands_setAuxPoll(void (*fn)(void)) { s_auxPoll = fn; }
 
 uint32_t commands_rxBytes(void) { return s_rxBytes; }
 uint32_t commands_drops(void)   { return s_drops; }

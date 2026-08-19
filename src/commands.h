@@ -36,6 +36,18 @@
                       waiting up to a full 5 ms control period. May be NULL. */
 void commands_init(Stream& usb, Stream& bt, void (*emergencyHook)(void));
 
+/* Register a function for commsTask to call once per poll, after the operator
+   ports are pumped. Phase 3 uses it for the Pi pose link (pi_poll), which shares
+   this task's 2 ms cadence rather than adding a seventh task and its stack.
+
+   Registered rather than #included so commands.cpp stays generic and keeps no
+   dependency on the link -- the same wiring idiom as faults_setHwKillHook() and
+   safety_setFanMonitor().
+
+   CONTRACT: runs on commsTask at prio 2 and MUST NOT BLOCK. Anything that waits
+   here delays the operator X fast path. */
+void commands_setAuxPoll(void (*fn)(void));
+
 /* Drain one queued command line. Call from the control task at the top of its
    cycle. Returns false when the queue is empty. */
 bool commands_next(String& out);

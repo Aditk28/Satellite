@@ -867,18 +867,20 @@ gyro read; it now runs at a flat 4 kHz straight through it.
 | `E` | Encoder diagnostic — motor off, stream shaft angle/velocity to hand-turn the wheel |
 | `V<V>` | Manual constant-voltage drive + unlimited encoder stream; any key stops |
 | `S<n>` | **Fans:** select channel 1–4, or `S0` for all four |
-| `L<pct>` | **Fans:** throttle the selection. `L0` = off but still armed. Clamped to `FAN_THROTTLE_MAX` = 30%, and auto-zeroes after 10 s with no refresh |
+| `L<pct>` | **Fans:** throttle the selection. `L0` = off but still armed. Clamped to `FAN_THROTTLE_MAX` = 60%, and auto-zeroes after 10 s with no refresh |
 
 **Fan safety.** `X` and every fault path hard-kill the fans **before** the wheel — the
 props are unguarded by choice (`TRANSLATION_DOCKING.md` B7), so they are the larger
 hazard. A hard kill drives PA8–PA11 low as GPIO rather than trusting the DMA path, and
-latches; `R` re-arms (~1 s). The 30% ceiling is applied inside `fans_setThrottle()`, so
-a runaway control law is bound by it too.
+latches; `R` re-arms (~1 s). The **60%** ceiling (`FAN_THROTTLE_MAX`, `fans.h`; raised
+from the 30% bring-up value for Phase 2 plant ID) is applied inside
+`fans_setThrottle()`, so a runaway control law is bound by it too.
 
 **Any unrecognised input stops the motor.** Deliberate — a confused operator
 should not leave a flywheel spinning.
 
-Safety: hard abort above `WHEEL_SAT_LIMIT` = 45 rad/s. This dumps the wheel
+Safety: hard abort above `WHEEL_SAT_LIMIT` = 55 rad/s (`rtos_main.cpp`; the
+`superloop` regression sketch still carries the older 45). This dumps the wheel
 instantly, which spins the platform (roughly 42 rad/s² against a 4.24 breakaway).
 Accepted behaviour; with the current clamp it should not be reached.
 
@@ -999,7 +1001,7 @@ between tests otherwise, which silently turns a `T-60` into a 120° slew.
 7. **Enable feedforward** at `F0.85` and repeat the nudge. Should return closer.
 8. **Gain progression: work DOWN the table**, re-running `T90` each time. Stop and
    back off one row on ringing, audible buzz (lower `D` only), or the wheel
-   climbing toward 45 rad/s.
+   climbing toward 55 rad/s.
 9. **Friction magnitude (`A`), then feedforward trim (`F`).** These act on the
    same product `ffFrac × A_FRICTION`, so sweep one. Break-free from rest needs
    about 28 delivered. Parks short and the wheel winds → raise; overshoots then
@@ -1363,7 +1365,8 @@ both Bluejay and BLHeli_S, so it is the correct target regardless.
 throttle became a comfortable 50% purely by flipping one prop. Check orientation
 and handedness before concluding you need larger props.
 
-**Third: all four DSHOT channels must share one GPIO port** (PA8/PA9/PA10/PA0).
+**Third: all four DSHOT channels must share one GPIO port** (now PA8/PA9/PA10/**PA11**,
+all four on TIM1_CH1–CH4; ch4 moved off PA0 in Phase 1).
 Putting channel 4 on PC7 forced either a port parameter or a duplicated send
 function, and every such variant broke the previously-working channels.
 

@@ -58,8 +58,18 @@ with fans running — they cost it nothing.
 **Yaw coupling measured:** thrust-line offset, 2-3 rad/s^2, wheel peaks 4-12 rad/s.
 Small enough that no mechanical correction is needed.
 
-**NEXT: Phase 3 — the Pi <-> STM32 wired UART link (USART6, PC6/PC7).** The Pi is
-mounted, powered and connected to its camera; the three wires are not run.
+**Phase 3 IN PROGRESS. Step 3.1 DONE (2026-08-19): the Pi <-> STM32 link is wired and
+proven.** USART6, PC6 (CN10-4) / PC7 (D9) / GND. The Pi was moved off the mini-UART onto
+the PL011 with `dtoverlay=disable-bt` -- on a 3B+ the header pins are `ttyS0`, whose baud
+is clocked from the scaling VPU core clock, so the link would have started failing exactly
+when AprilTag loaded the CPU (trap T28). `src/pi_link.*` owns USART6 as sole reader AND
+sole writer; `pi_poll()` rides `commsTask`'s 2 ms poll via `commands_setAuxPoll()` and is
+deliberately kept out of the operator parser, because a binary `0x58` would otherwise read
+as `X` and stop the wheel (decision B18). Verified 10/10 echo, RTT 2.61/3.52/5.32 ms.
+
+**NEXT: Step 3.2 — the framed protocol** (`[0xA5][0x5A][len][payload][crc16]`), CRC
+counters, timestamp/latency field, and the stale-pose fail-safe. **Step 3.1's raw echo
+must be deleted there.**
 
 **Raw calibration data** lives in `calibration/runs/`, one folder per experiment named
 by what it established, indexed in `calibration/runs/INDEX.md`.
@@ -133,7 +143,7 @@ to spend on added latency in the sense→command path.
 
 because 0.105 < 0.123. Anything that changes how `ω_w` is estimated can flip that
 
-margin and turn passive unwind into passive windup toward the 45 rad/s abort.
+margin and turn passive unwind into passive windup toward the 55 rad/s abort.
 
 **Verify unwind behavior after any change touching FOC rate or velocity
 
@@ -530,7 +540,9 @@ decision B7). Wiring IS secured and routed clear of all four prop discs (Step 0.
 
 Because there is no mechanical containment, the safety story is entirely firmware and
 
-procedure: **`FAN_THROTTLE_MAX` compiled in (30% for bring-up, clamped inside
+procedure: **`FAN_THROTTLE_MAX` compiled in (60%, raised from the 30% bring-up ceiling
+
+for Phase 2 plant ID; clamped inside
 
 `fans_setThrottle()`), props physically off for any test that does not need thrust, the
 
@@ -546,7 +558,9 @@ fuse and 18 AWG wiring (15 A max) were sized for low throttle.
 
   deliberate, keep it.
 
-- `WHEEL_SAT_LIMIT = 45 rad/s` is a hard abort.
+- `WHEEL_SAT_LIMIT = 55 rad/s` is a hard abort (`rtos_main.cpp`; the `superloop`
+
+  regression sketch still carries the older 45).
 
 - Every failure path (assert, stack overflow, malloc fail, watchdog) must disable
 

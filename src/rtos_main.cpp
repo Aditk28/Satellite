@@ -150,6 +150,7 @@
 #include "i2c_bus.h"         // Phase 5.2: I2C mutex (control MPU + safety INA219)
 #include "commands.h"        // Phase 6: commsTask owns serial RX
 #include "fans.h"            // Translation 1.2: fanTask is the SOLE fan writer
+#include "pi_link.h"         // Translation 3.1: USART6 pose link, sole owner of that port
 #include <Adafruit_INA219.h>
 
 // ------------------------- hardware -------------------------
@@ -163,6 +164,16 @@
 #define HC05_EN_PIN     PC12
 #define HC05_BAUD       115200
 HardwareSerial hc05Serial(PC11, PC10);
+
+// Translation Phase 3: the Raspberry Pi pose link on USART6.
+// ARGUMENT ORDER IS (RX, TX) -- same as hc05Serial above, where PC11 is
+// USART3_RX and PC10 is USART3_TX. So PC7 (USART6_RX) first, PC6 (USART6_TX)
+// second. Reversing these compiles cleanly and produces a dead link.
+// 115200: payload is ~20 B at 10-30 Hz = ~600 B/s, ~6% utilised, and it matches
+// the VCP and HC-05 so there is one baud to remember. It also keeps a 2 ms
+// commsTask poll at ~23 bytes, well inside the core's 64-byte RX ring.
+#define PI_BAUD         115200
+HardwareSerial piSerial(PC7, PC6);
 
 #define VOLTAGE_LIMIT   10.0f
 // Ceiling on the O/C open-loop pulse. Plateau = 9.64*V - 1.23, so 5.5 V -> 51.8 rad/s,
@@ -687,6 +698,15 @@ void printGains() {
             + "  stack free (words): " + String(fans_stackFreeWords()));
   printBoth("fans pct: " + String(fans_pct(1), 1) + " / " + String(fans_pct(2), 1)
             + " / " + String(fans_pct(3), 1) + " / " + String(fans_pct(4), 1));
+  // Translation 3.1: the Pi link. rx climbing when the Pi sends is the whole
+  // Step 3.1 verify. maxburst approaching the core's 64-byte RX ring would mean
+  // the 2 ms poll is losing the race; txdrops means the echo outran the TX ring.
+  printBoth(String("pi link: rx=") + String(pi_rxBytes())
+            + "  tx=" + String(pi_txBytes())
+            + "  txdrops=" + String(pi_txDrops())
+            + "  maxburst=" + String(pi_maxBurst())
+            + "  last=0x" + String(pi_lastByte(), HEX)
+            + "  (USART6 PC6/PC7 @ " + String(PI_BAUD) + ")");
   if (fans_overruns()) {
     uint32_t nl, nmin, nmax, cen;
     fans_overrunDetail(&nl, &nmin, &nmax, &cen);
@@ -1723,6 +1743,13 @@ void setup() {
   // Phase 6: commsTask (prio 2) becomes the SOLE serial READER. Created before the
   // control task; harmless if bytes arrive early, they just queue.
   commands_init(Serial, hc05Serial, commsEmergencyStop);
+
+  // Translation 3.1: the Pi pose link. piSerial is passed to pi_init, NEVER to
+  // commands_init -- it carries a binary stream, and commsTask's line assembly
+  // would read a 0x58 payload byte as 'X' and stop the wheel. See pi_link.h /
+  // decision B18. pi_poll shares commsTask's existing 2 ms poll.
+  pi_init(piSerial, PI_BAUD);
+  commands_setAuxPoll(pi_poll);
 
   // Phase 1.2 (translation): fanTask (prio 2) becomes the SOLE fan writer. Touches
   // only TIM1 + DMA2_S5 + PA8..PA11 -- nothing SimpleFOC, the encoder or I2C owns.

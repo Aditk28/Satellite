@@ -25,8 +25,17 @@ Never propose a solution that requires a scope.
 
 ## Current position
 
-**Phases 0, 1 and 2 are COMPLETE. Phase 3 (Pi ↔ STM32 wired link) is NEXT.**
+**Phases 0, 1 and 2 are COMPLETE. Phase 3 is IN PROGRESS — Step 3.1 (physical link)
+is DONE and verified on hardware 2026-08-19; Step 3.2 (framed protocol) is NEXT.**
 Tags: `trans-p1-fans`, `trans-p2-plantid`.
+
+**The Pi link is physically up.** USART6 PC6/PC7 wired, Pi moved onto the PL011
+rather than the mini-UART (**T28** — this is the one that would have bitten in
+Phase 4), `pi_link.*` owns the port as sole reader *and* sole writer, and a
+Pi-side send/echo test ran **10/10 clean, RTT min/mean/max 2.61 / 3.52 / 5.32 ms**,
+with `rx=120 tx=120 txdrops=0 maxburst=12 last=0x49` on the STM32 side. Bytes
+cross in both directions. **There is no protocol yet** — 3.1 counts and echoes raw
+bytes, and **the echo MUST be deleted in 3.2**.
 
 **Both plants are identified and the rotation axis is retuned and working:**
 
@@ -64,7 +73,7 @@ there automatically.
 | item | state |
 |---|---|
 | **Fan guards** | ⚠️ **SKIPPED — props are EXPOSED and will stay that way** (B7). Mitigated in firmware, not mechanically. |
-| Pi ↔ STM32 link | **no wire run yet** — Pi is powered and the camera is connected, but the UART is unrun. **This is Phase 3, and it is next.** |
+| Pi ↔ STM32 link | ✅ **wired and proven** (Step 3.1, 2026-08-19) — USART6, bytes cross both ways, 10/10 echo. ⬜ **No framing/CRC/pose yet** — that is Step 3.2, and it is next. |
 | AprilTag detection | not started (Phase 4) |
 | Any translation CONTROL | not started (Phase 6) — the plant is identified, no controller written |
 | Fan 2 thrust | ⚠️ produced no measurable thrust in the 2.4 runs. **Spin it and watch before Phase 7 relies on it.** |
@@ -136,7 +145,8 @@ These are in addition to `RTOS_migration.md`'s list, which all still applies.
    pad, and the ESC never armed. Throttle-range calibration also produces no beeps,
    because analog range calibration does not exist in that firmware.
 2. **All four DSHOT channels must be on the SAME GPIO PORT** (currently GPIOA:
-   PA8/PA9/PA10/PA0). Putting channel 4 on PC7 forced either a port parameter or a
+   **PA8/PA9/PA10/PA11** — ch4 moved off PA0 in Phase 1, B5). Putting channel 4 on
+   PC7 forced either a port parameter or a
    duplicated send function, and **every such variant broke the previously-working
    channels**. Root cause never fully proven; the fix that works is to keep one
    port and one `dshotSend()`. Do not "clean this up."
@@ -177,7 +187,7 @@ These are in addition to `RTOS_migration.md`'s list, which all still applies.
 | **0 safety hardening** | ✅ **(2026-08-13)** | Wires cleared, fuse/wiring confirmed, battery disconnect = e-stop. **Prop guards deliberately skipped (B7)** — mitigations moved into Phase 1. |
 | 1 fans into the RTOS (DSHOT + DMA) | ✅ **(2026-08-13)** `trans-p1-fans` | Four DSHOT channels on TIM1+DMA burst, `fanTask` prio 2 = sole fan writer, fans in every fault path *ahead* of the wheel, `S`/`L` manual commands, 30% ceiling + 10 s dead-man. Control loop untouched: ctrl period 4999/5000/5001 µs. |
 | 2 translation plant ID | ✅ **(2026-08-19)** `trans-p2-plantid` | `A(pct)=2.1e-4·pct²`, `A_c≈0.26`, **go/no-go 2.9× PASS**. Rotation re-identified + retuned: **0.47° mean, ±180° in one move, wheel returns to rest**. Yaw coupling is thrust-line offset, small (2–3 rad/s²) — no mechanical correction needed. |
-| 3 Pi ↔ STM32 wired link | ⬜ **NEXT** | — |
+| 3 Pi ↔ STM32 wired link | 🔶 **IN PROGRESS** | **3.1 ✅ (2026-08-19)** USART6 PC6/PC7 up; Pi forced onto the PL011 (T28); `pi_link.*` sole owner of the port, polled from `commsTask` and deliberately kept out of the operator parser (B18). 10/10 echo, RTT 2.61/3.52/5.32 ms. **3.2 ⬜ framed protocol + CRC + fail-safe — NEXT.** |
 | 4 vision: AprilTag pose on the Pi | ⬜ | — |
 | 5 estimator: fuse tag + IMU | ⬜ | — |
 | 6 translation control (LQR, x/y) | ⬜ | — |
@@ -223,12 +233,14 @@ These are in addition to `RTOS_migration.md`'s list, which all still applies.
 | PB8 / PB9 | D15 / D14 | I2C1 SCL / SDA | MPU6050 + INA219 |
 | PC10 / PC11 / PC12 | — | HC-05 TX / RX / EN | USART3 |
 | PA2 / PA3 | D1 / D0 | ST-LINK VCP | USART2 |
-| **PA8** | **D7** | **fan ch1 DSHOT** | GPIO bit-bang |
-| **PA9** | **D8** | **fan ch2 DSHOT** | GPIO bit-bang |
-| **PA10** | **D2** | **fan ch3 DSHOT** | GPIO bit-bang |
-| **PA0** | **A0** | **fan ch4 DSHOT** | GPIO bit-bang (**not** D9/PC7) |
-| PC1 | A4 | ESC current sense (optional) | unwired |
-| **PC6 / PC7** | — / D9 | **PROPOSED Pi link** | USART6 — free |
+| **PA8** | **D7** | **fan ch1 DSHOT** | TIM1_CH1, AF1 + DMA2_S5 burst |
+| **PA9** | **D8** | **fan ch2 DSHOT** | TIM1_CH2, AF1 + DMA2_S5 burst |
+| **PA10** | **D2** | **fan ch3 DSHOT** | TIM1_CH3, AF1 + DMA2_S5 burst |
+| **PA11** | **CN10-14** | **fan ch4 DSHOT** | TIM1_CH4, AF1 + DMA2_S5 burst (**moved from PA0/A0 in Phase 1 — B5**) |
+| PA0 | A0 | *(free — was fan ch4 before B5)* | — |
+| PC1 | A4 | ESC current sense | **WIRED and read** — `ESC_CUR_PIN`, `analogRead` at 20 Hz on `controlTask`, logged as `cap_cur`. ⚠️ 10-bit, reads only 0–3 counts; needs `analogReadResolution(12)` + oversampling to be useful |
+| **PC6** | **CN10-4** | **Pi link TX** | USART6_TX → Pi GPIO15 (pin 10). **WIRED 2026-08-19.** ⚠️ `CN10-8` = **U5V**, three positions along the same column — meter the pin before connecting the Pi |
+| **PC7** | **D9** | **Pi link RX** | USART6_RX ← Pi GPIO14 (pin 8). **WIRED 2026-08-19.** PC7's old DSHOT-ch4 warning is retired: ch4 is on PA11 |
 
 **Timers:** TIM2 + TIM3 = motor PWM (25 kHz, centre-aligned) · TIM5 = 1 MHz µs
 timebase · TIM9 = 4 kHz FOC/control tick · **free: TIM1, TIM4, TIM8, TIM10–12.**
@@ -247,7 +259,7 @@ TIM4 is free but **deliberately unused** — TIM4_CH1 is PB6, the driver enable.
 Battery input is the separate large `⊕`/`⊖` pads; the supplied capacitor goes
 directly across them with the shortest possible leads.
 
-## Firmware architecture (five FreeRTOS tasks)
+## Firmware architecture (six FreeRTOS tasks)
 
 | task | prio | period | owns |
 |---|---|---|---|
@@ -255,6 +267,7 @@ directly across them with the shortest possible leads.
 | `controlTask` | 3 | 5 ms (200 Hz) | gyro read, control law, capture, command execution |
 | `safetyTask` | 2 | 50 ms (20 Hz) | wheel overspeed, heartbeat watchdog, INA219 power |
 | `commsTask` | 2 | 2 ms poll | serial RX + line assembly — **sole reader** |
+| `fanTask` | 2 | 3 ms (333 Hz) | DSHOT300 on TIM1 + DMA burst — **sole fan writer** (added Phase 1; period 2→3 ms by B13) |
 | `telemTask` | 1 | event | **all** serial output — **sole writer** |
 
 One TIM9 interrupt at 4 kHz notifies `focTask` every tick and `controlTask` every
@@ -1159,6 +1172,62 @@ otherwise inject boot text into your protocol.
 powered from the same battery. Run the ground wire *in the same bundle* as TX/RX.
 This is the same shared-impedance argument as the ESC signal ground.
 
+**⚠️ Trap — the guide text above was WRONG for a Pi 3B+, corrected 2026-08-19.**
+"Disable the serial console on `/dev/ttyAMA0`" is generic Pi advice. On a 3B+ the
+PL011 (`ttyAMA0`) is wired to the **Bluetooth modem**, and GPIO14/15 get the
+**mini-UART** (`ttyS0`) whose baud generator is clocked from the **VPU core
+clock** — which the governor scales with CPU load. See **T28**; the fix is
+`dtoverlay=disable-bt`, and it is not optional.
+
+**Result (2026-08-19) — PASSED, both directions.**
+
+Wiring as specified: Pi pin 8 → **PC7 = D9** (Arduino header, female socket), Pi
+pin 10 → **PC6 = CN10-4** (morpho, needs a female Dupont), Pi pin 6 → GND, run in
+one bundle. ⚠️ **`CN10-8` is `U5V`, three positions from the target in the same
+column** — landing the Pi's 3.3 V RX there damages the Pi, so the pin was
+confirmed with a meter (DC rail presence check, ~0 V vs 5 V) before the Pi was
+connected. Counting was done relative to the known `PA11 = CN10-14` from Phase 1
+rather than from the header end.
+
+**Pi side** (`disable-bt` applied, `hciuart.service` did not exist on this image —
+benign, it means nothing was contending for the UART in the first place):
+
+```
+ls -l /dev/serial0  ->  serial0 -> ttyAMA0        <- the check that matters
+loopback GPIO14<->GPIO15, 115200  ->  b'HELLO\n'  <- port proven BEFORE the STM32
+```
+
+**Firmware:** new `src/pi_link.{h,cpp}` (sole reader *and* sole writer of USART6),
+`commands_setAuxPoll()` added to `commands.{h,cpp}` so `pi_poll()` rides
+`commsTask`'s existing 2 ms poll with no seventh task, and `piSerial(PC7, PC6)` +
+one `pi link:` line in `G` in `rtos_main.cpp`. All six environments compile.
+
+**Measured, read off the terminal:**
+
+```
+Pi:     10/10 clean    rtt min/mean/max = 2.61 / 3.52 / 5.32 ms
+STM32:  pi link: rx=120  tx=120  txdrops=0  maxburst=12  last=0x49
+        ctrl stack free (min words): 485
+        power: busV 11.89-11.96   |I| max 44 mA   read fails=0
+```
+
+`rx = 120` = 10 × 12 bytes exactly, `last=0x49` = `'I'`, the final character of
+`PING-FROM-PI`, so the tail is not being lost. `maxburst=12` means a whole payload
+drains in one poll; `txdrops=0` means the echo never outran the 64-byte TX ring.
+
+**Finding carried forward — the RTT distribution is bimodal, and the test caused
+it.** Seven samples clustered at 2.6–3.0 ms and three at 4.9–5.3 ms with *nothing
+between*, rather than the uniform smear across the 2 ms poll window that was
+predicted. Most likely cause: `pi_link_test.py` paces at `time.sleep(0.2)`, and
+200 ms is **exactly 100 × the 2 ms poll period**, so every trial lands at nearly
+the same phase relative to `commsTask` instead of a random one — the clusters are
+aliasing, and the drift between them is the two boards' clocks walking. Pi-side
+Linux scheduling jitter is a competing explanation and this data cannot separate
+them. **Not chased — 3.1's question was "do bytes cross," and they do.** But see
+**T29**: this must be fixed before latency is ever *characterised*, because the
+Phase 5 estimator consumes a latency figure and an aliased test measures a phase,
+not a distribution.
+
 ## Step 3.2 — Protocol
 
 **Concept.** The Phase-6 RTOS work established deferred interrupt processing:
@@ -1415,7 +1484,7 @@ during translation.
 as it already does; the question is whether it saturates.
 
 **Verify.** Translate 30 cm while holding heading. Log wheel speed throughout —
-**if `ω_w` walks toward the 45 rad/s abort, the yaw disturbance exceeds what passive
+**if `ω_w` walks toward the 55 rad/s abort, the yaw disturbance exceeds what passive
 desaturation can absorb** and the thrust lines need mechanical correction.
 
 **Trap.** Passive desaturation is *already* not completing (see "the retune
@@ -1529,6 +1598,8 @@ write-up more credible, not less. Do the same here.
 | T25 | **A diagnostic command's own clamp limiting the identification** | `O<V>` was hard-limited to ±3 V, so the wheel plant had only ever been characterised to 28 rad/s — while a 90° slew takes it to 50. Every constant was an extrapolation to ~2× the measured range, and nobody noticed because the clamp was invisible from the data. **Check the tool's limits before trusting the model's range.** |
 | T26 | **Persisting SOME tuned values to source** | Five of seven were written in and the two gains left at their placeholder. The result is not "slower", it is *specifically broken*: the deadband floor scales as `1/K_θ`, so low gains put the deadzones below the floor, feedforward never switches off, and the wheel winds forever. Six T90s ended 21–63° short. **Persist a tuned set atomically, or not at all.** |
 | T27 | **"Fixing" the two-stage deadzone chatter** | The `FINE_WW` comparison chatters — crossing it toggles the tolerance, which toggles the controller, which drives `ω_w` back across. Latching the transition measured **worse** (mean 0.97→1.25°, worst 1.47→3.10, wheel peaks 6–17→8–36): the chatter is a *safety valve* that lets the controller give up and the wheel bleed. Reverted. Do not re-fix without n ≥ 8 evidence. |
+| T28 | **Pi 3B+: GPIO14/15 are the mini-UART, not the PL011** | The BCM2837 has two UARTs. With Bluetooth enabled the PL011 (`ttyAMA0`) is wired to the **BT modem**, and the header pins get the **mini-UART** (`ttyS0`) — whose baud generator is clocked from the **VPU core clock**, which the governor scales with CPU load and temperature. The failure mode is vicious: the link is perfect at idle and starts throwing framing errors **exactly when AprilTag detection loads the CPU**, so it presents in Phase 4 as a vision bug, an EMI problem, or a bad ground — anything but the wiring session three steps earlier that introduced it. Fix: `dtoverlay=disable-bt` in `/boot/firmware/config.txt` (`/boot/config.txt` pre-Bookworm) + `enable_uart=1` + console off via `raspi-config`. **The check that actually confirms it is `ls -l /dev/serial0` resolving to `ttyAMA0`, not `ttyS0`** — everything else can look right while the port is still the wrong one. Costs Pi Bluetooth, which B1 already chose not to use. `hciuart.service` may not exist on Lite images; that is benign, not a failure. |
+| T29 | **Timing a periodic system at a commensurate interval** | `pi_link_test.py` paced at 200 ms against a 2 ms poll — an exact 100× multiple — so every sample landed at the same phase and the RTT came out **bimodal** (7 at 2.6–3.0 ms, 3 at 4.9–5.3, nothing between) instead of spread across the poll window. An aliased test measures **a phase, not a distribution**, and reports a confidently wrong mean. Harmless for a yes/no "do bytes cross" check; **not harmless for the Phase 5 estimator, which consumes a latency figure.** Before latency is characterised rather than merely observed, pace with a non-commensurate or randomised interval (197 ms, or jitter it) and take enough samples to see the actual shape. Same family as T20 — tick-granular reasoning hiding a sub-tick reality. |
 
 Plus **every trap in `RTOS_migration.md` Appendix A** — the one-writer/one-reader
 invariants, `delay()`, watchdogs measuring iterations instead of time, and the rest.
@@ -1556,7 +1627,8 @@ invariants, `delay()`, watchdogs measuring iterations instead of time, and the r
 | **B15** | **No table tilt — asserted by the user, not measured** | 2026-08-13. The measured accel bias magnitude (0.177–0.181 m/s², stable to 2% across a power cycle) corresponds to ~1.05° of tilt-equivalent *if* it were tilt, which would be 3× the 0.3° planning figure §18 warns about and comparable to friction itself. A `B` → rotate 180° → `B` test would separate world-fixed tilt from body-fixed sensor bias in 30 s. **The user has confidently asserted the table is level and declined the test; treated as sensor zero-g offset (16 mg, well inside MPU6050 spec) and not pursued further.** Recorded only so that if translation later shows a persistent directional drift that no controller seems to fix, this is the first thing to re-examine. |
 | **B16** | **Single-fan (`S1`) thrust steps, not all-four** | 2026-08-13. The four fans are opposing pairs (§18: "only one fan works for N/S/E/W; a diagonal splits across two"), so `S0` + a thrust step is **near-zero net thrust** — the pairs fight each other, producing heat and current and almost no motion. Per-motor curves need one fan at a time anyway. `S0` is kept for a different job: four motors drawing at a known throttle with the platform stationary is the clean way to answer the fuse/current question (T15) before raising `FAN_THROTTLE_MAX` above 30%. |
 | **B17** | **Fan 4 spin direction reversed in ESC firmware over DSHOT, not by touching hardware** | 2026-08-14. Three motors spun one way and one the other against 2 CW + 2 CCW props, so one fan had prop handedness mismatched to its rotation — costing ~half thrust (T3), and fan 4 could not break stiction at all. Fixed by sending DSHOT special commands from the firmware: `S4` → `J21` (SPIN_DIRECTION_REVERSED ×10) → `J12` (SAVE_SETTINGS ×10) → power-cycle. Implemented as a **general command primitive** (`fans_sendCommand`, serial `J<cmd>`) rather than a one-shot, because this ESC's DSHOT command table is demonstrably incomplete — the beep command has never worked on it — so being able to try 21, then 8, then 7 and observe was the point. **Command 21 worked.** Protocol details that are load-bearing: the telemetry-request bit must be SET to distinguish a command from a throttle value, the motor must be stopped, and the command must be repeated (~10 frames). Chosen over swapping props (hardware contact, and it only moves the mismatch) and over swapping phase wires (most invasive). **Verified by measurement, not just by eye:** fan 4 went from not moving at 40% to 0.577 ±6% at 55%. |
-| **B18** | *(next decision goes here)* | |
+| **B18** | **The Pi port is NEVER passed to `commands_init()` — `pi_link.*` owns USART6 outright, and `pi_poll()` rides `commsTask` via a registered callback** | 2026-08-19, Step 3.1. **The safety half:** `commsTask`'s contract is line assembly plus *any unrecognised input stops the motor*, with an `X` fast path that fires **before the line is even queued**. The Pi sends binary pose frames, so a payload byte of `0x58` is `'X'` and would stop the wheel mid-slew, a `0x0A` mid-frame is a line terminator, and Pi boot chatter arrives as a scatter of commands. The operator parser and the pose parser must never share a code path — so the Pi port gets its own reader from day one, before there is any protocol to get wrong. **The invariant half:** B15 (sole writer) and the sole-reader rule are stated over `Serial`/`hc05Serial`, but what they actually protect is that **`HardwareSerial` is not reentrant *per port*.** USART6 is touched by nothing else, so `pi_link` is both its sole reader and its sole writer — the same requirement satisfied by ownership rather than by arbitration. **The structural half:** `pi_poll()` is wired in with `commands_setAuxPoll()` rather than `#include "pi_link.h"` inside `commands.cpp`, matching the two existing registered-callback precedents (`faults_setHwKillHook` B10, `safety_setFanMonitor`); this keeps proven code generic and adds **no seventh task and no new stack** — the link rides the 2 ms poll that already exists, which is also where Appendix C puts it. Rejected: a dedicated `piTask` (more RTOS surface for a port that produces ~600 B/s), and extending `commands_init` to three streams (would have put a binary stream one `if` away from the motor-stop path). **Step 3.1's echo is a temporary diagnostic and must be deleted in 3.2** — a framed protocol that echoes its own payload back at the sender is a feedback loop. |
+| **B19** | *(next decision goes here)* | |
 
 ---
 
@@ -1573,7 +1645,7 @@ invariants, `delay()`, watchdogs measuring iterations instead of time, and the r
   │  controlTask(3) 200 Hz  IMU → estimator → 3-DOF LQR → allocation        │
   │  safetyTask (2) 20 Hz   wheel + fans + power + heartbeat                │
   │  commsTask  (2) 2 ms    HC-05 operator + Pi pose link                   │
-  │  fanTask    (2) 2-4 ms  DSHOT via TIM1 + DMA  (sole fan writer)         │
+  │  fanTask    (2) 3 ms    DSHOT via TIM1 + DMA  (sole fan writer)         │
   │  telemTask  (1) event   sole serial writer                              │
   └────────────────────────────────────────────────────────────────────────┘
             │                          │                        │
