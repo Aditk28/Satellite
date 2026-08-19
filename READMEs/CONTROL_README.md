@@ -4,12 +4,13 @@ Closed-loop heading control of a free-floating platform using a single reaction
 wheel. System identification, control design, firmware, tuning procedure, and
 measured performance.
 
-**Status:** working, tuning incomplete. Closed loop validated across a ±30° to
-±180° envelope at a mean final error of 1.20° and 1.6 s settling, but the
-terminal approach is **inconsistent** — roughly half of large negative slews
-stall a few degrees short and need a retry. Cause is understood and documented
-in §7 and §17; the fix needs a friction recalibration that has been deliberately
-deferred. **Translation hardware is BUILT and TESTED — control not started (§18).
+**Status: working, and RE-IDENTIFIED + RETUNED 2026-08-19** for the current
+(translation-hardware-fitted) platform. Closed loop now lands **0.47° mean over ±5° to
+±180°, every slew in one move, wheel returning fully to rest.** The terminal-approach
+inconsistency that dominated the previous entry is fixed — see §12 for the four changes
+that mattered (unstable `compFrac`, a feedforward that conflated static with kinetic
+friction, a clamp that had silently become the binding constraint, and ζ = 0.54 rather
+than the 0.7 the table assumes). **Translation hardware is BUILT and TESTED — control not started (§18).
 The active build guide is `TRANSLATION_DOCKING.md`.**
 
 **Why deferred:** adding the fan subsystem changes the platform's mass,
@@ -886,14 +887,77 @@ MPU6050 / INA219 / Unified Sensor / BusIO, Wire, SPI.
 
 ### Current tuned values
 
+**RE-IDENTIFIED AND RETUNED 2026-08-15/19**, after the translation hardware was
+fitted. Every number below is measured on the current platform.
+
 ```
-A_1 = 45.5    A_2 = 5.35    a = 0.19 nominal (true ~0.15)
-GYRO_SIGN = −1              compFrac = 0.89
-K_θ = 119.3   K_ω = 35.1    ffFrac = 0.90    A_FRICTION = 28.3  (needs sweeping)
-deadzone = 2.0°             deadzoneFine = 2.0°       FINE_WW = 5 rad/s
-ALPHA_STALL_MAX = 55        STALL_WW = 25             WHEEL_SAT_LIMIT = 45
-MAX_STALL_RETRIES = 3
+A_1 = 47.9    A_2 = 4.97    a = 0.098        K' = 9.64 (incremental)
+GYRO_SIGN = −1              compFrac = 0.90
+K_θ = 216     K_ω = 52      ffFrac = 0.95
+A_static = 60   A_moving = 34   A_viscous = 0    <-- feedforward is now SPLIT
+deadzone = 1.5°             deadzoneFine = 0.8°       FINE_WW = 5 rad/s
+ALPHA_STALL_MAX = 70   STALL_WW = 20   STALL_MS = 300   STALL_HOLD_MS = 4500
+WHEEL_SAT_LIMIT = 55        MAX_STALL_RETRIES = 3
 ```
+
+**Measured performance, 6 consecutive runs, 2026-08-19:**
+
+| target | final error | wheel peak | wheel at end | settle to 0.8° |
+|---|---|---|---|---|
+| +90° | −0.03° | 34.9 | **0.1** | 0.68 s |
+| +90° | −0.77° | 33.7 | **0.0** | 0.71 s |
+| −180° | −0.41° | 52.7 | **0.0** | 1.26 s |
+| −180° | +0.25° | 52.4 | **0.0** | 1.00 s |
+| +5° | +0.60° | 5.7 | **0.0** | 0.62 s |
+| −90° | −0.75° | 33.6 | **0.0** | 0.61 s |
+
+**Mean final error 0.47°, every slew reached target in one move, and the wheel
+returns fully to rest every time** — passive desaturation is alive again. Compare the
+pre-retune envelope in §2 (1.20° mean, 1.57 s settling) on a *lighter* platform.
+
+### What actually had to change, and why
+
+**1. `compFrac` was slightly UNSTABLE, not merely neutral.** With the old constants the
+residual pole was `5.633·cf − 4.97`, i.e. **+0.043 at cf = 0.89** — positive. That is
+why the wheel held speed instead of bleeding, and it is the same 13%-gain-error
+mechanism as the original runaway in §7. A 10-run `C`-sweep at ±2 V gave
+`pole = 3.905·cf − 4.453`; 0.90 was chosen because it is *directly observed* in both
+directions (−0.95 / −0.89) rather than extrapolated.
+
+**2. The Coulomb feedforward conflated two different physical quantities.** One
+constant was being asked to beat *static* breakaway in the STUCK branch and cancel
+*kinetic* friction in the MOVING branch. No single value can do both — set it high
+enough to break stiction and the moving branch over-cancels, turning friction into
+negative damping. The 5° sweep showed exactly that, two failures of each kind:
+
+```
+A36 -> moved  0.03 deg, 0/2 closed      never broke free
+A48 -> moved 31.80 deg on a 5 deg cmd   broke free and RAN AWAY
+```
+
+Split into `A_static` (60) and `A_moving` (34), terminal-correction success went from
+**5/11 to 8/8**. There is also an `A_viscous` term (default 0, command `AV`) for the
+speed-dependent component — friction measures ~34 α-units near standstill and ~65 at
+`ω_p ≈ 2` rad/s. It was not needed once the damping was fixed; keep it in reserve.
+
+**3. `ALPHA_STALL_MAX` failed for the THIRD time, and the sweep proved it was the
+binding constraint** — A44 and A48 delivered *identical* authority because the clamp
+capped the sum at 55. Raised to 70, with `STALL_WW`/`STALL_MS` tightened to 20/300 so
+the stall detector wins the race against the abort rather than losing it.
+
+**4. ζ is 0.54, NOT the 0.7 the gain table assumes.** This is the one that fixed large
+slews, and it is the most counter-intuitive result of the retune:
+
+```
+K_omega 64 (zeta 0.66) -> decelerated early, arrived with no momentum, stalled ~20 deg short
+K_omega 30 (zeta 0.31) -> overshoot -19.8 deg, rang past and stalled 7.6 deg out
+K_omega 52 (zeta 0.54) -> overshoot -1.8 to -8.1, 6/6 clean
+```
+
+**Coulomb friction already supplies heavy damping**, so a ζ = 0.7 *design* brakes twice
+and the platform stops short of target — then cannot restart, because breaking stiction
+from rest needs far more authority than finishing a move that still has momentum. The
+gain table's ζ column should be read as a starting point, not a target.
 
 Also in the repo: `live_monitor.py`, a self-contained serial bridge and browser
 instrument panel for watching heading, wheel speed, and momentum live. Useful for

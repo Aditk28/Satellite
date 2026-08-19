@@ -165,6 +165,9 @@
 HardwareSerial hc05Serial(PC11, PC10);
 
 #define VOLTAGE_LIMIT   10.0f
+// Ceiling on the O/C open-loop pulse. Plateau = 9.64*V - 1.23, so 5.5 V -> 51.8 rad/s,
+// just under WHEEL_SAT_LIMIT (55). Do NOT raise without raising that too.
+#define OPEN_PULSE_VMAX  5.5f
 #define VOLTAGE_PSU     12.0f
 
 BLDCMotor motor = BLDCMotor(POLE_PAIRS);
@@ -185,19 +188,69 @@ bool             inaPresent = false;
 // (rad/s)/V against the modelled 7.3, which left a residual pole of
 // +0.89 /s in the wheel loop -- unstable, and the cause of the first
 // closed-loop runaway to wheel saturation.
-//   K'   = 8.51 (rad/s)/V   (2.3% scatter over 6 tests)
-//   tau' = 0.187 s          (spin-up 0.181, decay 0.193)
-//   A_1  = K'/tau' = 45.5   A_2 = 1/tau' = 5.35
-static const float A_1          = 45.5f;    // rad/s^2 per V
-static const float A_2          = 5.35f;    // 1/s
-// RUNTIME TUNABLE (command A). Was a fixed 22.3, computed as 4.24/0.19 -- but
-// `a` is nearer 0.15, which makes the true break-free figure 4.24/0.15 = 28.3.
-// Running 22.3 left feedforward ~25% light: large errors had enough PD to cover
-// the gap, small ones did not, and a correction from rest at 5 deg error cleared
-// breakaway by only 10% -- a coin flip on stiction, and the cause of the
-// intermittent -90/-180 stalls. Tune with A<val> rather than measuring `a`:
-// raise until small corrections close reliably, lower if it overshoots.
-float A_FRICTION  = 28.3f;    // rad/s^2 (wheel) to break platform free
+// RE-IDENTIFIED 2026-08-15, after the translation hardware was fitted (12 O-tests
+// at +/-1, +/-2, +/-3 V). The plant MOVED, and the shift explains the dead passive
+// desaturation exactly:
+//   K' is NOT constant with voltage -- the plateau line has an intercept, because
+//   the wheel's own Coulomb friction eats a fixed bite:
+//        omega_plateau = 9.64*V - 1.23      (fits 1/2/3 V to ~0.5%)
+//   so the INCREMENTAL gain is 9.64, not the 8.51 secant value used before.
+//   tau' = 0.201 s from FREE DECAY (12 runs, 4.68-5.28) and 0.200 s from spin-up
+//   t63 -- two independent methods agreeing to 0.5%. The decay is the better
+//   measurement: with no applied voltage it depends on neither A_1 nor any
+//   voltage-scaling convention.
+//   A_1 = K'/tau' = 47.9      A_2 = 1/tau' = 4.97
+// Why this mattered: with the OLD constants the residual pole was
+//   5.633*compFrac - 4.97, i.e. +0.043 at compFrac = 0.89 -- POSITIVE, weakly
+// unstable. That is why the wheel held speed instead of bleeding down, and it is
+// the same 13%-gain-error mechanism that caused the first closed-loop runaway.
+// With these constants the pole is simply A_2*(compFrac - 1).
+static const float A_1          = 47.9f;    // rad/s^2 per V   [re-ID 2026-08-15]
+static const float A_2          = 4.97f;    // 1/s             [re-ID 2026-08-15]
+// RUNTIME TUNABLE (command A).  A_FRICTION = A_1 * V_break  -- note `a` CANCELS:
+//   friction (platform) = a*A_1*V_break,  and A_FRICTION = friction/a = A_1*V_break
+// Check against history: 40.56 * 0.55 = 22.3, exactly the original value. Which
+// means the earlier raise 22.3 -> 28.3 "because a is 0.15 not 0.19" DOUBLE-COUNTED
+// the correction: 4.24 was itself derived using a = 0.19. This constant is NOT in
+// the "derived from `a`, therefore suspect" class that bit ALPHA_STALL_MAX twice.
+//
+// Re-measured 2026-08-15 (23 O-tests, 0.30-0.90 V, 3 sets): breakaway is between
+// 0.65 and 0.85 V and varies by ~1.3x run to run -- intrinsic stiction scatter,
+// not measurement error. A_1 * V_break therefore spans 31-41.
+//   old: 40.56 * 0.55 = 22.3      new: 47.9 * ~0.75 = 36
+// The rise is physical: four motors, an ESC, a Pi and a battery raise the normal
+// force on the ball transfers, so friction torque rises while J_w is unchanged.
+// Biased to the upper half DELIBERATELY -- the observed failure is "parks short and
+// winds the wheel", which is the too-LOW signature; too high merely overshoots.
+// Settle it with the small-error sweep (5 deg corrections x10), not large slews.
+// SPLIT INTO TWO 2026-08-15. One constant was serving two DIFFERENT physical
+// quantities, and no single value can satisfy both:
+//    STUCK branch  needs to beat STATIC breakaway  (~55 in alpha units, measured)
+//    MOVING branch needs to cancel KINETIC friction (lower -- static > kinetic)
+// Set it high enough to break stiction and the moving branch OVER-cancels, turning
+// friction into negative damping; set it low enough not to overshoot and it cannot
+// break free. The 5-deg sweep showed exactly that split, 2 failures of each kind:
+//    test05 moved  0.23 deg -> never broke free   (wanted MORE)
+//    test08 moved 31.80 deg -> broke free and ran away on a 5 deg command (wanted LESS)
+// Commands:  A<val> sets STATIC,  AM<val> sets MOVING.
+float A_FRICTION  = 60.0f;    // rad/s^2 -- STUCK branch, must beat static breakaway
+float A_MOVING    = 34.0f;    // rad/s^2 -- MOVING branch, cancels kinetic friction
+// VISCOUS term on the MOVING branch, rad/s^2 per (rad/s) of platform rate. Command AV.
+// Friction on this platform is NOT purely Coulomb -- it grows with speed:
+//    at omega_p ~ 0     effective friction ~34 alpha-units  (A_MOVING, tuned on 5 deg
+//                       corrections, where 48 caused 28 deg runaways from over-cancel)
+//    at omega_p ~ 2.1   measured ~65 alpha-units, from a stalled T-90:
+//                         wheel gives theta_ddot = -a*23  = -2.25 rad/s^2
+//                         observed theta_ddot    = +4.13  (decelerating)
+//                         => friction supplying   +6.4 rad/s^2 = ~65 in alpha units
+// A single Coulomb constant cannot cancel both, which is exactly why small corrections
+// are excellent and large slews grind to a halt part-way. CONTROL_README section 6
+// already recorded that Coulomb+viscous fit better than Coulomb alone (R^2 0.951 vs
+// 0.918); it was simplified away because the lighter platform did not need it.
+// Slope from the two points above: (65-34)/2.1 ~ 15.
+// DEFAULT 0 so this build is behaviourally identical until you set AV -- change one
+// thing at a time.
+float A_VISCOUS   = 0.0f;
 static const float GYRO_SIGN   = -1.0f;    // aligns gyro with wheel convention
 
 // ------------------- control loop timing -------------------
@@ -207,11 +260,39 @@ static stat_t st_adc;   // Phase 2: ESC current-sense ADC read, added to the 200
 // ------------------- runtime-tunable gains -------------------
 // Start conservative (3.0 s row) and work down using P/D over serial --
 // no reflash needed between tuning steps.
-// Tuned on hardware 2026-08-02 (1.2 s row). A 148 deg slew settled to 0.79 deg
-// with a 14-34 rad/s wheel peak -- better than the simulated table predicted.
-float K_theta   = 119.3f;
-float K_omega   = 35.1f;
-float ffFrac    = 0.90f;    // trim up until it overshoots, then back off
+// RESET TO THE 3.0 s ROW 2026-08-15 for the post-re-ID retune. The old 119.3/35.1
+// were computed with a = 0.19; `a` is now measured at 0.105 (the platform got much
+// heavier at the perimeter), so every gain in the table roughly doubles:
+//        K_theta = wn^2 / a          K_omega = 2*zeta*wn / a        wn = 5.714/t_s
+//   settle   wn      K_theta   K_omega        (a = 0.105, zeta = 0.7)
+//    3.0 s   1.90       34        25    <-- start here, work DOWN
+//    2.0 s   2.86       78        38
+//    1.5 s   3.81      138        51
+//    1.2 s   4.76      216        64    <-- wn ceiling is A_2 = 4.97
+// Work DOWN the table with P/D over serial, not up: slow gains keep the feedforward
+// active longer, which winds the wheel MORE, so faster gains are better on both
+// accuracy and saturation.
+// VALIDATED AND PERSISTED 2026-08-15 (the 1.2 s row, a = 0.105).
+// These MUST stay in step with the deadzones: the deadband floor is
+// (1-ffFrac)*A_moving/K_theta, so dropping K_theta without widening the deadzones
+// puts the fine deadzone BELOW the floor, feedforward never switches off, and the
+// wheel winds forever. That is exactly what happened when these two were left at
+// the 3.0 s placeholder while everything else was persisted:
+//     K = 216 -> floor 0.45 deg (0.8 deg fine deadzone legal)
+//     K = 34.4 -> floor 2.83 deg (ILLEGAL) -> six T90 runs ended 21-63 deg short
+//                 with the wheel wound to 38-52 rad/s and still spinning.
+float K_theta   = 216.0f;
+// K_omega 64 -> 52 on 2026-08-19, found by bisection on hardware. zeta ~= 0.54, NOT
+// the 0.7 the table assumes -- because Coulomb friction already supplies heavy
+// damping, so a zeta-0.7 design brakes twice and the platform stops short of target.
+//   D64  over-damped: decelerated early, arrived with no momentum, stalled ~20 deg out
+//   D30  under-damped: overshoot -19.8 deg, rang past and stalled at 7.6 deg
+//   D52  overshoot -1.8 to -8.1, final error -0.03 to -0.77, 6/6 in one move
+float K_omega   = 52.0f;
+// 0.90 -> 0.95 on 2026-08-15. Raising ffFrac is the documented route to a tighter
+// deadzone, because the floor is (1-ffFrac)*A_moving/K_theta: at 0.90 the floor is
+// 1.35 deg (so a 1 deg fine deadzone is unreachable), at 0.95 it is 0.45 deg.
+float ffFrac    = 0.95f;    // trim up until it overshoots, then back off
 // Fraction of the modelled A_2 actually applied in the linearisation.
 // 1.0 = trust the model exactly. Below 1.0 deliberately UNDER-compensates.
 // This asymmetry is the whole point: under-compensation leaves a stable
@@ -231,8 +312,30 @@ float ffFrac    = 0.90f;    // trim up until it overshoots, then back off
 // ~4 s torque hold. Measured residual pole at this value: about -0.84 /s.
 // Do NOT make this direction-dependent: the measured asymmetry REVERSED sign
 // between those two runs, so a per-direction value would be wrong half the time.
-float compFrac  = 0.89f;
-float deadzone  = 0.035f;   // rad (2.0 deg) COARSE -- used while the wheel is
+// C-SWEEP 2026-08-15, 10 runs at +/-2 V, cf 0.70-0.95. ALL decayed -- no instability
+// anywhere in the range, unlike the previous campaign where cf = 1.0 was already
+// unstable positive-going.
+//        pole = 3.905*cf - 4.453      ->  measured neutral at cf = 1.140
+//   cf   pole(+2V)  pole(-2V)
+//   0.70   -1.712     -1.713
+//   0.80   -1.373     -1.295
+//   0.85   -1.178     -1.131
+//   0.90   -0.951     -0.893   <-- chosen: -0.92 mean, vs the -0.84 design target
+//   0.95   -0.760     -0.727
+// Direction asymmetry is now 3-6%, against 0.972/0.892 (8%) last campaign -- most of
+// that split was the wrong constants, not physics, so one value covers both.
+// Neutral measured at 1.14 vs 1.00 predicted: the gap is the WHEEL's own Coulomb
+// friction. The decay runs 18 -> 1 rad/s, so compensation voltage falls to ~0.1 V
+// where the -1.23 intercept in (omega_plateau = 9.64*V - 1.23) dominates. Coulomb
+// drag adds decay no proportional term can cancel, so neutral sits above 1.0 --
+// margin the linear model does not know about.
+// Chose 0.90 over the fitted 0.925 because 0.90 is DIRECTLY OBSERVED in both
+// directions rather than extrapolated, and section 7's rule is to err low.
+// Why 0.90 is safe when the old 0.89 was not -- the ratio it multiplies changed:
+//        old: 0.89 * 5.35 / 45.5 = 0.1047 * omega_w   (> hold voltage -> wound up)
+//        new: 0.90 * 4.97 / 47.9 = 0.0934 * omega_w   (11% less -> bleeds down)
+float compFrac  = 0.90f;
+float deadzone  = 0.0262f;  // rad (1.5 deg) COARSE -- used while the wheel is
                             // still fast and full torque is unavailable
 // FINE deadzone, used only once the wheel has unwound below FINE_WW, where the
 // controller has its full authority back. This is the "reduced-speed, tightened-
@@ -249,7 +352,11 @@ float deadzone  = 0.035f;   // rad (2.0 deg) COARSE -- used while the wheel is
 // At 2.0 deg both stages are equal, i.e. a single 2 deg tolerance, which is the
 // configuration that produced the clean 15-step envelope (1.20 deg mean error).
 // To go tighter you must raise ffFrac FIRST -- see the floor table above.
-float deadzoneFine = 0.035f;
+// 2026-08-15: with ffFrac 0.95 and A_moving 34 the floor is 0.45 deg, so 0.8 deg
+// is legitimate (nearly 2x the floor). Validated over n=8: mean |e| 0.97 deg,
+// worst 1.47, 8/8 closed -- better than the 1.20 deg mean of the ORIGINAL lighter
+// platform, on a platform whose friction has since risen ~60%.
+float deadzoneFine = 0.0140f;  // rad (0.8 deg) FINE
 #define FINE_WW         5.0f   // rad/s, wheel slow enough for a fine correction
 
 // ------------------- safety -------------------
@@ -287,16 +394,45 @@ float deadzoneFine = 0.035f;
 // -10 rad/s^2 came out as -27). If it is ever revisited, it must command VOLTAGE
 // directly from the wheel's hold curve (u_hold = omega_w/K_HOLD, K_HOLD ~ 8.13
 // (rad/s)/V measured at 42 rad/s), never a negative alpha.
-#define ALPHA_STALL_MAX     55.0f    // rad/s^2, cap while platform is stationary
-#define STALL_WW            25.0f    // rad/s -- was 30; lowered so a stuck
-                                     // platform is caught before the wheel has
-                                     // enough momentum to abort violently
-#define STALL_MS             600     // ms of continuous stall before backing off
-#define STALL_HOLD_MS       2000     // ms of alpha = 0 before retrying
+// RAISED 55 -> 70 on 2026-08-15. This constant has now failed THREE times, always
+// the same way: sized against a plant that then moved.
+//    28  -> a*28 = 4.2 vs a 4.24 breakaway; coin flip, wound to 44.5, aborted
+//    40  -> slews landed, terminal corrections stalled 2-9 deg short
+//    55  -> worked, ON THE LIGHTER PLATFORM
+//    55  -> after the fan subsystem, sits EXACTLY ON the new breakaway
+// The A_FRICTION sweep proved the clamp was the binding constraint, not A_FRICTION:
+//    A36 -> delivered alpha 49.6, moved 0.03 deg, 0/2 closed
+//    A40 -> delivered      52.9, moved 0.10-0.32, 0/2
+//    A44 -> delivered      55.0  (CLAMPED), 1/4
+//    A48 -> delivered      55.0  (CLAMPED), 4/7   <- same authority as A44
+// True breakaway is ~53-56 in alpha units. Raising A_FRICTION past ~44 does nothing
+// while the clamp caps the sum.
+#define ALPHA_STALL_MAX     70.0f    // rad/s^2, cap while platform is stationary
+// STALL_WW/STALL_MS MUST move with the clamp. Stuck at alpha = 70 the wheel runs to
+// 70/0.92 = 76 rad/s with tau = 1.09 s, so at the OLD 25 rad/s / 600 ms the detector
+// would have fired at 1.00 s -- by which point omega_w is 49 and WHEEL_SAT has
+// already aborted. The detector must win the race, not lose it:
+//    catch at 20 rad/s (0.33 s) + 300 ms dwell -> fires 0.63 s, omega_w = 33. Safe.
+#define STALL_WW            20.0f    // rad/s -- was 25
+#define STALL_MS             300     // ms of continuous stall before backing off
+// 2000 -> 4500 on 2026-08-15. The hold exists to bleed the wheel far enough that a
+// retry has authority again, and 2 s was sized when the unwind pole was assumed to be
+// ~0.9/s. MEASURED from 50 rad/s it is only 0.36/s: the extra decay the C-sweep saw
+// came from the wheel's COULOMB friction, which is a fixed deceleration -- dominant
+// at the 18 rad/s the sweep ran at, negligible at 50. So a 2 s hold left the retry
+// starting at 23 rad/s, where delivered = 70 - 0.36*23 = 62 and the platform still
+// would not break free reliably. 4.5 s bleeds 50 -> ~10 rad/s, restoring nearly the
+// full clamp to the retry.
+#define STALL_HOLD_MS       4500     // ms of alpha = 0 before retrying
 #define WW_MAX_JUMP         15.0f    // rad/s per control cycle -- above this is a
                                      // velocity-estimate glitch, not real (physical
                                      // max ~2.3 rad/s/cycle). Rejected in sense.
-#define WHEEL_SAT_LIMIT     45.0f    // rad/s -- abort above this.
+// RAISED 45 -> 55 on 2026-08-15 (user decision). This is a CHOSEN safety number, not
+// a hardware limit -- the wheel reaches ~96 rad/s at the 10 V ceiling. 45 was sized
+// for the lighter platform; friction has since risen ~60%, so break-free costs more
+// momentum and 45 left no headroom on the failure path. 55 buys margin while staying
+// far below what the motor can actually do.
+#define WHEEL_SAT_LIMIT     55.0f    // rad/s -- abort above this.
                                      // Keep at 45: a C3 spin-up alone reaches
                                      // ~26 rad/s, so a lower limit aborts the
                                      // comp test before it starts. Use C2 if
@@ -345,6 +481,16 @@ static bool transActive = false;
 // true so the NEXT capture was refused by the buffer-lifetime guard. Observed as
 // "after the first test it doesn't capture the rest" (2026-08-14).
 static bool capTranslation = false;
+// Yaw-coupling runs must NOT have the wheel killed at capture end. Slamming
+// motor.target to 0 drops the holding torque abruptly, and the wheel's own
+// deceleration reacts on the platform -- a torque impulse landing exactly in the
+// tail of the measurement. For Q we leave heading control running so the wheel
+// unwinds gracefully and the platform stays stable afterwards.
+static bool capKeepWheel = false;
+// Which flavour of capture this was. Latched at capture START, because the dump runs
+// later on telemTask by which time ctrlMode has already moved on.
+static bool capOpenLoop = false;
+static bool capCompTest = false;
 float lastAlpha  = 0.0f;
 bool  stallHold = false;
 unsigned long stallStartMs = 0;
@@ -373,7 +519,10 @@ uint16_t cap_cur[MAX_CAP];
 int   capN = 0;
 bool  capturing = false;
 unsigned long capStartMs = 0;
-#define CAPTURE_MS 6000
+// 6000 -> 7400. With STALL_HOLD_MS at 4500 a stall at t=1.5 s puts the retry at
+// t=6.0 s -- exactly where the old window closed, so captures ended just before the
+// interesting part. 7400 ms is the most MAX_CAP (1500 samples at 200 Hz = 7.5 s) allows.
+#define CAPTURE_MS 7400
 // Phase 2: capture window and label are per-run now, because a translation capture
 // wants a different length and needs a different metadata line for the parser.
 uint32_t    capWindowMs  = CAPTURE_MS;
@@ -480,7 +629,9 @@ void measureGyroBias() {
 // friction that feedforward does not cancel. Any deadzone below this can never
 // be reached: the controller pushes forever and the wheel winds up.
 float deadbandFloorDeg() {
-  return degrees((1.0f - ffFrac) * A_FRICTION / K_theta);
+  // Residual friction while MOVING is what the PD must overcome, so this is
+  // A_MOVING, not the static break-free value.
+  return degrees((1.0f - ffFrac) * A_MOVING / K_theta);
 }
 
 void printGains() {
@@ -490,14 +641,26 @@ void printGains() {
             + "  compFrac=" + String(compFrac, 2)
             + (stallHold ? "  [STALL-HOLD]" : "")
             + (parked ? "  [PARKED]" : ""));
-  printBoth("A_FRICTION=" + String(A_FRICTION, 1)
-            + "  ff*A_F=" + String(ffFrac * A_FRICTION, 1)
+  printBoth("A_static=" + String(A_FRICTION, 1) + " (ff*=" + String(ffFrac * A_FRICTION, 1)
+            + ")  A_moving=" + String(A_MOVING, 1) + " (ff*=" + String(ffFrac * A_MOVING, 1) + ")"
+            + "  A_visc=" + String(A_VISCOUS, 1) + "/rad/s"
             + "  (break-free from rest needs about 28)");
   float floorDeg = deadbandFloorDeg();
+  bool floorBad = (degrees(deadzoneFine) < floorDeg) || (degrees(deadzone) < floorDeg);
   printBoth("deadband floor=" + String(floorDeg, 2) + "deg"
-            + (degrees(deadzoneFine) < floorDeg
-               ? "  <-- WARNING: fine deadzone is BELOW the floor, raise N or F"
-               : "  (both deadzones clear it)"));
+            + (floorBad ? "  <-- BELOW A DEADZONE" : "  (both deadzones clear it)"));
+  if (floorBad) {
+    // Loud, because the quiet version of this warning cost a full session on
+    // 2026-08-15: below the floor the feedforward never switches off, so the
+    // controller cannot settle and the wheel winds indefinitely. It is not a
+    // degraded mode, it is a broken one.
+    printBoth("*********************************************************");
+    printBoth("** DEADZONE BELOW FLOOR -- THE CONTROLLER CANNOT SETTLE **");
+    printBoth("**   feedforward never switches off; the wheel winds.   **");
+    printBoth("**   fix: raise N/W above " + String(floorDeg, 2)
+              + " deg, or raise F, or raise P.   **");
+    printBoth("*********************************************************");
+  }
   printBoth("theta=" + String(degrees(theta), 2) + "deg  target=" + String(degrees(target), 2)
             + "deg  omega_p=" + String(omega_p, 3) + "  omega_w=" + String(omega_w, 2)
             + "  mode=" + String(ctrlMode == CTRL_IDLE ? "IDLE" : (ctrlMode == CTRL_HOLD ? "HOLD" : "STEP")));
@@ -561,6 +724,15 @@ void dumpCaptureTo(Print &out) {
     if (capFanSel > 0) { out.print(" fan"); out.print(capFanSel); }
     else if (capThrottle > 0.0f) out.print(" all");
     if (capThrottle > 0.0f) { out.print(" at "); out.print(capThrottle, 0); out.print(" pct"); }
+  } else if (ctrlMode == CTRL_OPEN || capOpenLoop) {
+    out.print("openloop ");
+    out.print(openVolts, 2);
+    out.print(" V");
+  } else if (ctrlMode == CTRL_COMP || capCompTest) {
+    out.print("comptest ");
+    out.print(openVolts, 2);
+    out.print("V cf ");
+    out.print(compFrac, 2);
   } else {
     out.print("heading step to ");
     out.print(degrees(target), 1);
@@ -580,6 +752,17 @@ void dumpCaptureTo(Print &out) {
   out.print(" accel_bias_y="); out.print(accelBiasY, 4);
   out.print(" fan_pct=");      out.print(capThrottle, 1);
   out.print(" fan_sel=");      out.print(capFanSel);
+  // The commanded open-loop voltage. Without it an O-test capture is unidentifiable
+  // from its header -- 12 files all labelled "heading step to 0.0 deg" and the
+  // voltage only recoverable by digging in the u column (2026-08-15).
+  out.print(" open_volts=");   out.print(openVolts, 2);
+  // A_FRICTION and compFrac are runtime-tunable, so a capture is not reproducible
+  // without them -- the A-sweep runs had to be identified by counting files.
+  out.print(" A_static=");     out.print(A_FRICTION, 1);
+  out.print(" A_moving=");     out.print(A_MOVING, 1);
+  out.print(" A_visc=");       out.print(A_VISCOUS, 1);
+  out.print(" compFrac=");     out.print(compFrac, 3);
+  out.print(" alpha_stall_max="); out.print(ALPHA_STALL_MAX, 1);
   out.println(" stop_reason=fixed_window");
   out.println("t_us,target_deg,theta_deg,omega_p,omega_w,alpha,u,ax,ay,iadc");
   for (int i = 0; i < capN; i++) {
@@ -785,6 +968,22 @@ void controlUpdate(float dt) {
   float e = wrapPi(target - theta);
   // Two-stage tolerance: coarse while the wheel still holds momentum, fine once
   // it has bled down and full torque is available again.
+  // TWO-STAGE DEADZONE. Bare comparison, deliberately -- see the note below.
+  //
+  // KNOWN, MEASURED, AND LEFT ALONE: this chatters. Crossing FINE_WW toggles the
+  // tolerance, which toggles the controller, which drives omega_w back across it:
+  //     w > 5 -> dz = coarse -> e inside  -> alpha = 0 -> wheel bleeds
+  //     w < 5 -> dz = fine   -> e outside -> push      -> wheel speeds up -> repeat
+  // Observed 2026-08-15: five of eight terminal corrections sat pinned at
+  // omega_w = 5.0-5.4 with the error frozen BETWEEN the two tolerances (~1.0-1.3 deg).
+  //
+  // A LATCHING VERSION WAS TRIED AND WAS WORSE. Holding the fine tolerance once the
+  // wheel had unwound made the controller persist against stiction it could not
+  // always beat: mean error 0.97 -> 1.25 deg, worst 1.47 -> 3.10, and wheel peaks
+  // 6-17 -> 8-36 rad/s with two runs parked at 24-30 rad/s. The chatter is a SAFETY
+  // VALVE -- the controller gives up and the wheel bleeds -- and removing it costs
+  // more than the ~0.3 deg of extra precision it buys. Do not "fix" this again
+  // without n >= 8 evidence that the latched version actually wins.
   float dz = (fabsf(omega_w) < FINE_WW) ? deadzoneFine : deadzone;
   bool outside   = fabsf(e) > dz;
   bool notMoving = fabsf(omega_p) < W_MOVING;
@@ -830,7 +1029,9 @@ void controlUpdate(float dt) {
     // ---- 3. Coulomb feedforward -- see header (b) ----
     float ff;
     if (fabsf(omega_p) > W_MOVING)
-      ff = -A_FRICTION * signf(omega_p);   // MOVING: cancel friction opposing motion
+      // MOVING: cancel kinetic friction, Coulomb + viscous. A_VISCOUS = 0 gives the
+      // pure-Coulomb behaviour this was before.
+      ff = -(A_MOVING + A_VISCOUS * fabsf(omega_p)) * signf(omega_p);
     else
       ff =  A_FRICTION * signf(alpha);     // STUCK:  push to break free
     alpha += ffFrac * ff;
@@ -904,6 +1105,9 @@ static void startCapture(const char* mode, uint32_t windowMs, float pct, int sel
   capThrottle = pct;
   capFanSel   = sel;
   capTranslation = translation;
+  capKeepWheel   = false;      // Q sets this true immediately after calling us
+  capOpenLoop    = false;      // O / C set theirs the same way
+  capCompTest    = false;
   capStartMs  = millis();
   capturing   = true;
 }
@@ -919,6 +1123,7 @@ static float    transPct     = 0.0f;
 static uint32_t transPreMs   = 500;    // quiet baseline before thrust
 static uint32_t transHoldMs  = 1000;   // thrust
 static uint32_t transTotalMs = 4000;   // remainder is coast-down
+#define YAW_TOTAL_MS 7000              // Q: long enough to see the wheel settle
 
 void handleLine(String s) {
   s.trim();
@@ -943,9 +1148,17 @@ void handleLine(String s) {
       // positive, which by theta'' = -a*alpha must move theta NEGATIVE.
       // If theta goes positive instead, GYRO_SIGN is wrong -- flip it in
       // the source and reflash BEFORE closing the loop.
-      openVolts = constrain(v, -3.0f, 3.0f);
+      // RAISED from +/-3 V on 2026-08-15. The 3 V clamp is why the wheel plant was
+      // only ever identified to 28 rad/s (plateau = 9.64*V - 1.23): the tool could
+      // not reach higher. But a 90 deg slew takes the wheel to 50, so every constant
+      // was being extrapolated to ~2x the speed it was measured at -- and the
+      // effective K' at 48 rad/s backs out at 7.46, not 9.64, which is why large
+      // slews stall mid-way while small corrections are fine.
+      // 5.5 V is the ceiling: plateau 51.8 rad/s, just under WHEEL_SAT_LIMIT 55.
+      openVolts = constrain(v, -OPEN_PULSE_VMAX, OPEN_PULSE_VMAX);
       theta = 0.0f;
-      startCapture("heading_step", CAPTURE_MS, 0.0f, 0, false);
+      startCapture("openloop", CAPTURE_MS, 0.0f, 0, false);
+      capOpenLoop = true;
       openStartMs = millis();
       ctrlMode = CTRL_OPEN; controllerEnabled = true;
       printBoth("OPEN-LOOP pulse " + String(openVolts, 2) + "V for "
@@ -972,16 +1185,26 @@ void handleLine(String s) {
       break;
     case 'C':
       // Compensation-only test: spin up at V, then alpha = 0. Watch omega_w.
-      openVolts = constrain(v, -3.0f, 3.0f);
+      openVolts = constrain(v, -OPEN_PULSE_VMAX, OPEN_PULSE_VMAX);
       theta = 0.0f;
-      startCapture("heading_step", CAPTURE_MS, 0.0f, 0, false);
+      startCapture("comptest", CAPTURE_MS, 0.0f, 0, false);
+      capCompTest = true;
       openStartMs = millis();
       ctrlMode = CTRL_COMP; controllerEnabled = true;
       printBoth("COMP test " + String(openVolts, 2) + "V spin-up, compFrac="
                 + String(compFrac, 2) + ", capturing...");
       printBoth("  expect: wheel coasts DOWN after the pulse. Growth = too high.");
       break;
-    case 'A': A_FRICTION = constrain(v, 0.0f, 60.0f); printGains(); break;
+    case 'A':
+      // A<val> = STATIC (break-free). AM<val> = MOVING (kinetic cancellation).
+      if (s.length() > 1 && toupper(s.charAt(1)) == 'M')
+        A_MOVING = constrain(s.substring(2).toFloat(), 0.0f, 80.0f);
+      else if (s.length() > 1 && toupper(s.charAt(1)) == 'V')
+        A_VISCOUS = constrain(s.substring(2).toFloat(), 0.0f, 60.0f);
+      else
+        A_FRICTION = constrain(v, 0.0f, 80.0f);
+      printGains();
+      break;
     case 'K': compFrac = constrain(v, 0.0f, 1.2f); printGains(); break;
     case 'P': K_theta = v; printGains(); break;
     case 'D': K_omega = v; printGains(); break;
@@ -1075,7 +1298,10 @@ void handleLine(String s) {
       target = theta;
       parked = false; stallCount = 0; stallHold = false; stallStartMs = 0;
       ctrlMode = CTRL_HOLD; controllerEnabled = true;
-      startCapture("yaw_coupling", transTotalMs, v, fanSel, true);
+      // Longer window than a thrust step: the 4 s one ended mid-settle, so we never
+      // saw where the wheel finished. MAX_CAP allows 7.5 s at 200 Hz.
+      startCapture("yaw_coupling", YAW_TOTAL_MS, v, fanSel, true);
+      capKeepWheel = true;
       printBoth("YAW COUPLING " + String(v, 1) + "% on "
                 + String(fanSel == 0 ? "ALL" : String(fanSel))
                 + " -- heading control ACTIVE, wheel will spin up to fight the torque");
@@ -1378,7 +1604,15 @@ static void controlStep() {
       // releases. The capture buffer stays untouched until the dump finishes --
       // the T/O/C commands refuse to start a new capture while telem_busy().
       telem_run(dumpCapture);
-      if (capTranslation) {
+      if (capTranslation && capKeepWheel) {
+        // Yaw coupling (Q): leave heading control RUNNING. Killing the wheel here
+        // dumps its holding torque in one step and the deceleration reacts on the
+        // platform -- a torque impulse in the tail of the very measurement we are
+        // taking. Leaving it engaged also lets the wheel unwind gracefully, which
+        // matters because consecutive runs stack momentum.
+        printBoth("yaw capture done. Heading control STILL ACTIVE so the wheel can "
+                  "unwind -- watch omega_w in G, and X when you are finished.");
+      } else if (capTranslation) {
         // Phase 2 plant ID: stay IDLE. Falling into HOLD here engaged the wheel
         // (contaminating the accelerometer with reaction torque) and started the
         // HOLD telemetry stream, which held telem_busy() and made the buffer

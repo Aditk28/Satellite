@@ -80,33 +80,59 @@ with no regression). **RTOS migration COMPLETE** — all seven phases done and v
 swapped). Five tasks: focTask (4), controlTask (3), safetyTask (2), commsTask (2),
 telemTask (1). Next major work is the combined hardware retune, then translation. See §6.
 
-### Tuned constants — do not change casually
+### Tuned constants — RE-IDENTIFIED AND RETUNED 2026-08-19
+
+Measured on the CURRENT platform (translation hardware fitted). Everything before this
+date is superseded; see `CONTROL_README` §12 for the derivation.
 
 ```
 
-A_1 = 45.5              wheel accel per volt, (rad/s²)/V
+A_1 = 47.9              wheel accel per volt, (rad/s^2)/V
 
-A_2 = 5.35              wheel damping pole, 1/s
+A_2 = 4.97              wheel damping pole, 1/s     (tau' = 0.201 s, free decay)
 
-a   = 0.19              J_w/J_p momentum coupling ratio
+K'  = 9.64              incremental, rad/s per V    (NOT constant: plateau line is
+                        omega = 9.64*V - 1.23, the intercept is wheel Coulomb friction)
 
-A_FRICTION = 22.3       Coulomb feedforward magnitude, rad/s²
+a   = 0.098             J_w/J_p, pooled over 11 rising-phase fits, +-10%
 
-GYRO_SIGN  = -1
+compFrac   = 0.90       residual pole -0.92 measured; 0.89 was mildly UNSTABLE (+0.04)
 
-compFrac   = 0.89       back-EMF compensation fraction
+K_theta = 216   K_omega = 52       zeta = 0.54, NOT 0.7 -- friction already damps
 
-K_θ = 119.3   K_ω = 35.1        (the 1.2 s row, ω_n = 4.76, ζ = 0.7)
+ffFrac = 0.95
 
-ffFrac = 0.90
+A_static = 60   A_moving = 34   A_viscous = 0      <-- feedforward is SPLIT
 
-deadzone = 2.0°   deadzoneFine = 1.0°   FINE_WW = 5 rad/s
+deadzone = 1.5 deg   deadzoneFine = 0.8 deg   FINE_WW = 5 rad/s
 
-ALPHA_STALL_MAX = 55   STALL_WW = 25    WHEEL_SAT_LIMIT = 45
+ALPHA_STALL_MAX = 70   STALL_WW = 20   STALL_MS = 300   STALL_HOLD_MS = 4500
+
+WHEEL_SAT_LIMIT = 55   MAX_STALL_RETRIES = 3
 
 control rate = 200 Hz, logged at full rate
 
 ```
+
+**Performance: 0.47 deg mean final error over +-5 to +-180 deg, every slew in ONE
+move, wheel returning fully to rest.** (Previous entry: 1.20 deg mean, 1.57 s settling,
+half of large negative slews stalling — on a lighter platform.)
+
+**Four things mattered, three of them latent bugs rather than tuning:**
+
+- **The Coulomb feedforward conflated STATIC with KINETIC friction.** One constant
+  cannot both beat breakaway and cancel drag; set it high and the moving branch
+  over-cancels into negative damping. Split into `A_static`/`A_moving` (commands `A`
+  and `AM`), and 5 deg corrections went from 5/11 to 8/8.
+- **`compFrac` 0.89 was mildly UNSTABLE**, not neutral -- residual pole +0.04. That is
+  why passive desaturation had been dead since the hardware rework.
+- **`ALPHA_STALL_MAX` failed a THIRD time** (28, 40, 55) and was the binding
+  constraint, not `A_FRICTION`. Now 70, with the stall detector tightened so it wins
+  the race against the abort.
+- **zeta = 0.54, not 0.7.** Coulomb friction already damps heavily, so a textbook
+  zeta-0.7 design brakes twice and the platform stops short -- then cannot restart,
+  because breaking stiction from rest costs far more than finishing a move that still
+  has momentum. Read the gain table's zeta column as a starting point, not a target.
 
 ### Two properties that constrain every design decision
 

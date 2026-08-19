@@ -207,7 +207,7 @@ These are in addition to `RTOS_migration.md`'s list, which all still applies.
 |---|---|---|
 | **0 safety hardening** | ✅ **(2026-08-13)** | Wires cleared, fuse/wiring confirmed, battery disconnect = e-stop. **Prop guards deliberately skipped (B7)** — mitigations moved into Phase 1. |
 | 1 fans into the RTOS (DSHOT + DMA) | ✅ **(2026-08-13)** `trans-p1-fans` | Four DSHOT channels on TIM1+DMA burst, `fanTask` prio 2 = sole fan writer, fans in every fault path *ahead* of the wheel, `S`/`L` manual commands, 30% ceiling + 10 s dead-man. Control loop untouched: ctrl period 4999/5000/5001 µs. |
-| 2 translation plant ID | 🟡 **2.1/2.2 ✅ 2.3 dropped** | `A(pct)=2.1e-4·pct²` (66 runs), `A_c≈0.26`, **go/no-go PASS at 2.9×**. Fans 1–3 matched to 7%; fan 4's reversed direction found and fixed over DSHOT. **2.4 (yaw coupling) NEXT.** |
+| 2 translation plant ID | 🟡 **2.1/2.2/2.3′ ✅** | Translation: `A(pct)=2.1e-4·pct²` (66 runs), `A_c≈0.26`, **go/no-go PASS at 2.9×**; fan 4's reversed direction found and fixed over DSHOT. **Rotation re-identified and retuned (2.3′): 0.47° mean, one-move slews to ±180°, wheel returns to rest.** **2.4 (yaw coupling) NEXT — last step before the tag.** |
 | 3 Pi ↔ STM32 wired link | ⬜ | — |
 | 4 vision: AprilTag pose on the Pi | ⬜ | — |
 | 5 estimator: fuse tag + IMU | ⬜ | — |
@@ -1063,6 +1063,50 @@ the architecture transfers even though none of the constants do.
 term on top — the rotation axis showed the same signature (R² 0.918 Coulomb alone vs
 0.951 with both). Not modelled yet; revisit if the feedforward misbehaves at speed.
 
+## Step 2.3′ — Rotation re-identification and retune — ✅ **DONE 2026-08-19**
+
+**This was the deferred campaign from `CONTROL_README` §17 / B6, and it finally
+happened here** — because Step 2.4 uses the heading controller as an *instrument*, and
+a controller that stalls cannot measure a disturbance. Ordering matters: translation
+(2.1/2.2) needed nothing from rotation, which is why it succeeded with the wheel off;
+2.4 is the first genuine coupling, so it goes after.
+
+**Result — 6 consecutive runs, mean final error 0.47°, every slew in ONE move, wheel
+returning fully to rest each time:**
+
+```
+ target   final err   w_peak   w_end    settle to 0.8 deg
+   +90      -0.03      34.9     0.1        0.68 s
+   +90      -0.77      33.7     0.0        0.71 s
+  -180      -0.41      52.7     0.0        1.26 s
+  -180      +0.25      52.4     0.0        1.00 s
+    +5      +0.60       5.7     0.0        0.62 s
+   -90      -0.75      33.6     0.0        0.61 s
+```
+
+**Constants now in `rtos_main.cpp`:** `A_1 47.9 · A_2 4.97 · a 0.098 · compFrac 0.90 ·
+K_θ 216 · K_ω 52 · ffFrac 0.95 · A_static 60 · A_moving 34 · A_viscous 0 ·
+deadzone 1.5/0.8 · ALPHA_STALL_MAX 70 · STALL_WW 20 / MS 300 / HOLD 4500 ·
+WHEEL_SAT_LIMIT 55`. Full derivation and the four findings are in `CONTROL_README` §12.
+
+**Four things mattered, and three were latent bugs rather than tuning:**
+
+1. **`compFrac` was mildly UNSTABLE** (residual pole `+0.043`), not merely neutral —
+   that is why passive desaturation was dead. Ten-run `C`-sweep fixed it.
+2. **The feedforward conflated static with kinetic friction.** Splitting into
+   `A_static`/`A_moving` took 5° corrections from **5/11 to 8/8**.
+3. **`ALPHA_STALL_MAX` failed a third time** and the sweep proved it — not
+   `A_FRICTION` — was the binding constraint.
+4. **ζ = 0.54, not 0.7.** Coulomb friction already damps heavily, so the textbook
+   design brakes twice and the platform stops short. This is what fixed large slews.
+
+**Traps found along the way, all recorded in Appendix A:** the `O` command was clamped
+to ±3 V, so the wheel plant had *only ever* been identified to 28 rad/s while slews
+reach 50 (T25); persisting five of seven tuned values while leaving the gains at their
+placeholder produced a specifically-broken build (T26); and the two-stage deadzone
+chatters at the `FINE_WW` boundary, where the obvious latching fix measured *worse*
+and was reverted (T27).
+
 ## Step 2.3 — Step-response identification — ❌ **DROPPED (B14)**
 
 **Not done, deliberately.** Its goal was *effective mass*, which was only ever a route
@@ -1511,6 +1555,9 @@ write-up more credible, not less. Do the same here.
 | T22 | **A new capture type added to a single-capture-type code path** | Three separate bugs from one assumption (2026-08-14): `Y`/`I` missing from the `telem_busy()` buffer-lifetime guard; the post-capture transition dropping plant-ID runs into `CTRL_HOLD` (engaging the wheel *and* holding `telem_busy` so the next run was refused); and `stepCount` only incrementing in `O`/`T`/`C`. **Grep every use of the capture state before adding a fourth type.** |
 | T23 | **The capture LABEL is the filename, and the script overwrites** | `capture_calibration.py` builds `test{N:02d}_{label}.csv` from the `--- capture start (test N/M: label) ---` marker and opens it `"w"`. Two captures emitting the same marker silently overwrite — presenting as "it only saves the first one" while the script honestly reports N files written. Every capture must emit a **unique N and a descriptive label**. |
 | T24 | **Diagnosing a tooling symptom without opening the tool** | Cost two wrong firmware diagnoses before `capture_calibration.py` was actually read; the answer was one line in it. When the user says "the file didn't save", read the writer first. T7, again. |
+| T25 | **A diagnostic command's own clamp limiting the identification** | `O<V>` was hard-limited to ±3 V, so the wheel plant had only ever been characterised to 28 rad/s — while a 90° slew takes it to 50. Every constant was an extrapolation to ~2× the measured range, and nobody noticed because the clamp was invisible from the data. **Check the tool's limits before trusting the model's range.** |
+| T26 | **Persisting SOME tuned values to source** | Five of seven were written in and the two gains left at their placeholder. The result is not "slower", it is *specifically broken*: the deadband floor scales as `1/K_θ`, so low gains put the deadzones below the floor, feedforward never switches off, and the wheel winds forever. Six T90s ended 21–63° short. **Persist a tuned set atomically, or not at all.** |
+| T27 | **"Fixing" the two-stage deadzone chatter** | The `FINE_WW` comparison chatters — crossing it toggles the tolerance, which toggles the controller, which drives `ω_w` back across. Latching the transition measured **worse** (mean 0.97→1.25°, worst 1.47→3.10, wheel peaks 6–17→8–36): the chatter is a *safety valve* that lets the controller give up and the wheel bleed. Reverted. Do not re-fix without n ≥ 8 evidence. |
 
 Plus **every trap in `RTOS_migration.md` Appendix A** — the one-writer/one-reader
 invariants, `delay()`, watchdogs measuring iterations instead of time, and the rest.
