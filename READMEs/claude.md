@@ -58,18 +58,37 @@ with fans running — they cost it nothing.
 **Yaw coupling measured:** thrust-line offset, 2-3 rad/s^2, wheel peaks 4-12 rad/s.
 Small enough that no mechanical correction is needed.
 
-**Phase 3 IN PROGRESS. Step 3.1 DONE (2026-08-19): the Pi <-> STM32 link is wired and
-proven.** USART6, PC6 (CN10-4) / PC7 (D9) / GND. The Pi was moved off the mini-UART onto
-the PL011 with `dtoverlay=disable-bt` -- on a 3B+ the header pins are `ttyS0`, whose baud
-is clocked from the scaling VPU core clock, so the link would have started failing exactly
-when AprilTag loaded the CPU (trap T28). `src/pi_link.*` owns USART6 as sole reader AND
-sole writer; `pi_poll()` rides `commsTask`'s 2 ms poll via `commands_setAuxPoll()` and is
-deliberately kept out of the operator parser, because a binary `0x58` would otherwise read
-as `X` and stop the wheel (decision B18). Verified 10/10 echo, RTT 2.61/3.52/5.32 ms.
+**Phase 3 COMPLETE (2026-08-19, tag `trans-p3-link`): the Pi <-> STM32 link is wired,
+framed, and fail-safe.** USART6, PC6 (CN10-4) / PC7 (D9) / GND. The Pi was moved off the
+mini-UART onto the PL011 with `dtoverlay=disable-bt` -- on a 3B+ the header pins are
+`ttyS0`, whose baud is clocked from the scaling VPU core clock, so the link would have
+started failing exactly when AprilTag loaded the CPU (trap T28).
 
-**NEXT: Step 3.2 — the framed protocol** (`[0xA5][0x5A][len][payload][crc16]`), CRC
-counters, timestamp/latency field, and the stale-pose fail-safe. **Step 3.1's raw echo
-must be deleted there.**
+`src/pi_link.*` owns USART6 as sole reader AND sole writer; `pi_poll()` rides
+`commsTask`'s 2 ms poll via `commands_setAuxPoll()` and is deliberately kept out of the
+operator parser, because a binary `0x58` would otherwise read as `X` and stop the wheel
+(B18 -- confirmed by measurement: `comms rx=4` against 2508 Pi bytes).
+
+```
+wire     [0xA5][0x5A][len=28][payload][crc16]  CRC-16/CCITT-FALSE, little-endian
+payload  seq flags tag_id range_m bearing_rad relyaw_rad quality age_us n_tags
+         POLAR not Cartesian (B19) -- keeps the estimator's R diagonal
+         AGE not a timestamp (B20) -- the two clocks are never synchronised
+ladder   250 ms pose invalid -> 1 s fans zeroed -> 3 s terminal hook (B21)
+```
+
+Verified: RTT 2.61/3.52/5.32 ms; 62 frames / 2508 B reconciling exactly against 14 CRC
+rejects and 26 seq gaps; ladder reaching DEAD and zeroing the fans. **Synthetic frames
+only -- no camera involved yet.**
+
+⚠️ **Known-wrong-for-Phase-6:** tier 2 calls `fans_stopAll()`, the HARD kill, which
+latches until `R`. B2 loses the tag at close range, so a 1 s dropout during docking would
+strand the approach waiting for an operator. Tier 2 must become a soft zero with the ESC
+left armed.
+
+**NEXT: Phase 4 -- AprilTag pose on the Pi.** Camera calibration, detection rate on a
+3B+, pose extraction, feeding the Phase 3 wire format unchanged. Multi-tag dock chosen
+(T30: single-tag relative yaw is ill-conditioned at exactly the range docking needs it).
 
 **Raw calibration data** lives in `calibration/runs/`, one folder per experiment named
 by what it established, indexed in `calibration/runs/INDEX.md`.

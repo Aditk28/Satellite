@@ -589,6 +589,24 @@ static void  safetyStop(const char* why)   { stopMotor(String(why)); }
 // asks for. handleLine() still runs the full stopMotor() when control drains it.
 static void commsEmergencyStop(void) { motor.target = 0.0f; fans_stopAll(); }
 
+// Translation 3.2: terminal action for a dead Pi link (PI_DEAD, 3 s with no
+// valid pose). Runs ON commsTask, fires ONCE per loss episode.
+//
+// This announces rather than stops, by decision B21. Tier 2 has already zeroed
+// the fans a full 2 s earlier, which is the action that matters while nothing
+// consumes pose. Calling stopMotor() here instead would dump a spinning
+// flywheel for a link nothing currently depends on -- and that dump is itself a
+// ~42 rad/s^2 kick against a 4.24 breakaway. PHASE 6 REPOINTS THIS AT
+// stopMotor() the moment a controller actually reads pose.
+//
+// printBoth is safe from here: the earliest this can fire is 3 s after a valid
+// frame, long after telem_activate(), so the text is queued to telemTask rather
+// than written from this task (invariant B15 / trap T18).
+static void piLinkDead(void) {
+  printBoth("!! PI LINK DEAD: no valid pose for 3 s. Fans were zeroed at 1 s. "
+            "Wheel control UNCHANGED (B21 -- nothing consumes pose yet).");
+}
+
 // Called from safetyTask (prio 2). Takes the I2C mutex around the transaction ONLY.
 // Longer timeout than the control path (5 ms): safety is not deadline-critical and
 // would rather wait behind a 2.5 ms gyro read than miss the sample entirely.
@@ -698,15 +716,35 @@ void printGains() {
             + "  stack free (words): " + String(fans_stackFreeWords()));
   printBoth("fans pct: " + String(fans_pct(1), 1) + " / " + String(fans_pct(2), 1)
             + " / " + String(fans_pct(3), 1) + " / " + String(fans_pct(4), 1));
-  // Translation 3.1: the Pi link. rx climbing when the Pi sends is the whole
-  // Step 3.1 verify. maxburst approaching the core's 64-byte RX ring would mean
-  // the 2 ms poll is losing the race; txdrops means the echo outran the TX ring.
-  printBoth(String("pi link: rx=") + String(pi_rxBytes())
-            + "  tx=" + String(pi_txBytes())
-            + "  txdrops=" + String(pi_txDrops())
-            + "  maxburst=" + String(pi_maxBurst())
-            + "  last=0x" + String(pi_lastByte(), HEX)
-            + "  (USART6 PC6/PC7 @ " + String(PI_BAUD) + ")");
+  // Translation 3.2: the Pi pose link.
+  // HEALTH SIGNATURE: frames climbing, crc/badlen/resync all 0, seqgaps 0.
+  // rx climbing while frames does NOT means the two ends disagree on the format
+  // or the CRC -- which looks exactly like a wiring fault, so check here first.
+  {
+    static const char* kState[] = { "NEVER", "FRESH", "STALE", "LOST", "DEAD" };
+    uint32_t a = pi_ageUs();
+    printBoth(String("pi link: ") + kState[(int)pi_state()]
+              + "  age=" + (a == UINT32_MAX ? String("--") : String(a / 1000)) + "ms"
+              + "  frames=" + String(pi_frames())
+              + "  rx=" + String(pi_rxBytes())
+              + "  crc=" + String(pi_crcErrors())
+              + "  badlen=" + String(pi_badLen())
+              + "  resync=" + String(pi_resyncs())
+              + "  seqgaps=" + String(pi_seqGaps())
+              + "  seqrestart=" + String(pi_seqRestarts())
+              + "  maxburst=" + String(pi_maxBurst()));
+    PiPose p;
+    if (pi_getPose(&p)) {
+      printBoth("pi pose: seq=" + String(p.seq)
+                + "  tag=" + String(p.tag_id) + " x" + String(p.n_tags)
+                + "  range=" + String(p.range_m, 3) + "m"
+                + "  bearing=" + String(degrees(p.bearing_rad), 2) + "deg"
+                + "  relyaw=" + String(degrees(p.relyaw_rad), 2) + "deg"
+                + "  q=" + String(p.quality, 2)
+                + "  piage=" + String(p.age_us / 1000) + "ms"
+                + "  flags=0x" + String(p.flags, HEX));
+    }
+  }
   if (fans_overruns()) {
     uint32_t nl, nmin, nmax, cen;
     fans_overrunDetail(&nl, &nmin, &nmax, &cen);
@@ -1750,6 +1788,13 @@ void setup() {
   // decision B18. pi_poll shares commsTask's existing 2 ms poll.
   pi_init(piSerial, PI_BAUD);
   commands_setAuxPoll(pi_poll);
+  // Translation 3.2: terminal action for a dead link. DELIBERATELY NOT
+  // stopMotor() in Phase 3 -- decision B21. Nothing consumes pose until Phase 6,
+  // so a lost link endangers nothing today, while dumping a spinning flywheel
+  // DOES spin the platform at ~42 rad/s^2 against a 4.24 breakaway. Tiers 1 and
+  // 2 (invalidate, fans off) fire for real; this one announces itself so the
+  // ladder is fully exercised, and Phase 6 repoints it at the real stop.
+  pi_setDeadHook(piLinkDead);
 
   // Phase 1.2 (translation): fanTask (prio 2) becomes the SOLE fan writer. Touches
   // only TIM1 + DMA2_S5 + PA8..PA11 -- nothing SimpleFOC, the encoder or I2C owns.

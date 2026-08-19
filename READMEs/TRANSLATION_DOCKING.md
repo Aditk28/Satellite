@@ -25,17 +25,29 @@ Never propose a solution that requires a scope.
 
 ## Current position
 
-**Phases 0, 1 and 2 are COMPLETE. Phase 3 is IN PROGRESS — Step 3.1 (physical link)
-is DONE and verified on hardware 2026-08-19; Step 3.2 (framed protocol) is NEXT.**
-Tags: `trans-p1-fans`, `trans-p2-plantid`.
+**Phases 0, 1, 2 and 3 are COMPLETE. Phase 4 (AprilTag pose on the Pi) is NEXT.**
+Tags: `trans-p1-fans`, `trans-p2-plantid`, `trans-p3-link`.
 
-**The Pi link is physically up.** USART6 PC6/PC7 wired, Pi moved onto the PL011
-rather than the mini-UART (**T28** — this is the one that would have bitten in
-Phase 4), `pi_link.*` owns the port as sole reader *and* sole writer, and a
-Pi-side send/echo test ran **10/10 clean, RTT min/mean/max 2.61 / 3.52 / 5.32 ms**,
-with `rx=120 tx=120 txdrops=0 maxburst=12 last=0x49` on the STM32 side. Bytes
-cross in both directions. **There is no protocol yet** — 3.1 counts and echoes raw
-bytes, and **the echo MUST be deleted in 3.2**.
+**The Pi link is up, framed, and fail-safe.** USART6 PC6/PC7, Pi moved onto the
+PL011 rather than the mini-UART (**T28** — the one that would otherwise have bitten
+in Phase 4, as framing errors appearing exactly when AprilTag loads the CPU).
+`pi_link.*` is sole reader *and* sole writer of the port, polled from `commsTask`
+and deliberately outside the operator parser (**B18**).
+
+```
+wire     [0xA5][0x5A][len=28][payload][crc16]   CRC-16/CCITT-FALSE, little-endian
+payload  seq, flags, tag_id, range_m, bearing_rad, relyaw_rad, quality,
+         age_us, n_tags                          POLAR not Cartesian (B19)
+                                                 AGE not a timestamp (B20)
+ladder   250 ms -> pose invalid, estimator coasts
+         1 s    -> fans zeroed
+         3 s    -> terminal hook (NOT stopMotor yet -- B21)
+```
+
+**Verified 2026-08-19:** RTT 2.61/3.52/5.32 ms (3.1); 62 frames / 2508 B
+reconciling exactly with 14 CRC rejects and 26 gaps, `badlen=0 resync=0`, pose
+decoding correctly, ladder reaching DEAD and zeroing the fans (3.2). **Tested
+with synthetic frames — no camera involved yet.**
 
 **Both plants are identified and the rotation axis is retuned and working:**
 
@@ -73,7 +85,8 @@ there automatically.
 | item | state |
 |---|---|
 | **Fan guards** | ⚠️ **SKIPPED — props are EXPOSED and will stay that way** (B7). Mitigated in firmware, not mechanically. |
-| Pi ↔ STM32 link | ✅ **wired and proven** (Step 3.1, 2026-08-19) — USART6, bytes cross both ways, 10/10 echo. ⬜ **No framing/CRC/pose yet** — that is Step 3.2, and it is next. |
+| Pi ↔ STM32 link | ✅ **COMPLETE** (Phase 3, 2026-08-19) — framed, CRC'd, 3-tier fail-safe, verified with synthetic frames. ⬜ **No real pose yet** — nothing has looked through the camera; that is Phase 4. |
+| Tier-2 fan cutout | ⚠️ **uses the hard kill, which latches until `R`.** Fine now, **wrong for docking** — B2 loses the tag at close range, so a 1 s dropout would strand the approach. Phase 6 must make it a soft zero. |
 | AprilTag detection | not started (Phase 4) |
 | Any translation CONTROL | not started (Phase 6) — the plant is identified, no controller written |
 | Fan 2 thrust | ⚠️ produced no measurable thrust in the 2.4 runs. **Spin it and watch before Phase 7 relies on it.** |
@@ -187,7 +200,7 @@ These are in addition to `RTOS_migration.md`'s list, which all still applies.
 | **0 safety hardening** | ✅ **(2026-08-13)** | Wires cleared, fuse/wiring confirmed, battery disconnect = e-stop. **Prop guards deliberately skipped (B7)** — mitigations moved into Phase 1. |
 | 1 fans into the RTOS (DSHOT + DMA) | ✅ **(2026-08-13)** `trans-p1-fans` | Four DSHOT channels on TIM1+DMA burst, `fanTask` prio 2 = sole fan writer, fans in every fault path *ahead* of the wheel, `S`/`L` manual commands, 30% ceiling + 10 s dead-man. Control loop untouched: ctrl period 4999/5000/5001 µs. |
 | 2 translation plant ID | ✅ **(2026-08-19)** `trans-p2-plantid` | `A(pct)=2.1e-4·pct²`, `A_c≈0.26`, **go/no-go 2.9× PASS**. Rotation re-identified + retuned: **0.47° mean, ±180° in one move, wheel returns to rest**. Yaw coupling is thrust-line offset, small (2–3 rad/s²) — no mechanical correction needed. |
-| 3 Pi ↔ STM32 wired link | 🔶 **IN PROGRESS** | **3.1 ✅ (2026-08-19)** USART6 PC6/PC7 up; Pi forced onto the PL011 (T28); `pi_link.*` sole owner of the port, polled from `commsTask` and deliberately kept out of the operator parser (B18). 10/10 echo, RTT 2.61/3.52/5.32 ms. **3.2 ⬜ framed protocol + CRC + fail-safe — NEXT.** |
+| 3 Pi ↔ STM32 wired link | ✅ **(2026-08-19)** `trans-p3-link` | USART6 PC6/PC7, Pi forced onto the PL011 (T28). `pi_link.*` is sole reader *and* writer of the port, polled from `commsTask`, deliberately outside the operator parser (B18 — verified: `comms rx=4` against 2508 Pi bytes). Framed `[A5 5A][len][28B][crc16]`, polar pose + `age_us` not a timestamp (B19/B20). 3-tier staleness ladder, tier 3 not wired to `stopMotor()` yet (B21). 62 frames / 2508 B reconcile exactly. ⚠️ tier 2 hard-kills the fans — Phase 6 must make it a soft zero. |
 | 4 vision: AprilTag pose on the Pi | ⬜ | — |
 | 5 estimator: fuse tag + IMU | ⬜ | — |
 | 6 translation control (LQR, x/y) | ⬜ | — |
@@ -1257,6 +1270,69 @@ reported in `G`. Unplug the Pi mid-run and confirm the fail-safe fires.
 byte-level state machine handling, and a `0x0A` inside a payload must not be
 mistaken for a line terminator.
 
+**Result (2026-08-19) — PASSED.**
+
+`src/pi_link.{h,cpp}` carries the byte-level framer, the pose decode, and the
+staleness ladder. Wire format, CRC parameters and endianness are specified in
+`pi_link.h` and mirrored in `tools/pi_pose_sim.py`; the Python CRC was validated
+against the published CCITT-FALSE check vector (`"123456789"` → `0x29B1`) and the
+payload offsets were checked field-by-field against the C decode **before**
+anything was flashed.
+
+**Tested with synthetic frames and no camera at all** — same argument as B8.
+The framer has several independent failure modes (endianness, CRC parameters,
+length convention, fragmentation, sequence tracking) and every one of them
+presents as `frames=0`; bisecting that with a detector, camera and lighting also
+in the picture is strictly harder.
+
+**Measured, read off the terminal:**
+
+```
+pi link: DEAD  age=33753ms  frames=62  rx=2508  crc=14  badlen=0  resync=0  seqgaps=26
+pi pose: seq=88  tag=7 x3  range=1.507m  bearing=0.25deg  relyaw=0.17deg  q=0.94  piage=12ms
+comms:   rx bytes=4          <- the operator port saw ONLY the 'g' presses
+fans:    KILLED              <- tier 2 fired
+ctrl stack free (min words): 475
+```
+
+**The run reconciles exactly**, which is the real result: `rx = 2508 / 33 B =
+76.0 frames`, being 62 accepted + 14 CRC-rejected with **zero bytes
+unaccounted**; last seq 88 − 76 arrived = 12 never sent; 12 + 14 = **26 gaps**.
+`piage=12ms` matches the simulated detection latency, and `resync=0` after a
+40-byte garbage preamble means the parser locked on without eating a real frame.
+
+**`comms: rx bytes=4` is the safety property confirmed by measurement**, not by
+construction: none of the 2508 Pi bytes reached `commsTask`, so no payload byte
+could ever have been read as `X`. That is B18 working.
+
+**Sequence-gap accounting — two structural properties, neither of them bugs.**
+Both cost time to understand once and are written down so they don't again (T31):
+`seqgaps` **includes CRC-rejected frames**, because a rejected frame's `seq` was
+never decoded and is therefore indistinguishable from one never sent; and a gap
+counter **cannot see trailing loss**, because an absence needs a *later* frame to
+reveal it — so the Pi's count runs 1–2 high at the tail of every run. Observed
+26 (STM32) vs 27 (Pi). Correct on both sides.
+
+**One real bug found and fixed in review**, before it could bite: the `uint16`
+sequence subtraction wraps correctly for rollover but turns a *backwards* jump
+into ~65000 gaps in a single frame — and a backwards jump is exactly what
+re-running the Pi sender without resetting the board produces. Bounded by
+`PI_SEQ_MAX_GAP`, with `seqrestart` counting restarts as their own event.
+
+**⚠️ Carried to Phase 6 — tier 2 currently uses the WRONG mechanism.** It calls
+`fans_stopAll()`, which is the **hard kill and latches until `R`** (B10). That is
+right for a fault and wrong for an expected dropout: **B2 says the tag is
+routinely lost at close range**, so a 1 s dropout during terminal docking would
+permanently disable translation mid-approach and wait for an operator. Phase 6
+must give tier 2 a **soft zero with the ESC left armed**, so authority returns the
+instant pose does. Faults and expected dropouts deserve different mechanisms.
+
+**Note on the Verify list above.** It asks for round-trip latency in `G`, but
+removing the Step-3.1 echo removed the round trip. The requirement is met across
+the two steps instead: 3.1 measured RTT at **2.61 / 3.52 / 5.32 ms**, and `G` now
+reports the Pi-side `age_us`, which is the number the Phase-5 estimator actually
+consumes. Recorded rather than left looking unmet.
+
 **Phase 3 exit:** `git tag trans-p3-link`
 
 ---
@@ -1600,6 +1676,8 @@ write-up more credible, not less. Do the same here.
 | T27 | **"Fixing" the two-stage deadzone chatter** | The `FINE_WW` comparison chatters — crossing it toggles the tolerance, which toggles the controller, which drives `ω_w` back across. Latching the transition measured **worse** (mean 0.97→1.25°, worst 1.47→3.10, wheel peaks 6–17→8–36): the chatter is a *safety valve* that lets the controller give up and the wheel bleed. Reverted. Do not re-fix without n ≥ 8 evidence. |
 | T28 | **Pi 3B+: GPIO14/15 are the mini-UART, not the PL011** | The BCM2837 has two UARTs. With Bluetooth enabled the PL011 (`ttyAMA0`) is wired to the **BT modem**, and the header pins get the **mini-UART** (`ttyS0`) — whose baud generator is clocked from the **VPU core clock**, which the governor scales with CPU load and temperature. The failure mode is vicious: the link is perfect at idle and starts throwing framing errors **exactly when AprilTag detection loads the CPU**, so it presents in Phase 4 as a vision bug, an EMI problem, or a bad ground — anything but the wiring session three steps earlier that introduced it. Fix: `dtoverlay=disable-bt` in `/boot/firmware/config.txt` (`/boot/config.txt` pre-Bookworm) + `enable_uart=1` + console off via `raspi-config`. **The check that actually confirms it is `ls -l /dev/serial0` resolving to `ttyAMA0`, not `ttyS0`** — everything else can look right while the port is still the wrong one. Costs Pi Bluetooth, which B1 already chose not to use. `hciuart.service` may not exist on Lite images; that is benign, not a failure. |
 | T29 | **Timing a periodic system at a commensurate interval** | `pi_link_test.py` paced at 200 ms against a 2 ms poll — an exact 100× multiple — so every sample landed at the same phase and the RTT came out **bimodal** (7 at 2.6–3.0 ms, 3 at 4.9–5.3, nothing between) instead of spread across the poll window. An aliased test measures **a phase, not a distribution**, and reports a confidently wrong mean. Harmless for a yes/no "do bytes cross" check; **not harmless for the Phase 5 estimator, which consumes a latency figure.** Before latency is characterised rather than merely observed, pace with a non-commensurate or randomised interval (197 ms, or jitter it) and take enough samples to see the actual shape. Same family as T20 — tick-granular reasoning hiding a sub-tick reality. |
+| T30 | **Relative yaw from a planar tag is ill-conditioned, and it is worst exactly where docking needs it** | AprilTag gives full 6-DOF from one tag, so range, bearing *and* the dock's face normal all fall out of one detection. But for a **planar** target at small apparent size, two distinct orientations project almost identically — the solver flips between them frame to frame. Range and bearing stay well-conditioned; **yaw is noise at distance and only resolves as the tag grows in frame**, which is the opposite of the error profile an approach wants. Mitigations, in order of value: **multiple tags on the dock at known separation** (turns "read perspective distortion off one square" into "triangulate widely-separated points" — chosen 2026-08-19, and it also survives the close-range dropout B2 warns about), then propagating the PnP ambiguity ratio to the estimator as `quality` + `PI_FLAG_AMBIGUOUS` so `R` is **widened on yaw** instead of a flipped solution being believed. Do NOT let a single-tag yaw drive terminal alignment. |
+| T31 | **Sequence-gap counters: two structural properties that both read as bugs** | Cost real confusion on the Step 3.2 verify. **(a) `seqgaps` includes CRC-rejected frames.** A rejected frame's `seq` was never decoded, so at the sequence layer it is indistinguishable from one never sent. That is correct — the estimator wants "measurements I am missing", and the answer does not depend on lost-vs-corrupted. True transport loss is the *derived* `seqgaps − crc`. Do not split them into non-overlapping counters: a CRC failure cannot be attributed to a specific missing `seq`, so the split would have to assume one gap per CRC error, which breaks the moment a corrupt length field desyncs the parser and eats the next frame too. **(b) A gap counter cannot see trailing loss** — an absence needs a *later* frame to reveal it, so the sender's count runs 1–2 high at the tail of every run (observed 26 STM32 vs 27 Pi). Neither is fixable and neither matters. **(c) The one that WAS a bug:** `uint16` subtraction wraps correctly for rollover but turns a *backwards* jump into ~65000 gaps in one frame — and restarting the sender without resetting the board produces exactly that. Bound the jump; count restarts separately. |
 
 Plus **every trap in `RTOS_migration.md` Appendix A** — the one-writer/one-reader
 invariants, `delay()`, watchdogs measuring iterations instead of time, and the rest.
@@ -1628,7 +1706,10 @@ invariants, `delay()`, watchdogs measuring iterations instead of time, and the r
 | **B16** | **Single-fan (`S1`) thrust steps, not all-four** | 2026-08-13. The four fans are opposing pairs (§18: "only one fan works for N/S/E/W; a diagonal splits across two"), so `S0` + a thrust step is **near-zero net thrust** — the pairs fight each other, producing heat and current and almost no motion. Per-motor curves need one fan at a time anyway. `S0` is kept for a different job: four motors drawing at a known throttle with the platform stationary is the clean way to answer the fuse/current question (T15) before raising `FAN_THROTTLE_MAX` above 30%. |
 | **B17** | **Fan 4 spin direction reversed in ESC firmware over DSHOT, not by touching hardware** | 2026-08-14. Three motors spun one way and one the other against 2 CW + 2 CCW props, so one fan had prop handedness mismatched to its rotation — costing ~half thrust (T3), and fan 4 could not break stiction at all. Fixed by sending DSHOT special commands from the firmware: `S4` → `J21` (SPIN_DIRECTION_REVERSED ×10) → `J12` (SAVE_SETTINGS ×10) → power-cycle. Implemented as a **general command primitive** (`fans_sendCommand`, serial `J<cmd>`) rather than a one-shot, because this ESC's DSHOT command table is demonstrably incomplete — the beep command has never worked on it — so being able to try 21, then 8, then 7 and observe was the point. **Command 21 worked.** Protocol details that are load-bearing: the telemetry-request bit must be SET to distinguish a command from a throttle value, the motor must be stopped, and the command must be repeated (~10 frames). Chosen over swapping props (hardware contact, and it only moves the mismatch) and over swapping phase wires (most invasive). **Verified by measurement, not just by eye:** fan 4 went from not moving at 40% to 0.577 ±6% at 55%. |
 | **B18** | **The Pi port is NEVER passed to `commands_init()` — `pi_link.*` owns USART6 outright, and `pi_poll()` rides `commsTask` via a registered callback** | 2026-08-19, Step 3.1. **The safety half:** `commsTask`'s contract is line assembly plus *any unrecognised input stops the motor*, with an `X` fast path that fires **before the line is even queued**. The Pi sends binary pose frames, so a payload byte of `0x58` is `'X'` and would stop the wheel mid-slew, a `0x0A` mid-frame is a line terminator, and Pi boot chatter arrives as a scatter of commands. The operator parser and the pose parser must never share a code path — so the Pi port gets its own reader from day one, before there is any protocol to get wrong. **The invariant half:** B15 (sole writer) and the sole-reader rule are stated over `Serial`/`hc05Serial`, but what they actually protect is that **`HardwareSerial` is not reentrant *per port*.** USART6 is touched by nothing else, so `pi_link` is both its sole reader and its sole writer — the same requirement satisfied by ownership rather than by arbitration. **The structural half:** `pi_poll()` is wired in with `commands_setAuxPoll()` rather than `#include "pi_link.h"` inside `commands.cpp`, matching the two existing registered-callback precedents (`faults_setHwKillHook` B10, `safety_setFanMonitor`); this keeps proven code generic and adds **no seventh task and no new stack** — the link rides the 2 ms poll that already exists, which is also where Appendix C puts it. Rejected: a dedicated `piTask` (more RTOS surface for a port that produces ~600 B/s), and extending `commands_init` to three streams (would have put a binary stream one `if` away from the motor-stop path). **Step 3.1's echo is a temporary diagnostic and must be deleted in 3.2** — a framed protocol that echoes its own payload back at the sender is a feedback loop. |
-| **B19** | *(next decision goes here)* | |
+| **B19** | **Pose is sent in POLAR (range, bearing, rel-yaw), not Cartesian — and the Pi does geometry, never time** | 2026-08-19, Step 3.2. **Polar:** identical information to (x, y), different *noise*. AprilTag range error grows roughly with distance squared while bearing error is roughly constant in angle, so in polar the two are axis-aligned and the estimator's measurement covariance `R` is **diagonal**. Converting on the Pi produces the classic banana-shaped correlated uncertainty, which needs a full covariance to represent honestly — and sending it as diagonal anyway would make the filter quietly overconfident. Cost: the EKF measurement model is nonlinear, which it already was. **Geometry not time:** the Pi runs detection + PnP + the 6-DOF→planar collapse and is otherwise **stateless per frame** — no smoothing, no velocity, no filtering. A Kalman filter needs independent measurements with known covariance; pre-filtering on the Pi produces time-correlated noise its model does not include, so it would think it had N independent looks when it had one look smeared over N frames (T10's cousin — information counted twice). Bandwidth was explicitly *not* the reason: 33 B at 30 Hz is ~1 kB/s against 11.5 kB/s, ~9% utilised. |
+| **B20** | **The frame carries `age_us`, NOT a Pi timestamp — this DEPARTS from the guide's Step 3.2 text** | 2026-08-19. The guide asked for a "Pi-side timestamp". The two clocks are unsynchronised, so an absolute Pi timestamp is meaningless on the STM32 without a clock-sync protocol to build, debug and keep correct across reboots — a whole subsystem bought for nothing. `age_us` is measured **entirely on the Pi's own clock** (capture → transmit), where the difference is valid regardless of offset, and the STM32 adds the transit it already measured in 3.1 (~2–5 ms). Same information, no shared clock. **Measured from CAPTURE, not detection-complete:** AprilTag on a Pi 3B+ carries 50–150 ms, which at docking closing speeds is the *dominant* position error rather than a rounding one, so stamping at the wrong end would quietly discard most of the latency the field exists to report. Verified end-to-end: a simulated 12 ms detection latency arrived as `piage=12ms`. |
+| **B21** | **The staleness ladder is 3-tier and split by axis; tier 3 is deliberately NOT wired to `stopMotor()` in Phase 3** | 2026-08-19. **Why a ladder and not one timeout:** the two axes dead-reckon completely differently. Heading coasts on the gyro at ~0.8 °/min — 0.04° after 3 s, effectively free. Position coasts on double-integrated accelerometer, error ~½·a·t², so it is spent within about a second. Translation authority is therefore withdrawn a full 2 s before attitude control is even questioned: a platform holding heading with fans off is stable and recoverable, one that has also dropped attitude control just drifts. Thresholds **250 ms** (≈2–3 missed detections at 10 Hz — tolerate dropout without twitching) / **1 s** / **3 s**. **Why tier 3 only calls a hook:** nothing consumes pose until Phase 6, so a lost link endangers nothing today — while dumping a spinning flywheel *does* kick the platform at ~42 rad/s² against a 4.24 breakaway, and `safety.cpp`'s own comments warn against nuisance trips. A safe-stop that is not needed is not free on this machine. Tiers 1 and 2 fire for real; tier 3 announces itself so all three timers are exercised, and **Phase 6 repoints it at `stopMotor()`** once there is something to protect. **Why the ladder arms on the first valid frame:** if pose has never been valid its absence is not a loss — without that, every rotation test would trip a timeout at boot merely because no Pi is attached. ⚠️ **Known wrong for Phase 6:** tier 2 calls `fans_stopAll()`, the hard kill, which **latches until `R`** (B10). B2 says the tag is routinely lost at close range, so a 1 s dropout during terminal docking would permanently disable translation and wait for an operator. Phase 6 must give tier 2 a **soft zero with the ESC left armed** — expected dropouts and faults need different mechanisms. |
+| **B22** | *(next decision goes here)* | |
 
 ---
 
