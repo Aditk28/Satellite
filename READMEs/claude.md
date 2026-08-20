@@ -147,10 +147,37 @@ psi = theta + psi_offset, and ONLY the offset is estimated
 `PI_FLAG_AMBIGUOUS` drops the heading gain to a quarter. Accelerometer prediction
 deliberately not used yet -- its body-frame axis signs are unverified (T11).
 
-**NEXT: Phase 6 -- translation control (LQR).** Three double integrators (x, y, psi),
-fan allocation with the square-law `throttle = sqrt(A/A_max)`, and the tier-2 fan
-inhibit that B21b flags as still wrong (hard kill that latches; needs a soft zero plus
-an inhibit flag the allocator checks).
+**Phase 6 WRITTEN BUT NEVER RUN (2026-08-20).** `src/translation.*` builds and is wired
+into the control loop and the command parser. PD in ACCELERATION units -- no mass term,
+because B14 identified the plant so mass cancels; the guide's `K_p = omega_n^2 * m` is
+wrong for this build. Coulomb feedforward ported from rotation (opposite-signed branches,
+CONTROL_README section 6). Dock->body rotation by psi. Allocation onto two opposing fan
+pairs with 12% idle bias, then `throttle = sqrt(A / 2.1e-4)`.
+
+Fan geometry, degrees CCW from the camera axis: **fan1 -40, fan2 +50, fan4 +140,
+fan3 +230.** Pairs are 1/4 and 2/3.
+
+```
+TX<m> TY<m>   set the dock-frame target for the MAGNET (not the platform centre)
+TT            enable -- REFUSES unless pose is FRESH
+TS            stop.   X also stops it.
+```
+
+Safety: a **divergence guard** kills all four fans if the error grows under thrust
+(catches a wrong fan angle, backwards prop, reversed ESC or a frame-sign slip without
+caring which), plus a 15 s no-convergence timeout. B21b is fixed -- `PI_LOST` is now a
+SOFT zero with the ESC left armed, and the controller withdraws thrust itself when the
+pose is not FRESH.
+
+⚠️ **The Pi runs at 600 MHz, undervolt-throttled, and that is ACCEPTED (B26).** ~7 fps
+at ~140 ms latency. No diagnosis was reached: regulator cool, 300 uF changed nothing,
+meter reads 5.15 V at the Pi while the Pi disagrees (T40). Real fix is a dedicated
+5 V/3 A buck for the Pi alone. **Do NOT use `force_turbo`/`avoid_warnings`** -- that
+disables protection rather than supplying power, and this project has already lost a Pi
+and an SD card to brownouts. Vision settings retuned for it: `--decimate 3.0`,
+`--buffersize 1` (B27 -- buffer deep when faster than the source, shallow when slower).
+
+**NEXT: run and tune Phase 6.** Nothing in it has touched hardware.
 
 **Raw calibration data** lives in `calibration/runs/`, one folder per experiment named
 by what it established, indexed in `calibration/runs/INDEX.md`.

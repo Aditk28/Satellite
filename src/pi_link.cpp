@@ -229,15 +229,17 @@ static void ladder(uint32_t now) {
   s_state = PI_LOST;
   if (!s_lostActionDone) {
     s_lostActionDone = true;
-    /* ⚠️ PHASE 6 MUST CHANGE THIS. fans_stopAll() is the HARD kill and it
-       LATCHES until `R` (B10) -- correct for a fault, wrong for a condition we
-       expect to enter and leave repeatedly while searching. It also only zeroes
-       once, so a running controller would simply re-command the fans next
-       cycle: what Phase 6 actually needs is an INHIBIT flag the allocator
-       checks, plus a soft zero that leaves the ESC armed so authority returns
-       the instant a pose does. Safe today only because nothing commands the
-       fans yet. */
-    fans_stopAll();
+    /* SOFT zero, not fans_stopAll(). Fixed in Phase 6 -- the hard kill LATCHES
+       until `R` (B10), which is correct for a fault and wrong for a condition
+       we expect to enter and leave repeatedly while searching (B21b). This
+       leaves the ESC armed and the DSHOT stream running, so authority returns
+       the instant a pose does.
+
+       Defence in depth, not the primary mechanism: the CONTROLLER also checks
+       pose freshness every cycle and withdraws thrust itself. This is here so
+       that "fans off when pose is lost" does not depend on the controller
+       being correct. */
+    fans_setAll(0, 0, 0, 0);
   }
 }
 

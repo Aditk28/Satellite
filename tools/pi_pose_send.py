@@ -80,7 +80,7 @@ class Camera(threading.Thread):
     at the cost of letting them age, which is backwards for a measurement
     feeding a control loop."""
 
-    def __init__(self, device, width, height):
+    def __init__(self, device, width, height, bufsize):
         super().__init__(daemon=True)
         self.cap = cv2.VideoCapture(device, cv2.CAP_V4L2)
         if not self.cap.isOpened():
@@ -89,7 +89,19 @@ class Camera(threading.Thread):
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH,  width)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
         self.cap.set(cv2.CAP_PROP_CONVERT_RGB, 0)
-        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 4)
+        # BUFFER DEPTH DEPENDS ON WHETHER YOU OUTRUN THE CAMERA.
+        #
+        #   CPU faster than the camera (1400 MHz): depth 4. A single buffer
+        #   leaves the driver nowhere to capture while userspace holds a frame,
+        #   so it misses every other one -- measured 15.9 fps against 30.
+        #
+        #   CPU slower than the camera (600 MHz, undervolt-throttled): depth 1.
+        #   Processing takes ~140 ms against a 33 ms frame interval, so a deep
+        #   queue BACKS UP and grab() starts returning frames up to 130 ms old.
+        #   Deep buffering silently turns a rate problem into a LATENCY problem,
+        #   and latency is the thing the estimator cannot tolerate. Depth 1 makes
+        #   the driver DROP stale frames instead of queueing them.
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, bufsize)
         self.lock, self.latest, self.seq, self.stop = threading.Lock(), None, 0, False
 
     def run(self):
@@ -123,15 +135,25 @@ def main():
     ap.add_argument("--baud",   type=int, default=115200)
     ap.add_argument("--width",  type=int, default=1280)
     ap.add_argument("--height", type=int, default=720)
-    ap.add_argument("--decimate", type=float, default=2.0)
+    ap.add_argument("--decimate", type=float, default=3.0,
+                    help="quad-detection decimation. 2.0 at full clock; 3.0 is "
+                         "the 600 MHz compromise -- roughly halves detect cost. "
+                         "CHECK the tag count still holds at 3: 4.0 was measured "
+                         "to drop the 4 cm flanking tags, and those are what "
+                         "resolve the yaw ambiguity (T30).")
     ap.add_argument("--threads",  type=int, default=3)
+    ap.add_argument("--buffersize", type=int, default=1,
+                    help="V4L2 queue depth. 1 when the CPU is SLOWER than the "
+                         "camera (600 MHz throttled) so stale frames are "
+                         "dropped; 4 when it is FASTER (1400 MHz) so the driver "
+                         "always has somewhere to capture. See Camera.__init__.")
     ap.add_argument("--quiet", action="store_true")
     args = ap.parse_args()
 
     lock_exposure(args.device)   # must match the calibration (T35)
 
     ser = serial.Serial(args.port, args.baud, timeout=0)
-    cam = Camera(args.device, args.width, args.height)
+    cam = Camera(args.device, args.width, args.height, args.buffersize)
     cam.start()
     time.sleep(1.0)
 

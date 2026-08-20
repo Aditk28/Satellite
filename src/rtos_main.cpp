@@ -152,6 +152,7 @@
 #include "fans.h"            // Translation 1.2: fanTask is the SOLE fan writer
 #include "pi_link.h"         // Translation 3.1: USART6 pose link, sole owner of that port
 #include "estimator.h"       // Translation 5.1: dock-relative pose estimator
+#include "translation.h"     // Translation 6: x/y control via the fans
 #include <Adafruit_INA219.h>
 
 // ------------------------- hardware -------------------------
@@ -566,6 +567,7 @@ void stopMotor(const String &why) {
   // should not leave a flywheel spinning" rule, and it applies harder to props.
   fans_stopAll();
   transActive = false;          // Phase 2: X aborts a thrust step mid-sequence
+  trans_enable(false);          // Phase 6: X aborts closed-loop translation
   controllerEnabled = false;
   ctrlMode = CTRL_IDLE;
   capturing = false;
@@ -589,6 +591,7 @@ static void  safetyStop(const char* why)   { stopMotor(String(why)); }
 // MICROSECONDS -- comfortably better than the "within one frame period" the guide
 // asks for. handleLine() still runs the full stopMotor() when control drains it.
 static void commsEmergencyStop(void) { motor.target = 0.0f; fans_stopAll(); }
+// NOTE: trans_enable(false) also runs from handleLine's X path via stopMotor().
 
 // Translation 3.2: terminal action for a dead Pi link (PI_DEAD, 3 s with no
 // valid pose). Runs ON commsTask, fires ONCE per loss episode.
@@ -767,6 +770,23 @@ void printGains() {
     printBoth("est gains: aPos=" + String(ga, 3) + " bVel=" + String(gb, 3)
               + " aPsi=" + String(gc, 3) + "   fixes=" + String(est_fixes())
               + " rejects=" + String(est_rejects()));
+  }
+  {
+    float tkp, tkd, tff, tax, tay, p1, p2, p3, p4, tx, ty;
+    trans_getGains(&tkp, &tkd, &tff);
+    trans_lastCommand(&tax, &tay, &p1, &p2, &p3, &p4);
+    trans_getTarget(&tx, &ty);
+    printBoth(String("trans: ") + (trans_enabled() ? "ON " : "off")
+              + (trans_tripped() ? " TRIPPED" : "")
+              + "  target=(" + String(tx, 3) + "," + String(ty, 3) + ")"
+              + "  err=" + String(trans_lastErr(), 3) + "m"
+              + "  a=(" + String(tax, 2) + "," + String(tay, 2) + ")m/s2"
+              + "  pct=" + String(p1, 0) + "/" + String(p2, 0) + "/"
+              + String(p3, 0) + "/" + String(p4, 0));
+    printBoth("trans gains: Kp=" + String(tkp, 2) + " Kd=" + String(tkd, 2)
+              + " ff=" + String(tff, 2) + "   idle=" + String(TRANS_IDLE_PCT, 0)
+              + "%  deadzone=" + String(TRANS_DEADZONE * 100.0f, 1) + "cm");
+    if (trans_tripped()) printBoth(String("  !! ") + trans_tripReason());
   }
   if (fans_overruns()) {
     uint32_t nl, nmin, nmax, cen;
@@ -1003,6 +1023,15 @@ void controlUpdate(float dt) {
   {
     PiPose pp;
     if (pi_getPose(&pp)) est_correct(&pp, theta, omega_p);
+  }
+
+  // Translation 6: x/y control. Runs BEFORE the enable/idle early-return below,
+  // because translation and rotation are independent -- the wheel being idle
+  // says nothing about whether the fans should be holding station.
+  {
+    EstState es;
+    if (est_get(&es)) trans_update(&es, pi_state() == PI_FRESH);
+    else              trans_update(NULL, false);
   }
 
   if (!controllerEnabled || ctrlMode == CTRL_IDLE) {
@@ -1258,6 +1287,34 @@ void handleLine(String s) {
       printBoth("  expect: wheel POSITIVE, theta NEGATIVE (for positive volts)");
       break;
     case 'T':
+      // TX/TY set the dock-frame target for the MAGNET, TT enables, TS stops.
+      // 'T' followed by a LETTER is a translation command; followed by a digit
+      // it is the original heading step, unchanged.
+      if (s.length() > 1 && isAlpha(s.charAt(1))) {
+        char sub = toupper(s.charAt(1));
+        float v2 = (s.length() > 2) ? s.substring(2).toFloat() : 0.0f;
+        float tx, ty;
+        trans_getTarget(&tx, &ty);
+        if (sub == 'X') { trans_setTarget(v2, ty); }
+        else if (sub == 'Y') { trans_setTarget(tx, v2); }
+        else if (sub == 'T') {
+          if (pi_state() != PI_FRESH) {
+            printBoth("REFUSED: pose is not FRESH. Translation will not start "
+                      "blind -- check the Pi is sending and the tags are seen.");
+            break;
+          }
+          trans_enable(true);
+          trans_getTarget(&tx, &ty);
+          printBoth("TRANSLATE -> magnet target (" + String(tx, 3) + ", "
+                    + String(ty, 3) + ")  PROPS ARE LIVE");
+          break;
+        }
+        else if (sub == 'S') { trans_enable(false); printBoth("translation STOP"); break; }
+        else { printBoth("TX<m> TY<m> set target, TT go, TS stop"); break; }
+        trans_getTarget(&tx, &ty);
+        printBoth("target (" + String(tx, 3) + ", " + String(ty, 3) + ")");
+        break;
+      }
       parked = false; stallCount = 0; stallHold = false; stallStartMs = 0;
       target = wrapPi(radians(v));
       startCapture("heading_step", CAPTURE_MS, 0.0f, 0, false);
@@ -1831,6 +1888,7 @@ void setup() {
   pi_setDeadHook(piLinkDead);
 
   est_init();
+  trans_init();
 
   // Phase 1.2 (translation): fanTask (prio 2) becomes the SOLE fan writer. Touches
   // only TIM1 + DMA2_S5 + PA8..PA11 -- nothing SimpleFOC, the encoder or I2C owns.
