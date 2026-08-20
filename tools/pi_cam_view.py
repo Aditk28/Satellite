@@ -98,9 +98,18 @@ def capture_loop(args):
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    # Spec-sheet focal length: half-diagonal / tan(DFOV/2), DFOV = 120 deg.
-    # Scales with width because that is all we can assume without calibration.
-    f_px = 424.0 * (w / 1280.0)
+    # MEASURED 2026-08-20, not from the spec sheet. Two known-distance readings
+    # of the 12 cm tag: 115 px @ 1.00 m -> 958, 281 px @ 0.40 m -> 937. Mean 947.
+    #
+    # The spec sheet claims 120 deg DFOV, which would be f = 424. The measured
+    # 947 implies ~76 deg DFOV (68 H, 42 V) -- so either the spec is marketing or
+    # 720p is a CENTRE CROP of the sensor rather than a downscale. Trust the
+    # measurement: it is self-consistent across two distances to 2%.
+    #
+    # This is a focal length only -- NOT a calibration. Principal point is
+    # assumed centred and distortion is uncorrected, so bearing degrades toward
+    # the frame edges. Run pi_calibrate.py when that starts to matter.
+    f_px = 947.0 * (w / 1280.0)
 
     mode, det = (None, None) if args.no_detect else make_detector()
     print(f"camera {w}x{int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))}  "

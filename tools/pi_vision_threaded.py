@@ -89,7 +89,15 @@ class Camera(threading.Thread):
         # skipping colour reconstruction and a separate cvtColor. Measured
         # 50.2 ms -> 15.0 ms at 720p.
         self.cap.set(cv2.CAP_PROP_CONVERT_RGB, 0)
-        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        # BUFFERSIZE 4, not 1. With a single V4L2 buffer the driver has nowhere
+        # to capture while we hold the frame, so it misses every other one --
+        # measured 15.9 fps against the camera's 30. A depth of 4 cannot make
+        # frames stale HERE because the capture thread drains continuously and
+        # take() always returns the newest; the shallow-buffer reasoning applies
+        # to a serial loop, not this one. Measured 15.9 -> 28.6 fps, latency
+        # 44.5 -> 60.9 ms (processing contention, not queue age: 31 ms decode +
+        # 29 ms detect ~= 60 ms), and worst case actually IMPROVED, 89 -> 76 ms.
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 4)
 
         self.lock    = threading.Lock()
         self.latest  = None      # (gray, t_capture)
