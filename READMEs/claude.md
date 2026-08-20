@@ -86,9 +86,26 @@ latches until `R`. B2 loses the tag at close range, so a 1 s dropout during dock
 strand the approach waiting for an operator. Tier 2 must become a soft zero with the ESC
 left armed.
 
-**NEXT: Phase 4 -- AprilTag pose on the Pi.** Camera calibration, detection rate on a
-3B+, pose extraction, feeding the Phase 3 wire format unchanged. Multi-tag dock chosen
-(T30: single-tag relative yaw is ill-conditioned at exactly the range docking needs it).
+**Phase 4 IN PROGRESS. Step 4.2 DONE (2026-08-20): vision pipeline measured and
+chosen.** 1280x720 MJPG, grayscale decode, `decimate=2.0`, threaded capture ->
+**44.9 ms capture->pose latency, 14.8 fps, 3 of 3 tags every frame** (B22/B23), down
+from 443 ms. Detector is Debian `python3-apriltag` (the reference AprilTag 3.4.2);
+`cv2.aruco` is ~4x slower and ignores decimation (T32); `pupil-apriltags` cannot be
+built on 512 MB. 720p is forced -- lower modes detect only 2 of 3 tags, losing the
+flanking tags that resolve yaw ambiguity (T30).
+
+⚠️ **Camera exposure must be locked manually before calibrating** -- auto-exposure caps
+the rate at 15 fps, implies ~15 px blur at 30 deg/s, and changes effective focal length,
+so a calibration taken with it on is invalid (T35).
+
+⚠️ **Hardware: the Pi 3B+ died** (PMIC failure -- 3.3 V rail absent, board cold, would
+not boot from SD or USB). Replaced with a **Pi 3A+**: identical BCM2837B0 at 1.4 GHz so
+identical vision performance, 512 MB, one USB port, no Ethernet, ~1/5 the current draw.
+Nothing architectural changed. `tools/pi_setup.sh` rebuilds a fresh Pi in one command.
+
+**NEXT: Step 4.1 camera calibration**, then 4.3 pose extraction feeding the Phase 3
+wire format unchanged. Multi-tag dock: 12 cm centre tag (id 0) at 9 cm height, two 4 cm
+flanking tags (ids 1-2) at 14.15 cm centre-to-centre.
 
 **Raw calibration data** lives in `calibration/runs/`, one folder per experiment named
 by what it established, indexed in `calibration/runs/INDEX.md`.

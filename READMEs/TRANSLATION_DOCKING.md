@@ -25,8 +25,24 @@ Never propose a solution that requires a scope.
 
 ## Current position
 
-**Phases 0, 1, 2 and 3 are COMPLETE. Phase 4 (AprilTag pose on the Pi) is NEXT.**
+**Phases 0, 1, 2 and 3 are COMPLETE. Phase 4 is IN PROGRESS — Step 4.2
+(detection rate) is DONE; Step 4.1 (calibration) is NEXT.**
 Tags: `trans-p1-fans`, `trans-p2-plantid`, `trans-p3-link`.
+
+**Vision pipeline measured and chosen (2026-08-20):** 1280×720 MJPG, grayscale
+decode, `decimate=2.0`, threaded capture → **44.9 ms capture→pose latency,
+14.8 fps, 3 of 3 tags every frame** (B22/B23). Detector is Debian's
+`python3-apriltag`. **⚠️ Camera exposure MUST be locked manually before
+calibrating** — auto-exposure caps the rate at 15 fps, implies ~15 px of blur at
+30 °/s, and changes effective focal length so any calibration taken with it
+enabled is invalid (T35).
+
+**⚠️ Hardware changed:** the Pi 3B+ died mid-phase (PMIC failure — 3.3 V rail
+absent, cold, would not boot from SD or USB). Replaced with a **Pi 3A+**:
+identical BCM2837B0 at 1.4 GHz, so identical detection performance; 512 MB RAM,
+one USB port, no Ethernet, ~1/5 the current draw. Nothing architectural changed.
+`pupil-apriltags` cannot be built on 512 MB — use the Debian package.
+**`tools/pi_setup.sh` rebuilds a fresh Pi in one command.**
 
 **The Pi link is up, framed, and fail-safe.** USART6 PC6/PC7, Pi moved onto the
 PL011 rather than the mini-UART (**T28** — the one that would otherwise have bitten
@@ -201,7 +217,7 @@ These are in addition to `RTOS_migration.md`'s list, which all still applies.
 | 1 fans into the RTOS (DSHOT + DMA) | ✅ **(2026-08-13)** `trans-p1-fans` | Four DSHOT channels on TIM1+DMA burst, `fanTask` prio 2 = sole fan writer, fans in every fault path *ahead* of the wheel, `S`/`L` manual commands, 30% ceiling + 10 s dead-man. Control loop untouched: ctrl period 4999/5000/5001 µs. |
 | 2 translation plant ID | ✅ **(2026-08-19)** `trans-p2-plantid` | `A(pct)=2.1e-4·pct²`, `A_c≈0.26`, **go/no-go 2.9× PASS**. Rotation re-identified + retuned: **0.47° mean, ±180° in one move, wheel returns to rest**. Yaw coupling is thrust-line offset, small (2–3 rad/s²) — no mechanical correction needed. |
 | 3 Pi ↔ STM32 wired link | ✅ **(2026-08-19)** `trans-p3-link` | USART6 PC6/PC7, Pi forced onto the PL011 (T28). `pi_link.*` is sole reader *and* writer of the port, polled from `commsTask`, deliberately outside the operator parser (B18 — verified: `comms rx=4` against 2508 Pi bytes). Framed `[A5 5A][len][28B][crc16]`, polar pose + `age_us` not a timestamp (B19/B20). 3-tier staleness ladder, tier 3 not wired to `stopMotor()` yet (B21). 62 frames / 2508 B reconcile exactly. ⚠️ tier 2 hard-kills the fans — Phase 6 must make it a soft zero. |
-| 4 vision: AprilTag pose on the Pi | ⬜ | — |
+| 4 vision: AprilTag pose on the Pi | 🔶 **IN PROGRESS** | **4.2 ✅ (2026-08-20)** — 720p MJPG grey / `decimate=2.0` / threaded: **44.9 ms capture→pose, 14.8 fps, 3/3 tags** (B22, B23). Pi 3B+ died mid-phase (PMIC), replaced by a **3A+** — same SoC and clock, so same performance. Detector is Debian `python3-apriltag`. ⚠️ **Lock exposure before 4.1** (T35) — auto-exposure caps rate at 15 fps, blurs ~15 px at 30 °/s, and invalidates any calibration taken with it on. **4.1 calibration ⬜ NEXT, 4.3 pose extraction ⬜.** |
 | 5 estimator: fuse tag + IMU | ⬜ | — |
 | 6 translation control (LQR, x/y) | ⬜ | — |
 | 7 combined 3-DOF + allocation | ⬜ | — |
@@ -1376,6 +1392,68 @@ lowest resolution that still gives reliable detection at maximum working range.*
 **Trap 2.** Motion blur during rotation will kill detection. Note the maximum
 angular rate at which the tag is still detected — this bounds the SEARCH sweep speed.
 
+**Result (2026-08-20) — PASSED. Chosen mode: 1280×720 MJPG, grayscale decode,
+`decimate=2.0`, threaded capture.**
+
+```
+LATENCY capture->pose   mean 44.9 ms   p95 43.8   max 680.3
+decode  9.5 ms (capture thread)   detect 31.8 ms (main thread)
+14.8 fps   tags 3/3/3 (mean 3.00, min 3, max 3)
+```
+
+Run on the **3A+ replacement board** (the 3B+ died — see the hardware note below),
+at a verified 1400 MHz with the `performance` governor pinned.
+
+**How it got from 443 ms to 45 ms**, in order of contribution:
+
+| change | effect |
+|---|---|
+| use the reference detector, not `cv2.aruco` | **~4×** — see T32 |
+| `decimate=2.0` | **3.5×** on detect (285.6 → 82.0 ms) |
+| decode MJPEG straight to grayscale | 50.2 → 15.0 ms (skips colour recon + `cvtColor`) |
+| threaded capture, newest-frame-wins | period stops being capture+process serialised |
+
+**720p is not negotiable.** At 800×600 and 640×480 the benchmark detects only
+**2 of 3 tags** — the 4 cm flanking tags fall under the detection floor, and those
+are the entire mechanism for resolving planar yaw ambiguity (T30). Speed bought by
+losing a tag is a broken terminal approach, not speed.
+
+**`decimate=4.0` is too far**: latency drops to 29.4 ms but tags fall to
+`mean 2.82, min 1`. 2.0 is the setting that holds 3/3/3. Detect is only 31.8 ms
+there, so there is no reason to push it.
+
+**YUYV was tested and REJECTED, opposite to the prediction.** At 720p it is capped
+~5.9 fps by **USB bandwidth**, not by the 10 fps the camera advertises: an
+uncompressed 720p frame is 1.84 MB and takes ~170 ms to cross the wire. That
+transfer is both a rate cap and pure latency, and it is **invisible in the profile
+because it hides inside `grab()` as blocking**. MJPEG moves ~100 KB in ~10 ms and
+wins on rate *and* latency. See T34.
+
+**⚠️ Still open at the close of this step — auto-exposure.** The camera delivers
+only ~15 fps against an advertised 30 for MJPG 720p, which is the signature of an
+auto-exposure sitting near 66 ms. That same exposure implies **~15 px of motion
+blur at 30 °/s** (0.135°/px), which would destroy corner localisation during
+SEARCH. **Locking exposure short is a PREREQUISITE for Step 4.1**, not an
+optimisation: auto-exposure changes effective focal length, so a calibration taken
+with it enabled is invalid. Set `auto_exposure=1` (manual, in UVC) and
+`exposure_time_absolute=100` (10 ms), add light until 3 tags hold at maximum
+range, calibrate at that setting, and never touch it again.
+
+**Rolling shutter is a second, separate motion effect** and is not fixed by
+exposure: the sensor reads top-to-bottom over the frame period, so during rotation
+the tag arrives *sheared* and PnP returns a confidently wrong pose rather than
+failing. Mitigations: **step-and-stare** search (rotate, stop, look — what real
+spacecraft do, and it removes blur and shear together), and **widen `R` on measured
+`ω_p`**, which the STM32 already has from the gyro at 200 Hz.
+
+**Hardware note.** The original Pi 3B+ died mid-phase (PMIC failure — 3.3 V rail
+absent, board cold, would not boot from SD *or* USB). Replaced with a **Pi 3A+**:
+identical BCM2837B0 at 1.4 GHz so identical detection performance, 512 MB instead
+of 1 GB, one USB port, no Ethernet, ~1/5 the current draw, ~$15 cheaper. Nothing in
+the architecture changed. Detector is Debian's **`python3-apriltag`** (prebuilt
+reference AprilTag 3.4.2) — `pupil-apriltags` cannot be built on 512 MB, it
+OOM-kills the compiler even single-threaded with swap.
+
 ## Step 4.3 — Pose extraction
 
 **Do.** From the tag detection produce: **bearing** (angle from camera axis to tag),
@@ -1678,6 +1756,10 @@ write-up more credible, not less. Do the same here.
 | T29 | **Timing a periodic system at a commensurate interval** | `pi_link_test.py` paced at 200 ms against a 2 ms poll — an exact 100× multiple — so every sample landed at the same phase and the RTT came out **bimodal** (7 at 2.6–3.0 ms, 3 at 4.9–5.3, nothing between) instead of spread across the poll window. An aliased test measures **a phase, not a distribution**, and reports a confidently wrong mean. Harmless for a yes/no "do bytes cross" check; **not harmless for the Phase 5 estimator, which consumes a latency figure.** Before latency is characterised rather than merely observed, pace with a non-commensurate or randomised interval (197 ms, or jitter it) and take enough samples to see the actual shape. Same family as T20 — tick-granular reasoning hiding a sub-tick reality. |
 | T30 | **Relative yaw from a planar tag is ill-conditioned, and it is worst exactly where docking needs it** | AprilTag gives full 6-DOF from one tag, so range, bearing *and* the dock's face normal all fall out of one detection. But for a **planar** target at small apparent size, two distinct orientations project almost identically — the solver flips between them frame to frame. Range and bearing stay well-conditioned; **yaw is noise at distance and only resolves as the tag grows in frame**, which is the opposite of the error profile an approach wants. Mitigations, in order of value: **multiple tags on the dock at known separation** (turns "read perspective distortion off one square" into "triangulate widely-separated points" — chosen 2026-08-19, and it also survives the close-range dropout B2 warns about), then propagating the PnP ambiguity ratio to the estimator as `quality` + `PI_FLAG_AMBIGUOUS` so `R` is **widened on yaw** instead of a flipped solution being believed. Do NOT let a single-tag yaw drive terminal alignment. |
 | T31 | **Sequence-gap counters: two structural properties that both read as bugs** | Cost real confusion on the Step 3.2 verify. **(a) `seqgaps` includes CRC-rejected frames.** A rejected frame's `seq` was never decoded, so at the sequence layer it is indistinguishable from one never sent. That is correct — the estimator wants "measurements I am missing", and the answer does not depend on lost-vs-corrupted. True transport loss is the *derived* `seqgaps − crc`. Do not split them into non-overlapping counters: a CRC failure cannot be attributed to a specific missing `seq`, so the split would have to assume one gap per CRC error, which breaks the moment a corrupt length field desyncs the parser and eats the next frame too. **(b) A gap counter cannot see trailing loss** — an absence needs a *later* frame to reveal it, so the sender's count runs 1–2 high at the tail of every run (observed 26 STM32 vs 27 Pi). Neither is fixable and neither matters. **(c) The one that WAS a bug:** `uint16` subtraction wraps correctly for rollover but turns a *backwards* jump into ~65000 gaps in one frame — and restarting the sender without resetting the board produces exactly that. Bound the jump; count restarts separately. |
+| T32 | **A benchmark whose DETECTOR is ambiguous is worthless — and a silent fallback guarantees it** | Cost most of a session (2026-08-19/20). `cv2.aruco` can decode `tag36h11` but uses the ArUco quad detector: **~4× slower than the reference AprilTag detector, and it ignores `decimate` entirely** — so decimated rows silently duplicated the undecimated ones and read as "decimation does nothing". The fallback was hidden by a bare `except: pass`, so a run landed on the slow backend with no indication, was compared against an earlier run on the fast one, and the 4× gap looked like a hardware problem. **Never swallow a backend-selection exception**; print why each preferred option was skipped, print which one ran, and never compare numbers across backends. Related: the Debian binding's constructor kwarg is **`threads`, not the `Nthreads` its own docstring claims**, and it defaults to **1** — getting that wrong costs ~3× on a quad-core and looks exactly like a slow board. |
+| T33 | **Reading a clock at idle and assuming it applied during the run** | The old Pi's ARM clock read 600 MHz *after* a benchmark, at idle, and that was taken as proof the run had been throttled to 43% — the basis for a 2.33× extrapolation that predicted 12–14 fps on the replacement. Wrong twice over: **600 MHz at idle is the normal `ondemand` floor**, not throttling, and the real gap between the "throttled" board and a verified-1400 MHz one turned out to be 1.34×, not 2.33×. Governor scaling and thermal/undervolt throttling both produce the same idle reading and only one is a fault. **Poll the clock DURING the workload, in a second session, or the number means nothing** — and pin `performance` before benchmarking so the ramp is not part of what you measure. |
+| T34 | **Period is not latency, and blocking hides inside the profile** | Two ways this bit. (a) The serial benchmark reported `grab+decode+detect` as latency, but when the pipeline outruns the camera `grab()` **blocks** — that time is a frame that has not been captured yet, not the age of one that has. It inflates the apparent latency while the real figure is much lower. (b) **YUYV at 720p looked cheap because its "decode" is 8 ms vs MJPEG's 50** — but an uncompressed 1.84 MB frame takes ~170 ms to cross USB 2.0, and that transfer is *both* a rate cap and pure latency, entirely concealed inside `grab()`. Measured: YUYV `decimate=2` showed `grab 74.3 ms`, matching the predicted wait to within 1 ms. **Timestamp the frame the instant `grab()` returns and measure to pose-available; report that separately from the iteration period.** |
+| T35 | **Auto-exposure is a control-loop parameter, not a camera convenience** | It silently sets three things at once: **frame rate** (a 66 ms exposure caps you at 15 fps no matter what the camera advertises), **motion blur** (66 ms at 30 °/s ≈ 15 px at 0.135°/px, which destroys corner localisation), and **effective focal length** — so a calibration taken with auto-exposure enabled is invalid the moment the lighting changes. Lock it manually (`auto_exposure=1` is *manual* in UVC; 3 is auto), add light to compensate, calibrate at that setting, and never touch it again. Rolling shutter is a **separate** effect the exposure fix does not address: during rotation the tag arrives sheared and PnP returns a confidently wrong pose rather than failing. |
 
 Plus **every trap in `RTOS_migration.md` Appendix A** — the one-writer/one-reader
 invariants, `delay()`, watchdogs measuring iterations instead of time, and the rest.
@@ -1709,7 +1791,9 @@ invariants, `delay()`, watchdogs measuring iterations instead of time, and the r
 | **B19** | **Pose is sent in POLAR (range, bearing, rel-yaw), not Cartesian — and the Pi does geometry, never time** | 2026-08-19, Step 3.2. **Polar:** identical information to (x, y), different *noise*. AprilTag range error grows roughly with distance squared while bearing error is roughly constant in angle, so in polar the two are axis-aligned and the estimator's measurement covariance `R` is **diagonal**. Converting on the Pi produces the classic banana-shaped correlated uncertainty, which needs a full covariance to represent honestly — and sending it as diagonal anyway would make the filter quietly overconfident. Cost: the EKF measurement model is nonlinear, which it already was. **Geometry not time:** the Pi runs detection + PnP + the 6-DOF→planar collapse and is otherwise **stateless per frame** — no smoothing, no velocity, no filtering. A Kalman filter needs independent measurements with known covariance; pre-filtering on the Pi produces time-correlated noise its model does not include, so it would think it had N independent looks when it had one look smeared over N frames (T10's cousin — information counted twice). Bandwidth was explicitly *not* the reason: 33 B at 30 Hz is ~1 kB/s against 11.5 kB/s, ~9% utilised. |
 | **B20** | **The frame carries `age_us`, NOT a Pi timestamp — this DEPARTS from the guide's Step 3.2 text** | 2026-08-19. The guide asked for a "Pi-side timestamp". The two clocks are unsynchronised, so an absolute Pi timestamp is meaningless on the STM32 without a clock-sync protocol to build, debug and keep correct across reboots — a whole subsystem bought for nothing. `age_us` is measured **entirely on the Pi's own clock** (capture → transmit), where the difference is valid regardless of offset, and the STM32 adds the transit it already measured in 3.1 (~2–5 ms). Same information, no shared clock. **Measured from CAPTURE, not detection-complete:** AprilTag on a Pi 3B+ carries 50–150 ms, which at docking closing speeds is the *dominant* position error rather than a rounding one, so stamping at the wrong end would quietly discard most of the latency the field exists to report. Verified end-to-end: a simulated 12 ms detection latency arrived as `piage=12ms`. |
 | **B21** | **The staleness ladder is 3-tier and split by axis; tier 3 is deliberately NOT wired to `stopMotor()` in Phase 3** | 2026-08-19. **Why a ladder and not one timeout:** the two axes dead-reckon completely differently. Heading coasts on the gyro at ~0.8 °/min — 0.04° after 3 s, effectively free. Position coasts on double-integrated accelerometer, error ~½·a·t², so it is spent within about a second. Translation authority is therefore withdrawn a full 2 s before attitude control is even questioned: a platform holding heading with fans off is stable and recoverable, one that has also dropped attitude control just drifts. Thresholds **250 ms** (≈2–3 missed detections at 10 Hz — tolerate dropout without twitching) / **1 s** / **3 s**. **Why tier 3 only calls a hook:** nothing consumes pose until Phase 6, so a lost link endangers nothing today — while dumping a spinning flywheel *does* kick the platform at ~42 rad/s² against a 4.24 breakaway, and `safety.cpp`'s own comments warn against nuisance trips. A safe-stop that is not needed is not free on this machine. Tiers 1 and 2 fire for real; tier 3 announces itself so all three timers are exercised, and **Phase 6 repoints it at `stopMotor()`** once there is something to protect. **Why the ladder arms on the first valid frame:** if pose has never been valid its absence is not a loss — without that, every rotation test would trip a timeout at boot merely because no Pi is attached. ⚠️ **Known wrong for Phase 6:** tier 2 calls `fans_stopAll()`, the hard kill, which **latches until `R`** (B10). B2 says the tag is routinely lost at close range, so a 1 s dropout during terminal docking would permanently disable translation and wait for an operator. Phase 6 must give tier 2 a **soft zero with the ESC left armed** — expected dropouts and faults need different mechanisms. |
-| **B22** | *(next decision goes here)* | |
+| **B22** | **Capture mode: 1280×720 MJPG, grayscale decode, `decimate=2.0`, threaded capture** | 2026-08-20, Step 4.2, chosen from measurement. **720p is forced, not preferred:** at 800×600 and 640×480 only **2 of 3 tags** detect — the 4 cm flanking tags fall below the detection floor, and those are the whole mechanism for resolving planar yaw ambiguity (T30), so the lower modes trade away terminal alignment for frame rate. **MJPEG over YUYV**, opposite to the initial prediction: uncompressed 720p is 1.84 MB and USB-bandwidth-capped at ~5.9 fps with ~170 ms of transfer that is *both* rate cap and latency, hidden inside `grab()` (T34). **Grayscale decode** (`CAP_PROP_CONVERT_RGB=0` + `imdecode(IMREAD_GRAYSCALE)`) takes decode+convert from 50.2 → 15.0 ms by not reconstructing colour we immediately discard. **`decimate=2.0` not 4.0**: 4.0 is faster (29.4 ms latency) but drops to `min 1` tag; 2.0 holds 3/3/3 with detect at only 31.8 ms, so there is nothing to buy. Result: **44.9 ms mean capture→pose latency, 14.8 fps**, from a 443 ms starting point. |
+| **B23** | **Threaded capture with newest-frame-wins, and latency measured from `grab()` rather than inferred** | 2026-08-20. The serial loop `grab → decode → detect` serialises capture and processing, so once processing got fast `grab()` simply blocked and the period stayed pinned at ~67 ms regardless — every millisecond saved in detection was absorbed by waiting. A capture thread buys two things: **overlap** (decode on the capture thread, detect on the main thread, different cores → period is `max()` not `sum()`) and **freshness**. It **deliberately drops frames**: a queue would preserve every frame at the cost of letting them age, which is exactly backwards here — a pose from three frames ago is worse than no pose because the estimator will believe it (T9). Newest-wins is the correct policy for a measurement feeding a control loop. Also load-bearing: the frame is **timestamped the instant `grab()` returns**, so latency is measured rather than inferred from the iteration period, which conflated the two (T34). That timestamp is what `age_us` carries. Detector threads set to 3, not 4, leaving one core for capture. |
+| **B24** | *(next decision goes here)* | |
 
 ---
 
