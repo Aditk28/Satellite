@@ -89,12 +89,27 @@
    NEVER is distinct from DEAD on purpose: if pose has never been valid, its
    absence is not a loss, and nothing should fire. Without that, every rotation
    test would trip a timeout at boot simply because no Pi is attached. */
+/* TWO INDEPENDENT THINGS, and conflating them was a real bug (hardware,
+   2026-08-20): covering the tags reported DEAD while the link was perfectly
+   healthy and frames were arriving with crc=0.
+
+     POSE freshness (last VALID frame)  -> FRESH / STALE / LOST.
+        Losing sight of the tag is NORMAL. During SEARCH the tag is not visible
+        by definition, and B2 says it is routinely lost at close range too.
+     LINK health (last frame of ANY kind) -> DEAD.
+        Silence is a FAULT. The Pi keeps sending frames with PI_FLAG_VALID clear
+        when it cannot see the dock, which is exactly what makes the two
+        distinguishable from this end.
+
+   Keying the terminal action off pose age would have fired it on every search
+   sweep and during every close approach. */
 typedef enum {
-  PI_NEVER = 0,   /* no valid frame since boot -- ladder inert               */
-  PI_FRESH,       /* < PI_STALE_MS                                           */
-  PI_STALE,       /* pose marked invalid, estimator coasts                   */
-  PI_LOST,        /* + fans zeroed: translation dead-reckoning has run out   */
-  PI_DEAD         /* + terminal hook fired                                   */
+  PI_NEVER = 0,   /* no valid pose since boot -- pose ladder inert           */
+  PI_FRESH,       /* valid pose newer than PI_STALE_MS                       */
+  PI_STALE,       /* pose stale, LINK FINE -- estimator coasts. Not a fault. */
+  PI_LOST,        /* pose older than the dead-reckoning budget; fans zeroed.
+                     Still not a fault -- this is what SEARCH looks like.    */
+  PI_DEAD         /* THE LINK IS SILENT. This one IS a fault.                */
 } PiState;
 
 typedef struct {
@@ -129,6 +144,13 @@ bool pi_getPose(PiPose* out);
 
 PiState  pi_state(void);
 uint32_t pi_ageUs(void);        /* since last VALID frame; UINT32_MAX if never */
+
+/* True while frames of ANY kind are still arriving. This is the LINK health
+   question, and it is the one a fault path should ask -- pi_state() reaching
+   PI_LOST means we cannot see the dock, which is an expected condition, not a
+   reason to stop. */
+bool     pi_linkAlive(void);
+uint32_t pi_linkAgeUs(void);    /* since last frame of any kind               */
 
 /* Terminal action for PI_DEAD. NOT wired to stopMotor() in Phase 3, by
    decision B21: nothing consumes pose until Phase 6, so a lost link endangers

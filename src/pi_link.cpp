@@ -20,10 +20,25 @@
    So translation authority is withdrawn a full 2 s before attitude control is
    even questioned. A platform holding heading with the fans off is stable and
    recoverable; one that has also dropped attitude control just drifts.        */
-#define PI_STALE_MS   250    /* ~2-3 missed detections at 10 Hz: tolerate
-                                dropout without twitching                      */
+#define PI_STALE_MS   250    /* ~7 missed detections at 28 Hz: tolerate dropout
+                                without twitching                              */
 #define PI_LOST_MS   1000    /* translation dead-reckoning budget is spent     */
-#define PI_DEAD_MS   3000    /* terminal                                       */
+
+/* LINK death is a DIFFERENT thing from pose staleness, and keying both off the
+   same clock was a real bug (found on hardware 2026-08-20 by covering the tags:
+   the link was perfectly healthy, frames arriving with crc=0, and the ladder
+   reported DEAD).
+
+   Losing sight of the tag is NORMAL -- during SEARCH the tag is not visible by
+   definition, and B2 says it is also routinely lost at close range. Losing the
+   LINK is a fault. Conflating them would have fired the terminal action on every
+   search sweep and during every close approach.
+
+   So: pose freshness (last VALID frame) drives the estimator and translation
+   authority; link health (last frame of ANY kind, valid or not) drives the fault
+   path. The Pi deliberately keeps sending frames with PI_FLAG_VALID clear when
+   it cannot see the dock, which is what makes the distinction observable. */
+#define PI_LINK_DEAD_MS 500  /* ~14 missed frames at 28 Hz -- silence, not blindness */
 
 /* Bytes drained per pi_poll(). Bounded work per poll: a Pi streaming
    continuously must not hold commsTask in a while(available()) spin. 128 is ~4x
@@ -52,6 +67,8 @@ static bool     s_haveSeq  = false;
 static uint16_t s_lastSeq  = 0;
 static bool     s_everValid = false;
 static uint32_t s_lastValidUs = 0;
+static bool     s_everFrame = false;
+static uint32_t s_lastFrameUs = 0;    /* ANY accepted frame, valid or not */
 static PiState  s_state = PI_NEVER;
 static bool     s_lostActionDone = false;
 static bool     s_deadActionDone = false;
@@ -113,15 +130,20 @@ static void commit(uint32_t now) {
   s_pose = p;
   taskEXIT_CRITICAL();
 
-  /* Only a frame that actually SAW a tag refreshes the freshness clock. A
-     detector reporting "nothing in view" at 10 Hz proves the link is alive but
-     does NOT make the pose fresh -- conflating those is trap T9, a stale pose
-     driving control while every counter looks healthy. */
+  /* EVERY accepted frame proves the LINK is alive, whether or not it saw a tag.
+     That is what clears the fault path. */
+  s_lastFrameUs    = now;
+  s_everFrame      = true;
+  s_deadActionDone = false;
+
+  /* Only a frame that actually SAW a tag refreshes the POSE clock. A detector
+     reporting "nothing in view" proves the link is alive but does NOT make the
+     pose fresh -- conflating those is trap T9, a stale pose driving control
+     while every counter looks healthy. */
   if (p.flags & PI_FLAG_VALID) {
     s_lastValidUs    = now;
     s_everValid      = true;
     s_lostActionDone = false;
-    s_deadActionDone = false;
   }
 }
 
@@ -176,34 +198,46 @@ static void feed(uint8_t b, uint32_t now) {
    structurally cannot resolve what this is measuring, which is trap T20's
    lesson from the fan period investigation. */
 static void ladder(uint32_t now) {
-  if (!s_everValid) { s_state = PI_NEVER; return; }
-
-  uint32_t age_ms = (now - s_lastValidUs) / 1000u;
-
-  if (age_ms < PI_STALE_MS) {
-    s_state = PI_FRESH;
-    return;
-  }
-
-  if (age_ms < PI_LOST_MS) { s_state = PI_STALE; return; }
-
-  if (age_ms < PI_DEAD_MS) {
-    s_state = PI_LOST;
-    if (!s_lostActionDone) {
+  /* ---- fault path: is the LINK alive? Checked FIRST because link death
+     subsumes pose staleness -- if no frames are arriving, no pose can be
+     fresh either, and the fault response is the one that matters. */
+  if (s_everFrame && (uint32_t)((now - s_lastFrameUs) / 1000u) >= PI_LINK_DEAD_MS) {
+    s_state = PI_DEAD;
+    if (!s_deadActionDone) {
+      s_deadActionDone = true;
+      /* Kill translation too -- a dead link means we have no idea where we are,
+         and unlike a lost tag this is not a condition we expect to recover
+         from on its own. */
       s_lostActionDone = true;
-      /* Translation authority withdrawn. fans_stopAll() takes no lock and calls
-         no FreeRTOS API, so it is safe from here exactly as it is from a fault
-         path. Fans off is unambiguously the safe direction: there is no test in
-         which running fans on a pose we no longer believe is correct. */
       fans_stopAll();
+      if (s_deadHook) s_deadHook();
     }
     return;
   }
 
-  s_state = PI_DEAD;
-  if (!s_deadActionDone) {
-    s_deadActionDone = true;
-    if (s_deadHook) s_deadHook();
+  /* ---- normal path: how old is the POSE? Losing sight of the tag is an
+     expected operating condition (SEARCH, close approach), NOT a fault. */
+  if (!s_everValid) { s_state = PI_NEVER; return; }
+
+  uint32_t age_ms = (now - s_lastValidUs) / 1000u;
+
+  if (age_ms < PI_STALE_MS) { s_state = PI_FRESH; return; }
+  if (age_ms < PI_LOST_MS)  { s_state = PI_STALE; return; }
+
+  /* Pose older than the translation dead-reckoning budget. Withdraw translation
+     authority but say nothing about the link, which is fine. */
+  s_state = PI_LOST;
+  if (!s_lostActionDone) {
+    s_lostActionDone = true;
+    /* ⚠️ PHASE 6 MUST CHANGE THIS. fans_stopAll() is the HARD kill and it
+       LATCHES until `R` (B10) -- correct for a fault, wrong for a condition we
+       expect to enter and leave repeatedly while searching. It also only zeroes
+       once, so a running controller would simply re-command the fans next
+       cycle: what Phase 6 actually needs is an INHIBIT flag the allocator
+       checks, plus a soft zero that leaves the ESC armed so authority returns
+       the instant a pose does. Safe today only because nothing commands the
+       fans yet. */
+    fans_stopAll();
   }
 }
 
@@ -243,6 +277,15 @@ PiState pi_state(void) { return s_state; }
 uint32_t pi_ageUs(void) {
   if (!s_everValid) return UINT32_MAX;
   return us_now() - s_lastValidUs;
+}
+
+uint32_t pi_linkAgeUs(void) {
+  if (!s_everFrame) return UINT32_MAX;
+  return us_now() - s_lastFrameUs;
+}
+
+bool pi_linkAlive(void) {
+  return s_everFrame && (pi_linkAgeUs() / 1000u) < PI_LINK_DEAD_MS;
 }
 
 void pi_setDeadHook(void (*fn)(void)) { s_deadHook = fn; }

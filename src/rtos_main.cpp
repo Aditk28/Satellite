@@ -603,8 +603,9 @@ static void commsEmergencyStop(void) { motor.target = 0.0f; fans_stopAll(); }
 // frame, long after telem_activate(), so the text is queued to telemTask rather
 // than written from this task (invariant B15 / trap T18).
 static void piLinkDead(void) {
-  printBoth("!! PI LINK DEAD: no valid pose for 3 s. Fans were zeroed at 1 s. "
-            "Wheel control UNCHANGED (B21 -- nothing consumes pose yet).");
+  printBoth("!! PI LINK SILENT: no frames of ANY kind for 500 ms -- the Pi or "
+            "the wire, not a lost tag. Fans killed. Wheel control UNCHANGED "
+            "(B21 -- nothing consumes pose yet).");
 }
 
 // Called from safetyTask (prio 2). Takes the I2C mutex around the transaction ONLY.
@@ -723,8 +724,11 @@ void printGains() {
   {
     static const char* kState[] = { "NEVER", "FRESH", "STALE", "LOST", "DEAD" };
     uint32_t a = pi_ageUs();
+    uint32_t l = pi_linkAgeUs();
     printBoth(String("pi link: ") + kState[(int)pi_state()]
-              + "  age=" + (a == UINT32_MAX ? String("--") : String(a / 1000)) + "ms"
+              + (pi_linkAlive() ? "  [link OK]" : "  [LINK SILENT]")
+              + "  poseage=" + (a == UINT32_MAX ? String("--") : String(a / 1000)) + "ms"
+              + "  linkage=" + (l == UINT32_MAX ? String("--") : String(l / 1000)) + "ms"
               + "  frames=" + String(pi_frames())
               + "  rx=" + String(pi_rxBytes())
               + "  crc=" + String(pi_crcErrors())
