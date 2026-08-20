@@ -25,17 +25,33 @@ Never propose a solution that requires a scope.
 
 ## Current position
 
-**Phases 0, 1, 2 and 3 are COMPLETE. Phase 4 is IN PROGRESS — Step 4.2
-(detection rate) is DONE; Step 4.1 (calibration) is NEXT.**
+**Phases 0, 1, 2, 3 and 4 are COMPLETE. Phase 5 (estimator) is NEXT.**
 Tags: `trans-p1-fans`, `trans-p2-plantid`, `trans-p3-link`.
 
-**Vision pipeline measured and chosen (2026-08-20):** 1280×720 MJPG, grayscale
-decode, `decimate=2.0`, threaded capture → **44.9 ms capture→pose latency,
-14.8 fps, 3 of 3 tags every frame** (B22/B23). Detector is Debian's
-`python3-apriltag`. **⚠️ Camera exposure MUST be locked manually before
-calibrating** — auto-exposure caps the rate at 15 fps, implies ~15 px of blur at
-30 °/s, and changes effective focal length so any calibration taken with it
-enabled is invalid (T35).
+**Vision produces pose (2026-08-20).** 1280×720 MJPG, grayscale decode,
+`decimate=2.0`, threaded capture with `BUFFERSIZE=4` → **60.9 ms capture→pose,
+28.6 fps, 3 of 3 tags every frame** (B22/B23). Bundle `solvePnP` (IPPE) over every
+visible tag gives range / bearing / rel-yaw plus an ambiguity ratio. Range matches
+a tape measure at 0.5 and 1.0 m. Detector is Debian `python3-apriltag`.
+
+```
+SIGN CONVENTIONS -- verified on hardware, never compensate downstream (T11)
+  bearing  0 = dead ahead   POSITIVE = counter-clockwise
+                            sliding the platform LEFT -> bearing POSITIVE
+  relyaw   0 = square-on    POSITIVE = viewing from the dock's RIGHT
+```
+
+**⚠️ Camera exposure is locked manually and must stay that way** —
+`auto_exposure=1`, `exposure_time_absolute=100`. Auto-exposure caps the frame
+rate, blurs ~15 px at 30 °/s, and changes effective focal length (T35).
+
+**⚠️ `f = 947 px` was MEASURED, and the camera is ~76° FOV, not the advertised
+120°** (B25). Every geometry figure derived from the spec sheet was wrong in both
+directions — detection range is better than planned, close-range framing much
+tighter. **The dock wall moved from 25 cm to 35 cm behind the magnet** so all
+three tags stay in frame when docked. Chessboard calibration is deliberately
+skipped (B24): distortion and principal point remain uncorrected, which is the
+first thing to revisit if terminal alignment shows a bias no tuning fixes.
 
 **⚠️ Hardware changed:** the Pi 3B+ died mid-phase (PMIC failure — 3.3 V rail
 absent, cold, would not boot from SD or USB). Replaced with a **Pi 3A+**:
@@ -217,7 +233,7 @@ These are in addition to `RTOS_migration.md`'s list, which all still applies.
 | 1 fans into the RTOS (DSHOT + DMA) | ✅ **(2026-08-13)** `trans-p1-fans` | Four DSHOT channels on TIM1+DMA burst, `fanTask` prio 2 = sole fan writer, fans in every fault path *ahead* of the wheel, `S`/`L` manual commands, 30% ceiling + 10 s dead-man. Control loop untouched: ctrl period 4999/5000/5001 µs. |
 | 2 translation plant ID | ✅ **(2026-08-19)** `trans-p2-plantid` | `A(pct)=2.1e-4·pct²`, `A_c≈0.26`, **go/no-go 2.9× PASS**. Rotation re-identified + retuned: **0.47° mean, ±180° in one move, wheel returns to rest**. Yaw coupling is thrust-line offset, small (2–3 rad/s²) — no mechanical correction needed. |
 | 3 Pi ↔ STM32 wired link | ✅ **(2026-08-19)** `trans-p3-link` | USART6 PC6/PC7, Pi forced onto the PL011 (T28). `pi_link.*` is sole reader *and* writer of the port, polled from `commsTask`, deliberately outside the operator parser (B18 — verified: `comms rx=4` against 2508 Pi bytes). Framed `[A5 5A][len][28B][crc16]`, polar pose + `age_us` not a timestamp (B19/B20). 3-tier staleness ladder, tier 3 not wired to `stopMotor()` yet (B21). 62 frames / 2508 B reconcile exactly. ⚠️ tier 2 hard-kills the fans — Phase 6 must make it a soft zero. |
-| 4 vision: AprilTag pose on the Pi | 🔶 **IN PROGRESS** | **4.2 ✅ (2026-08-20)** — 720p MJPG grey / `decimate=2.0` / threaded: **44.9 ms capture→pose, 14.8 fps, 3/3 tags** (B22, B23). Pi 3B+ died mid-phase (PMIC), replaced by a **3A+** — same SoC and clock, so same performance. Detector is Debian `python3-apriltag`. ⚠️ **Lock exposure before 4.1** (T35) — auto-exposure caps rate at 15 fps, blurs ~15 px at 30 °/s, and invalidates any calibration taken with it on. **4.1 calibration ⬜ NEXT, 4.3 pose extraction ⬜.** |
+| 4 vision: AprilTag pose on the Pi | ✅ **(2026-08-20)** | **4.2** 720p MJPG grey / `decimate=2.0` / threaded, `BUFFERSIZE=4`: **60.9 ms capture→pose, 28.6 fps, 3/3 tags** (B22, B23). **4.3** bundle `solvePnP` (IPPE) over all visible tags → range / bearing / relyaw / ambiguity ratio; range matches a tape measure at 0.5 and 1.0 m; signs verified on hardware. **4.1 chessboard calibration SKIPPED (B24)** — focal length measured directly instead, `f = 947 px`, which revealed the camera is **~76° FOV, not the advertised 120°** (B25) and forced the dock standoff from 25 → 35 cm. Pi 3B+ died mid-phase (PMIC), replaced by a **3A+**: same SoC and clock, same performance. |
 | 5 estimator: fuse tag + IMU | ⬜ | — |
 | 6 translation control (LQR, x/y) | ⬜ | — |
 | 7 combined 3-DOF + allocation | ⬜ | — |
@@ -1486,6 +1502,62 @@ the estimator needs those as measurement covariances.
 **Trap.** Range from a single tag is the **least** accurate quantity and degrades
 with distance squared. Bearing is much better. Weight them accordingly in Phase 5.
 
+**Result (2026-08-20) — PASSED.** `tools/pi_pose.py`, bundle solve over all
+visible tags via `cv2.solvePnPGeneric` with `SOLVEPNP_IPPE`.
+
+**Bundle geometry, measured:** tag 0 (12 cm) centred; tags 1 (left) and 2 (right),
+4 cm, at **±14.15 cm** centre-to-centre; **all three coplanar and at the same
+9 cm height**. `f = 947 px`, principal point assumed centred, distortion
+uncorrected (B24).
+
+**SIGN CONVENTIONS — verified on hardware, not derived. Do not change these
+without re-verifying, and never compensate for them downstream (T11).**
+
+```
+bearing   0 = dock dead ahead        POSITIVE = counter-clockwise
+          sliding the platform LEFT makes bearing go POSITIVE
+relyaw    0 = square-on              POSITIVE = viewing from the dock's RIGHT
+                                     NEGATIVE = viewing from its LEFT
+```
+
+**Verified on hardware:** range matched a tape measure at 0.5 m and 1.0 m to
+within measurement precision — an independent confirmation of `f = 947`, now
+through the full bundle solve rather than a single apparent width. Occluding one
+flanking tag prints `PARTIAL`, drops to the remaining tags, and keeps producing a
+pose — graceful degradation confirmed.
+
+**Two bugs found by that hardware check, both mine, both silent:**
+
+**`relyaw` read −180° when square-on.** The dock frame's +Z points out of the wall
+toward the camera while the camera's +Z points into it, so square-on genuinely
+*is* a 180° relative rotation — correct geometry, useless as a control signal.
+Fixed by negating both `atan2` arguments, which rotates by exactly π and stays
+wrapped. **The synthetic test missed it entirely** because it projected with
+`rvec = 0`, the mathematically mirrored case rather than the physical one — it
+validated the solver against itself. Only hardware caught it. That is precisely
+what the open-loop sign check exists for.
+
+**The ambiguity ratio reported the degenerate case as maximally confident.**
+Dividing by a raw best-fit error makes "both solutions fit *perfectly*" — the
+maximally **ambiguous** case — come out as a huge ratio. Fixed with a 0.1 px
+noise floor on the denominator, so two equally-good fits now produce a *small*
+ratio and get flagged. Found on a synthetic square-on case, which is also the
+docking configuration and the worst one for planar ambiguity.
+
+**Ambiguity behaves as T30 predicted, and degrades smoothly.** With 0.3 px corner
+noise: ratio **73.6 at 0.4 m** and **16.8 at 1.0 m** for a 15° yaw; at square-on it
+falls to **1.2–1.6** and is correctly flagged. Confirmed on hardware — the ratio
+visibly drops toward 1–2 at range.
+
+**One reassuring detail worth keeping:** near square-on the ambiguity is
+*benign*. The two candidate solutions sit close to each other **and** close to
+zero, so even when the ratio says "cannot separate these", the yaw estimate is
+still within a couple of degrees (0.11° at 0.4 m, 1.77° at 1.0 m). **The dangerous
+combination is a low ratio together with a large `|relyaw|`** — that is when the
+solver genuinely cannot tell which way the dock faces, and it is what
+`PI_FLAG_AMBIGUOUS` must catch. A flag on ratio alone would cry wolf during
+docking, which is exactly when the pose is at its most trustworthy.
+
 **Phase 4 exit:** `git tag trans-p4-vision`
 
 ---
@@ -1781,6 +1853,7 @@ write-up more credible, not less. Do the same here.
 | T34 | **Period is not latency, and blocking hides inside the profile** | Two ways this bit. (a) The serial benchmark reported `grab+decode+detect` as latency, but when the pipeline outruns the camera `grab()` **blocks** — that time is a frame that has not been captured yet, not the age of one that has. It inflates the apparent latency while the real figure is much lower. (b) **YUYV at 720p looked cheap because its "decode" is 8 ms vs MJPEG's 50** — but an uncompressed 1.84 MB frame takes ~170 ms to cross USB 2.0, and that transfer is *both* a rate cap and pure latency, entirely concealed inside `grab()`. Measured: YUYV `decimate=2` showed `grab 74.3 ms`, matching the predicted wait to within 1 ms. **Timestamp the frame the instant `grab()` returns and measure to pose-available; report that separately from the iteration period.** |
 | T35 | **Auto-exposure is a control-loop parameter, not a camera convenience** | It silently sets three things at once: **frame rate** (a 66 ms exposure caps you at 15 fps no matter what the camera advertises), **motion blur** (66 ms at 30 °/s ≈ 15 px at 0.135°/px, which destroys corner localisation), and **effective focal length** — so a calibration taken with auto-exposure enabled is invalid the moment the lighting changes. Lock it manually (`auto_exposure=1` is *manual* in UVC; 3 is auto), add light to compensate, calibrate at that setting, and never touch it again. Rolling shutter is a **separate** effect the exposure fix does not address: during rotation the tag arrives sheared and PnP returns a confidently wrong pose rather than failing. |
 | T36 | **Deriving geometry from a published FOV instead of a measured focal length** | The camera's spec sheet says 120° DFOV, which gives `f = 424 px` at 1280×720. **Measured `f ≈ 947`** — 2.2× off, implying ~76° diagonal, and self-consistent across two known distances to 2%. Likely 720p is a centre *crop* of the sensor, not a downscale. Everything sized from the published figure was wrong in **both directions**: detection range was badly *under*-estimated (12 cm tag reaches 4.5 m, not 2.0 m), while close-range framing was badly *over*-estimated — view width is `1.35 × range`, not `3.02 × range`. That second error had already produced a dock standoff recommendation (25 cm) which would have pushed both flanking tags out of frame at the docked position, silently removing the yaw solution during terminal alignment. **Measure `f` from a tag of known size at a tape-measured distance before sizing any geometry.** It takes five minutes and needs no chessboard: `f = apparent_px × range / tag_size`, checked at two distances so a disagreement is visible. |
+| T37 | **A synthetic test that validates the solver against itself** | `pi_pose.py`'s round-trip test projected the tag geometry with `rvec = 0`, solved it, and got the answer back exactly — range, bearing and yaw all perfect. It proved nothing about the **physical** case, because `rvec = 0` puts the tag plane in the mathematically mirrored orientation rather than facing the lens. On hardware, square-on read **−180°**. The generator and the solver shared the same wrong assumption, so the test could only ever agree with itself. **A synthetic check must inject the orientation the WORLD produces, not the one the code assumes** — here, `Ry(180)` so the tags actually face the camera. Corollary: keep the open-loop hardware sign check (T11) even when synthetic tests pass, because it is the only thing that samples reality. |
 
 Plus **every trap in `RTOS_migration.md` Appendix A** — the one-writer/one-reader
 invariants, `delay()`, watchdogs measuring iterations instead of time, and the rest.

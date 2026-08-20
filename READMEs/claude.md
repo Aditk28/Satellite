@@ -103,9 +103,28 @@ not boot from SD or USB). Replaced with a **Pi 3A+**: identical BCM2837B0 at 1.4
 identical vision performance, 512 MB, one USB port, no Ethernet, ~1/5 the current draw.
 Nothing architectural changed. `tools/pi_setup.sh` rebuilds a fresh Pi in one command.
 
-**NEXT: Step 4.1 camera calibration**, then 4.3 pose extraction feeding the Phase 3
-wire format unchanged. Multi-tag dock: 12 cm centre tag (id 0) at 9 cm height, two 4 cm
-flanking tags (ids 1-2) at 14.15 cm centre-to-centre.
+**Step 4.3 DONE: vision produces pose.** Bundle `solvePnP` (IPPE) over every visible tag
+-> range / bearing / rel-yaw / ambiguity ratio. Range matches a tape measure at 0.5 and
+1.0 m. Dock: 12 cm centre tag (id 0), 4 cm flanking tags (id 1 left, id 2 right) at
+**+-14.15 cm** centre-to-centre, all coplanar at 9 cm height.
+
+```
+SIGN CONVENTIONS -- verified on hardware, never compensate downstream (T11)
+  bearing  0 = dead ahead   POSITIVE = counter-clockwise
+                            sliding the platform LEFT -> bearing POSITIVE
+  relyaw   0 = square-on    POSITIVE = viewing from the dock's RIGHT
+```
+
+**Step 4.1 chessboard calibration SKIPPED (B24).** Focal length measured directly
+instead: **`f = 947 px`**, which revealed the camera is **~76 deg FOV, not the
+advertised 120** (B25). Every geometry number derived from the spec sheet was wrong --
+detection range is better than planned, close-range framing much tighter -- and the dock
+wall moved 25 -> 35 cm so all three tags stay framed when docked. Distortion and
+principal point remain uncorrected; revisit if terminal alignment shows a bias no tuning
+fixes. `tools/pi_calibrate.py` is written and ready whenever it is wanted.
+
+**NEXT: Phase 5 -- the estimator.** Wire `pi_pose.py` into the Phase 3 frame sender
+(range/bearing/relyaw/quality/n_tags/age_us over USART6), then fuse with the IMU.
 
 **Raw calibration data** lives in `calibration/runs/`, one folder per experiment named
 by what it established, indexed in `calibration/runs/INDEX.md`.
