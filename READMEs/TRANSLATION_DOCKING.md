@@ -25,8 +25,16 @@ Never propose a solution that requires a scope.
 
 ## Current position
 
-**Phases 0, 1, 2, 3 and 4 are COMPLETE. Phase 5 (estimator) is NEXT.**
-Tags: `trans-p1-fans`, `trans-p2-plantid`, `trans-p3-link`.
+**Phases 0-5 are COMPLETE. Phase 6 (translation control, LQR) is NEXT.**
+Tags: `trans-p1-fans`, `trans-p2-plantid`, `trans-p3-link`, `trans-p4-vision`,
+`trans-p5-estimator`.
+
+**The estimator produces dock-relative platform pose** (`src/estimator.*`,
+200 Hz): `x`, `y`, `psi`, velocity, and the magnet position that actually has to
+land on the target. Vision drives position; the gyro drives fast heading; vision
+corrects heading only slowly. `age_us` latency compensated. **5.2 Kalman
+deferred** — revisit only if Phase 6 is limited by estimate quality rather than
+by actuation.
 
 **Vision produces pose (2026-08-20).** 1280×720 MJPG, grayscale decode,
 `decimate=2.0`, threaded capture with `BUFFERSIZE=4` → **60.9 ms capture→pose,
@@ -234,7 +242,7 @@ These are in addition to `RTOS_migration.md`'s list, which all still applies.
 | 2 translation plant ID | ✅ **(2026-08-19)** `trans-p2-plantid` | `A(pct)=2.1e-4·pct²`, `A_c≈0.26`, **go/no-go 2.9× PASS**. Rotation re-identified + retuned: **0.47° mean, ±180° in one move, wheel returns to rest**. Yaw coupling is thrust-line offset, small (2–3 rad/s²) — no mechanical correction needed. |
 | 3 Pi ↔ STM32 wired link | ✅ **(2026-08-19)** `trans-p3-link` | USART6 PC6/PC7, Pi forced onto the PL011 (T28). `pi_link.*` is sole reader *and* writer of the port, polled from `commsTask`, deliberately outside the operator parser (B18 — verified: `comms rx=4` against 2508 Pi bytes). Framed `[A5 5A][len][28B][crc16]`, polar pose + `age_us` not a timestamp (B19/B20). 3-tier staleness ladder, tier 3 not wired to `stopMotor()` yet (B21). 62 frames / 2508 B reconcile exactly. ⚠️ tier 2 hard-kills the fans — Phase 6 must make it a soft zero. |
 | 4 vision: AprilTag pose on the Pi | ✅ **(2026-08-20)** | **4.2** 720p MJPG grey / `decimate=2.0` / threaded, `BUFFERSIZE=4`: **60.9 ms capture→pose, 28.6 fps, 3/3 tags** (B22, B23). **4.3** bundle `solvePnP` (IPPE) over all visible tags → range / bearing / relyaw / ambiguity ratio; range matches a tape measure at 0.5 and 1.0 m; signs verified on hardware. **4.1 chessboard calibration SKIPPED (B24)** — focal length measured directly instead, `f = 947 px`, which revealed the camera is **~76° FOV, not the advertised 120°** (B25) and forced the dock standoff from 25 → 35 cm. Pi 3B+ died mid-phase (PMIC), replaced by a **3A+**: same SoC and clock, same performance. |
-| 5 estimator: fuse tag + IMU | ⬜ | — |
+| 5 estimator: fuse tag + IMU | ✅ **(2026-08-20)** | **5.1** complementary filter, `src/estimator.*`, 200 Hz. Vision → `x`,`y` (hard, `aPos` 0.35); gyro → fast `psi`; vision → slow absolute `psi` (`aPsi` 0.02, ~1.8 s). `psi = theta + psi_offset`, only the offset estimated, so the proven heading integrator is reused. `age_us` latency compensated. Forced by measurement: raw vision yaw was compressing `x` to ~35% of true (T39). **5.2 Kalman DEFERRED** — revisit only if Phase 6 is limited by estimate quality. |
 | 6 translation control (LQR, x/y) | ⬜ | — |
 | 7 combined 3-DOF + allocation | ⬜ | — |
 | 8 acquisition and docking sequence | ⬜ | — |
@@ -1591,6 +1599,61 @@ error proportional to velocity. Either compensate using the timestamp from Phase
 or keep the vision weight low enough that the error is tolerable — and *know which
 you chose*.
 
+**Result (2026-08-20) — PASSED.** `src/estimator.{h,cpp}`, running on
+`controlTask` at 200 Hz. Latency **is** compensated, using the measured `age_us`
+rather than a tolerated error.
+
+**The design was forced by a measurement, not chosen on principle.** Raw vision
+pose was tested first and `x` came out compressed to **~35% of true**
+(0.0825 → 0.026 m; −0.1905 → −0.076 m). Cause: `x = range·sin(psi − bearing)`,
+so a `psi` that drifts *with* `bearing` cancels the difference and collapses
+position. The noisy quantity was **yaw**, and it was corrupting **position**.
+
+Root cause is **T30 and it is structural, not tuning**: the three tags are
+coplanar, so near square-on — the docking configuration — the two IPPE solutions
+are nearly degenerate and the solver flips between them. Calibration fixed the
+optics and could not fix a geometric degeneracy.
+
+**So each sensor now does only what it is good at:**
+
+| | source | why |
+|---|---|---|
+| `x`, `y` | **vision**, corrected hard (`aPos = 0.35`) | range matches a tape measure |
+| `psi` fast | **gyro**, via the controller's existing `theta` | 0.8 °/min drift |
+| `psi` absolute | **vision**, corrected slowly (`aPsi = 0.02`, ~1.8 s) | noisy but drift-free |
+
+**`psi = theta + psi_offset`, and only the offset is estimated.** The rotation
+controller already integrates the gyro into `theta` and that path is proven;
+a second integrator could silently diverge from it. Vision only ever has to pin
+down one slowly-varying scalar.
+
+**This answers "how do you initialise the gyro" — you never have to.** The
+offset is nudged toward vision on every frame, forever, so a bad first fix is
+simply outvoted. Noise averages as √N: at 28 fps, ±10° of per-frame yaw noise
+becomes roughly ±1.4° over ~50 frames, far better than the gyro drifts in
+minutes. The first fix is adopted outright rather than eased in, since there is
+nothing to average yet.
+
+**`PI_FLAG_AMBIGUOUS` drops the heading gain to a quarter** — when the solver
+admits it cannot separate the two planar poses, the filter stops arguing with
+the gyro. That is what the `quality` field was plumbed through Phase 3 for.
+
+**And the position transform uses the FILTERED psi, not the raw measurement.**
+That is the actual fix for the compressed `x`.
+
+⚠️ **Carried forward — noise averages out, BIAS DOES NOT.** Vision yaw error that
+*correlates with position* is bias, and this filter will believe it. Observed:
+yaw quality degrades off-axis. Survivable because conditioning is **best** near
+square-on and close, which is where docking happens. **If terminal alignment
+turns out limited by this, the structural fix is ~2 cm standoffs under the two
+flanking tags** — non-coplanar points kill the ambiguity outright, at the cost of
+one more measured geometry parameter.
+
+**Deliberately NOT done: accelerometer prediction (5.1b).** At 28 Hz the platform
+barely moves between frames, so constant-velocity propagation is adequate, and
+the accel's body-frame axis signs are unverified — an unverified sign there
+(T11) would be worse than no accel at all.
+
 ## Step 5.2 — Kalman filter
 
 **Concept.** The upgrade the rotation axis never got. State:
@@ -1618,6 +1681,16 @@ schedulability analysis afterwards.
 **Trap 2.** Tag measurements arrive at ~10–30 Hz into a 200 Hz loop. Run predict
 every cycle and correct only when a fresh measurement arrives. Never re-apply the
 same measurement twice — an easy bug that produces overconfident, drifting estimates.
+
+**Result — 5.2 DEFERRED (2026-08-20).** The complementary filter works and the
+next real deliverable is translation *control*, which is what the demo needs. A
+7-state Kalman filter is a substantial piece of work whose main wins here —
+estimating gyro bias as a state, and principled covariances — buy little while
+`aPsi` already averages the noisy quantity and gyro drift is 0.8 °/min against
+runs of tens of seconds. **Revisit if Phase 6 tuning turns out to be limited by
+estimate quality rather than by actuation.** The measurement plumbing (`age_us`,
+`quality`, `PI_FLAG_AMBIGUOUS`, per-frame sequence numbers) is already in place,
+so the upgrade is self-contained when it is wanted.
 
 **Phase 5 exit:** `git tag trans-p5-estimator`
 
@@ -1855,6 +1928,7 @@ write-up more credible, not less. Do the same here.
 | T36 | **Deriving geometry from a published FOV instead of a measured focal length** | The camera's spec sheet says 120° DFOV, which gives `f = 424 px` at 1280×720. **Measured `f ≈ 947`** — 2.2× off, implying ~76° diagonal, and self-consistent across two known distances to 2%. Likely 720p is a centre *crop* of the sensor, not a downscale. Everything sized from the published figure was wrong in **both directions**: detection range was badly *under*-estimated (12 cm tag reaches 4.5 m, not 2.0 m), while close-range framing was badly *over*-estimated — view width is `1.35 × range`, not `3.02 × range`. That second error had already produced a dock standoff recommendation (25 cm) which would have pushed both flanking tags out of frame at the docked position, silently removing the yaw solution during terminal alignment. **Measure `f` from a tag of known size at a tape-measured distance before sizing any geometry.** It takes five minutes and needs no chessboard: `f = apparent_px × range / tag_size`, checked at two distances so a disagreement is visible. |
 | T37 | **A synthetic test that validates the solver against itself** | `pi_pose.py`'s round-trip test projected the tag geometry with `rvec = 0`, solved it, and got the answer back exactly — range, bearing and yaw all perfect. It proved nothing about the **physical** case, because `rvec = 0` puts the tag plane in the mathematically mirrored orientation rather than facing the lens. On hardware, square-on read **−180°**. The generator and the solver shared the same wrong assumption, so the test could only ever agree with itself. **A synthetic check must inject the orientation the WORLD produces, not the one the code assumes** — here, `Ry(180)` so the tags actually face the camera. Corollary: keep the open-loop hardware sign check (T11) even when synthetic tests pass, because it is the only thing that samples reality. |
 | T38 | **A fault path that cannot tell "I can't see it" from "it's gone"** | The Phase 3 staleness ladder keyed every tier off time-since-last-**valid**-pose, so covering the tags — link healthy, frames arriving, `crc=0` — reported `DEAD` and fired the terminal action. **The severity is in when it would have surfaced: during SEARCH the tag is not visible by definition**, and the tag is routinely lost at close range (B2), so the fault would have fired on every search sweep and every docking approach, presenting in Phase 8 as an intermittent link problem three phases from its cause. The distinguishing mechanism already existed and was being discarded — the sender deliberately transmits frames with the valid bit clear when it cannot see the target, exactly so the receiver can tell the difference. **Track sensor-has-no-measurement separately from sensor-is-not-responding; only the second is a fault.** Generalises beyond this link: any "stale data" watchdog needs to ask whether the *source* is alive, not just whether the *data* is fresh. |
+| T39 | **A noisy quantity corrupting a quantity that was fine** | Vision `range` and `bearing` were good — range matched a tape measure — yet reported `x` came out at **~35% of true**. The transform is `x = range·sin(psi − bearing)`, and `psi` came from vision's rel-yaw, which is ill-conditioned for a coplanar tag array near square-on (T30). A `psi` that drifts *with* `bearing` cancels the difference and collapses position toward zero. **The symptom appeared in a completely different quantity from the cause**, and chasing the position error directly — recalibrating, re-measuring the lever arm — would have found nothing. **Look at what your good quantity is being multiplied or differenced AGAINST.** The fix was not to improve the noisy measurement but to stop it entering that path: heading now comes from the gyro moment-to-moment, with vision supplying only a slow absolute reference. Each sensor does what it is good at, which is the entire point of fusing them. |
 
 Plus **every trap in `RTOS_migration.md` Appendix A** — the one-writer/one-reader
 invariants, `delay()`, watchdogs measuring iterations instead of time, and the rest.

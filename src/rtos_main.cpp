@@ -151,6 +151,7 @@
 #include "commands.h"        // Phase 6: commsTask owns serial RX
 #include "fans.h"            // Translation 1.2: fanTask is the SOLE fan writer
 #include "pi_link.h"         // Translation 3.1: USART6 pose link, sole owner of that port
+#include "estimator.h"       // Translation 5.1: dock-relative pose estimator
 #include <Adafruit_INA219.h>
 
 // ------------------------- hardware -------------------------
@@ -749,6 +750,24 @@ void printGains() {
                 + "  flags=0x" + String(p.flags, HEX));
     }
   }
+  {
+    EstState e;
+    float ga, gb, gc;
+    est_getGains(&ga, &gb, &gc);
+    if (est_get(&e)) {
+      printBoth("est: x=" + String(e.x, 3) + " y=" + String(e.y, 3)
+                + " psi=" + String(degrees(e.psi), 1) + "deg"
+                + "  v=(" + String(e.vx, 3) + "," + String(e.vy, 3) + ")m/s"
+                + "  mag=(" + String(e.mag_x, 3) + "," + String(e.mag_y, 3) + ")"
+                + "  dockerr=" + String(sqrtf(e.mag_x * e.mag_x
+                    + (e.mag_y - EST_D_DOCK) * (e.mag_y - EST_D_DOCK)), 3) + "m");
+    } else {
+      printBoth("est: no fix yet (needs one valid vision frame)");
+    }
+    printBoth("est gains: aPos=" + String(ga, 3) + " bVel=" + String(gb, 3)
+              + " aPsi=" + String(gc, 3) + "   fixes=" + String(est_fixes())
+              + " rejects=" + String(est_rejects()));
+  }
   if (fans_overruns()) {
     uint32_t nl, nmin, nmax, cen;
     fans_overrunDetail(&nl, &nmin, &nmax, &cen);
@@ -974,6 +993,17 @@ void controlUpdate(float dt) {
 
   // ---- estimate heading (gyro integration; vision correction later) ----
   theta = wrapPi(theta + omega_p * dt);
+
+  // ---- Translation 5.1: dock-relative pose estimator.
+  // Runs unconditionally, even when the controller is idle -- it is a SENSOR,
+  // and having a converged estimate the moment control is enabled is worth
+  // more than the handful of microseconds it costs. Predict every cycle;
+  // correct only when pi_link has a frame we have not already used (T10).
+  est_predict(dt, theta);
+  {
+    PiPose pp;
+    if (pi_getPose(&pp)) est_correct(&pp, theta, omega_p);
+  }
 
   if (!controllerEnabled || ctrlMode == CTRL_IDLE) {
     motor.target = 0.0f;
@@ -1799,6 +1829,8 @@ void setup() {
   // 2 (invalidate, fans off) fire for real; this one announces itself so the
   // ladder is fully exercised, and Phase 6 repoints it at the real stop.
   pi_setDeadHook(piLinkDead);
+
+  est_init();
 
   // Phase 1.2 (translation): fanTask (prio 2) becomes the SOLE fan writer. Touches
   // only TIM1 + DMA2_S5 + PA8..PA11 -- nothing SimpleFOC, the encoder or I2C owns.

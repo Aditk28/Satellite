@@ -47,6 +47,7 @@ except ImportError:
     sys.exit("pyserial missing:  sudo apt install -y python3-serial")
 
 from pi_pose import solve, make_detector, F_PX_AT_1280
+from pi_camcfg import lock_exposure, load_intrinsics
 
 MAGIC = b"\xA5\x5A"
 PAYLOAD_LEN = 28
@@ -127,6 +128,8 @@ def main():
     ap.add_argument("--quiet", action="store_true")
     args = ap.parse_args()
 
+    lock_exposure(args.device)   # must match the calibration (T35)
+
     ser = serial.Serial(args.port, args.baud, timeout=0)
     cam = Camera(args.device, args.width, args.height)
     cam.start()
@@ -134,12 +137,19 @@ def main():
 
     W = int(cam.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     H = int(cam.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    f = F_PX_AT_1280 * (W / 1280.0)
-    K = np.array([[f, 0, W / 2.0], [0, f, H / 2.0], [0, 0, 1.0]])
-    dist = np.zeros(5)
+    # Real intrinsics if we have them. The fallback is a MEASURED focal length
+    # with the principal point assumed centred and no distortion model -- that
+    # assumption is what made rel-yaw wander under pure translation, because
+    # uncorrected barrel distortion shears an off-centre target and solvePnP
+    # fits the shear as a rotation.
+    K, dist, src = load_intrinsics(W, H)
+    if K is None:
+        f = F_PX_AT_1280 * (W / 1280.0)
+        K = np.array([[f, 0, W / 2.0], [0, f, H / 2.0], [0, 0, 1.0]])
+        dist = np.zeros(5)
     det = make_detector(args.decimate, args.threads)
 
-    print(f"{W}x{H} f={f:.0f}  ->  {args.port} @ {args.baud}")
+    print(f"{W}x{H} [{src}]  ->  {args.port} @ {args.baud}")
     print("sending Phase 3 frames. invalid frames ARE sent (flags bit0 clear) so")
     print("the STM32 can tell 'no tag' from 'link dead'.  Ctrl-C to stop.\n")
 

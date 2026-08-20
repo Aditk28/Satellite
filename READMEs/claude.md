@@ -18,13 +18,13 @@ A tabletop platform on three ball transfer units that points itself using a
 
 reaction wheel — a benchtop analogue of spacecraft attitude control. Long-term
 
-goal is autonomous vision-guided docking (translation via four fans, overhead
+goal is autonomous vision-guided docking (translation via four fans, AprilTag
 
-AprilTag, camera on the platform). **Translation hardware is built and tested;
+on the dock, camera on the platform). **Vision, the Pi link and the dock-relative
 
-translation CONTROL is not started** — see `TRANSLATION_DOCKING.md`. All flight
+estimator all work; translation CONTROL is Phase 6 and not started** — see
 
-firmware today is rotation-only.
+`TRANSLATION_DOCKING.md`. All *actuation* today is rotation-only.
 
 The project exists to demonstrate a full engineering stack: system
 
@@ -36,8 +36,10 @@ depth matters as much as the demo working.
 
 ## 2. Current state
 
-**Phases 0, 1 and 2 of `TRANSLATION_DOCKING.md` are COMPLETE** (tags `trans-p1-fans`,
-`trans-p2-plantid`). The RTOS migration was completed before them (`rtos-p7-complete`).
+**Phases 0-5 of `TRANSLATION_DOCKING.md` are COMPLETE.** Tags `trans-p1-fans`,
+`trans-p2-plantid`, `trans-p3-link`, `trans-p4-vision`, `trans-p5-estimator`. The RTOS
+migration was completed before them (`rtos-p7-complete`). **Phase 6 -- translation
+control -- is NEXT and is the first time fans will be driven by a controller.**
 
 **Rotation control: re-identified and retuned 2026-08-19. 0.47 deg mean final error
 over +-5 to +-180 deg, every slew in ONE move, wheel returning fully to rest.**
@@ -123,8 +125,32 @@ wall moved 25 -> 35 cm so all three tags stay framed when docked. Distortion and
 principal point remain uncorrected; revisit if terminal alignment shows a bias no tuning
 fixes. `tools/pi_calibrate.py` is written and ready whenever it is wanted.
 
-**NEXT: Phase 5 -- the estimator.** Wire `pi_pose.py` into the Phase 3 frame sender
-(range/bearing/relyaw/quality/n_tags/age_us over USART6), then fuse with the IMU.
+**Phase 5 DONE (2026-08-20): `src/estimator.*` produces dock-relative platform pose**
+at 200 Hz -- `x`, `y`, `psi`, velocity, and the magnet position. Dock frame: origin at
+tag 0 projected to the table, +X right as you face the wall, +Y out from it, psi = 0
+facing the wall square-on. All of x/y/psi refer to the platform's CENTRE OF ROTATION;
+the camera sits 13.46 cm ahead and the magnet 9.46 cm ahead, and those lever arms
+ROTATE with heading.
+
+**The sensor split was forced by measurement, not chosen.** Raw vision yaw was
+compressing reported `x` to ~35% of true, because `x = range*sin(psi - bearing)`
+collapses when psi drifts with bearing (T39). Root cause is T30: coplanar tags are
+ill-conditioned in yaw near square-on. So:
+
+```
+x, y        <- vision, corrected hard (aPos 0.35)
+psi fast    <- gyro, via the controller's existing theta (0.8 deg/min drift)
+psi absolute<- vision, corrected SLOWLY (aPsi 0.02, ~1.8 s) -- averages the noise
+psi = theta + psi_offset, and ONLY the offset is estimated
+```
+
+`PI_FLAG_AMBIGUOUS` drops the heading gain to a quarter. Accelerometer prediction
+deliberately not used yet -- its body-frame axis signs are unverified (T11).
+
+**NEXT: Phase 6 -- translation control (LQR).** Three double integrators (x, y, psi),
+fan allocation with the square-law `throttle = sqrt(A/A_max)`, and the tier-2 fan
+inhibit that B21b flags as still wrong (hard kill that latches; needs a soft zero plus
+an inhibit flag the allocator checks).
 
 **Raw calibration data** lives in `calibration/runs/`, one folder per experiment named
 by what it established, indexed in `calibration/runs/INDEX.md`.

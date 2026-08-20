@@ -76,6 +76,8 @@ import time
 import cv2
 import numpy as np
 
+from pi_camcfg import lock_exposure, load_intrinsics
+
 # --- measured geometry, 2026-08-20 -------------------------------------------
 # x = horizontal offset of the tag CENTRE from tag 0's centre, metres, +ve right
 # as you look at the wall. All three are at the same height and coplanar, so y
@@ -90,6 +92,53 @@ TAGS = {
 # Measured focal length, NOT the spec sheet (which claims 120 deg DFOV -> 424).
 # Two known distances gave 958 and 937; see decision B24/B25.
 F_PX_AT_1280 = 947.0
+
+# --- platform geometry, metres ------------------------------------------------
+# Both offsets are along the platform's FACING direction, measured from the
+# platform's centre of rotation (the reaction wheel axis, which is what psi
+# rotates about).
+L_CAM = 0.1346      # lens, ahead of centre
+L_MAG = 0.0946      # docking magnet, ahead of centre (13.46 - 4 cm behind lens)
+D_DOCK = 0.35       # ground magnet, out from the wall. Update if the wall moves.
+
+
+def platform_pose(rng, bearing, relyaw):
+    """Vision measures where the DOCK is relative to the CAMERA. The controller
+    needs where the PLATFORM is relative to the DOCK. Two chained transforms:
+
+      1. invert the measurement -> camera position in the dock frame
+      2. walk the lever arm back from the lens to the platform centre, then
+         forward again to the magnet
+
+    Step 2 matters because the arm ROTATES with heading: a 10 deg heading error
+    swings the lens 2.3 cm from where a naive 'camera ~= platform' model puts
+    it, which is twice the docking tolerance from heading alone.
+
+    DOCK FRAME (2D, horizontal plane; the vertical axis is irrelevant here):
+        origin  tag 0 projected to the table
+          +X    right, as you FACE the wall
+          +Y    out from the wall, toward the approach side
+        psi     platform heading; 0 = facing the wall square-on
+
+    Sanity checks built into the algebra, both confirmed on hardware:
+      psi=0, bearing=0        -> (0, rng)   dead in front at the measured range
+      bearing POSITIVE        -> x NEGATIVE  platform is LEFT of the dock,
+                                 which is what sliding left produced (T11 check)
+
+    Returns (x, y, psi, mag_x, mag_y), metres and radians.
+    """
+    psi = relyaw
+    # Direction from camera to dock, rotated out of the camera axis by bearing;
+    # the camera sits at minus that, scaled by range.
+    cam_x = rng * math.sin(psi - bearing)
+    cam_y = rng * math.cos(psi - bearing)
+    # Lens is AHEAD of centre, so the centre is behind it along the facing dir.
+    plat_x = cam_x + L_CAM * math.sin(psi)
+    plat_y = cam_y + L_CAM * math.cos(psi)
+    # Magnet is ahead of centre by a shorter arm.
+    mag_x = plat_x - L_MAG * math.sin(psi)
+    mag_y = plat_y - L_MAG * math.cos(psi)
+    return plat_x, plat_y, psi, mag_x, mag_y
 
 
 def tag_object_points(size, cx):
@@ -186,6 +235,9 @@ def main():
     ap.add_argument("--hz", type=float, default=10.0, help="print rate")
     args = ap.parse_args()
 
+    # Must match the exposure the calibration was taken at (T35).
+    lock_exposure(args.device)
+
     cap = cv2.VideoCapture(args.device, cv2.CAP_V4L2)
     if not cap.isOpened():
         sys.exit(f"cannot open {args.device}")
@@ -197,22 +249,33 @@ def main():
 
     W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    f = F_PX_AT_1280 * (W / 1280.0)
-    # Principal point ASSUMED at the image centre and distortion ASSUMED zero --
-    # we measured a focal length, not a calibration (B24). Bearing degrades
-    # toward the frame edges. pi_calibrate.py fixes this when it matters.
-    K = np.array([[f, 0, W / 2.0], [0, f, H / 2.0], [0, 0, 1.0]])
-    dist = np.zeros(5)
+    # Real intrinsics if we have them. The fallback is a MEASURED focal length
+    # with the principal point assumed centred and no distortion model -- that
+    # assumption is what made rel-yaw wander under pure translation, because
+    # uncorrected barrel distortion shears an off-centre target and solvePnP
+    # fits the shear as a rotation.
+    K, dist, src = load_intrinsics(W, H)
+    if K is None:
+        f = F_PX_AT_1280 * (W / 1280.0)
+        K = np.array([[f, 0, W / 2.0], [0, f, H / 2.0], [0, 0, 1.0]])
+        dist = np.zeros(5)
 
     det = make_detector(args.decimate, args.threads)
     period = 1.0 / args.hz
     t_next = 0.0
 
-    print(f"{W}x{H}  f={f:.0f}px (MEASURED, uncalibrated -- no distortion model)")
+    print(f"{W}x{H}  [{src}]")
     print("bearing +ve = dock is to the camera's RIGHT.  VERIFY BY SLIDING THE")
     print("PLATFORM before trusting it (T11).\n")
+    print("platform pose is in the DOCK frame: +X right as you face the wall,")
+    print(f"+Y out from it. dock target for the magnet is (0.000, {D_DOCK:.3f}).\n")
     print(f"{'tags':<10}{'range m':>9}{'bearing':>9}{'relyaw':>9}"
-          f"{'ratio':>8}{'reproj':>8}")
+          f"{'ratio':>7} | {'plat x':>8}{'plat y':>8}{'psi':>7}"
+          f" | {'mag x':>8}{'mag y':>8}{'x|psi=0':>9}")
+    print("  x|psi=0 ignores relyaw entirely: -range*sin(bearing). If THAT")
+    print("  tracks the tape measure while 'plat x' does not, the position")
+    print("  error is coming from noisy yaw, not from bearing or range.")
+    print("")
 
     while True:
         if not cap.grab():
@@ -233,14 +296,22 @@ def main():
             continue
 
         flag = ""
-        if p["ratio"] < 2.0:
-            flag = "  AMBIGUOUS(yaw)"      # two poses fit nearly as well
+        if p["ratio"] < 3.0 and abs(p["relyaw"]) > math.radians(10.0):
+            flag = "  AMBIGUOUS(yaw)"      # low ratio only matters off-square
         if len(p["tags"]) < 3:
             flag += "  PARTIAL"
+
+        px, py, psi, mx, my = platform_pose(p["range"], p["bearing"],
+                                            p["relyaw"])
+        dock_err = math.hypot(mx - 0.0, my - D_DOCK)
+
         print(f"{str(p['tags']):<10}{p['range']:>9.3f}"
               f"{math.degrees(p['bearing']):>9.2f}"
               f"{math.degrees(p['relyaw']):>9.2f}"
-              f"{p['ratio']:>8.1f}{p['reproj']:>8.2f}{flag}")
+              f"{p['ratio']:>7.1f} | {px:>8.3f}{py:>8.3f}"
+              f"{math.degrees(psi):>7.1f}"
+              f" | {mx:>8.3f}{my:>8.3f}"
+              f"{-p['range']*math.sin(p['bearing']):>9.3f}{flag}")
 
 
 if __name__ == "__main__":
