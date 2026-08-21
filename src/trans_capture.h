@@ -47,8 +47,15 @@
    the main capture uses. */
 void tcap_start(float target_x, float target_y, int testNum);
 
-/* Call every control cycle while a move is running. Decimates internally. */
+/* Call every control cycle while a move is running. Decimates internally.
+   Throttles come from trans_lastCommand(). */
 void tcap_sample(const EstState* st, uint32_t poseAgeUs);
+
+/* Same, but for a run the translation controller is NOT driving (the TC
+   single-fan probe). The throttles are passed in rather than read back from the
+   controller, because the controller's last command is stale during a probe and
+   a column that silently reports stale data is worse than no column (T21). */
+void tcap_sampleProbe(const EstState* st, uint32_t poseAgeUs, const float pct[4]);
 
 /* Freeze and record why. `reason` is copied by pointer -- pass a literal. */
 void tcap_stop(const char* reason);

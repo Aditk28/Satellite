@@ -956,6 +956,32 @@ void printTimingStats() {
 // =====================================================================
 // THE CONTROL LAW
 // =====================================================================
+// =====================================================================
+// Translation 1.4: which fan the L command drives. 0 = all four, 1-4 = one channel.
+// ---- TC single-fan direction probe (Phase 6) --------------------------------
+// Deliberately separate from the `I` thrust step rather than a flag on it: `I`
+// turns the WHEEL OFF on purpose, because Phase 2 wanted a clean accelerometer
+// trace uncontaminated by reaction torque. The probe wants the opposite -- the
+// wheel HOLDING, so psi stays put and vision displacement means something.
+// Same reasoning as B8: two different questions, two files, rather than one
+// path with a mode flag that gets set wrong.
+#define TCAL_PRE_MS   500
+#define TCAL_HOLD_MS  900
+#define TCAL_TOTAL_MS 4000
+static bool     tcalActive  = false;
+static float    tcalPct     = 0.0f;
+static uint32_t tcalStartMs = 0;
+
+static int fanSel = 0;
+
+// Apply throttle to whatever S selected. Called every control cycle during a
+// translation run, which also pets the fan dead-man (B12) exactly the way a closed
+// loop will in Phase 6 -- so the run cannot be cut short by the 10 s timeout.
+static void applyFanStep(float pct) {
+  if (fanSel == 0) fans_setAll(pct, pct, pct, pct);
+  else             fans_setThrottle(fanSel, pct);
+}
+
 void controlUpdate(float dt) {
   // ---- sense ----
   // Gyro read under the I2C mutex (safetyTask reads the INA219 on the same bus).
@@ -1060,6 +1086,24 @@ void controlUpdate(float dt) {
                                   : "operator_stop");
       }
     }
+    // ---- TC probe sequencer. Runs here rather than beside the `I` sequencer
+    // because it needs the estimator sample in the same cycle as the throttle
+    // it is recording.
+    if (tcalActive) {
+      uint32_t el = millis() - tcalStartMs;
+      float pct = (el >= TCAL_PRE_MS && el < TCAL_PRE_MS + TCAL_HOLD_MS)
+                    ? tcalPct : 0.0f;
+      applyFanStep(pct);
+      float p[4] = {0, 0, 0, 0};
+      if (fanSel >= 1 && fanSel <= 4) p[fanSel - 1] = pct;
+      if (haveEst) tcap_sampleProbe(&es, pi_ageUs(), p);
+      if (el >= TCAL_TOTAL_MS) {
+        tcalActive = false;
+        applyFanStep(0.0f);
+        tcap_stop("fan_probe");
+      }
+    }
+
     if (tcap_pending()) telem_run(dumpTransCapture);
   }
 
@@ -1228,18 +1272,6 @@ void controlUpdate(float dt) {
   lastU = u;
 }
 
-// =====================================================================
-// Translation 1.4: which fan the L command drives. 0 = all four, 1-4 = one channel.
-static int fanSel = 0;
-
-// Apply throttle to whatever S selected. Called every control cycle during a
-// translation run, which also pets the fan dead-man (B12) exactly the way a closed
-// loop will in Phase 6 -- so the run cannot be cut short by the 10 s timeout.
-static void applyFanStep(float pct) {
-  if (fanSel == 0) fans_setAll(pct, pct, pct, pct);
-  else             fans_setThrottle(fanSel, pct);
-}
-
 // One place to start any capture, so the window and the metadata line can never
 // disagree with what is actually being recorded.
 static void startCapture(const char* mode, uint32_t windowMs, float pct, int sel,
@@ -1324,8 +1356,25 @@ void handleLine(String s) {
         float v2 = (s.length() > 2) ? s.substring(2).toFloat() : 0.0f;
         float tx, ty;
         trans_getTarget(&tx, &ty);
-        if (sub == 'X') { trans_setTarget(v2, ty); }
-        else if (sub == 'Y') { trans_setTarget(tx, v2); }
+        // TX/TY are OFFSETS FROM THE MAGNET'S CURRENT POSITION, not absolute
+        // dock coordinates. Absolute is what a docking state machine wants but
+        // it is not what a human tuning by hand wants: it forces reading two
+        // numbers off G, subtracting a 9.46 cm lever arm, and typing the result
+        // -- which is how the centre got commanded instead of the magnet, twice
+        // (T45). Each recomputes from the CURRENT magnet position, so issuing
+        // TX then TY is not compounding and re-issuing one is idempotent.
+        // TZ sets the one absolute target that matters: the dock itself.
+        if (sub == 'X' || sub == 'Y' || sub == 'Z') {
+          EstState e;
+          if (!est_get(&e)) {
+            printBoth("no fix yet -- cannot place a target relative to a "
+                      "magnet position we do not have");
+            break;
+          }
+          if      (sub == 'X') trans_setTarget(e.mag_x + v2, ty);
+          else if (sub == 'Y') trans_setTarget(tx, e.mag_y + v2);
+          else                 trans_setTarget(0.0f, EST_D_DOCK);
+        }
         else if (sub == 'T') {
           if (pi_state() != PI_FRESH) {
             printBoth("REFUSED: pose is not FRESH. Translation will not start "
@@ -1384,8 +1433,39 @@ void handleLine(String s) {
                     + " t_settle=" + String((wn > 0.0f) ? 5.714f / wn : 0.0f, 1) + "s");
           break;
         }
-        else { printBoth("TX<m> TY<m> target, TT go, TS stop, "
-                         "TP/TD/TF Kp/Kd/ff"); break; }
+        // TC<pct> -- single-fan direction probe. The one measurement that has
+        // survived every attempt to infer this indirectly: ONE fan, heading
+        // HELD by the wheel so psi cannot wander, position from VISION so the
+        // accelerometer's unverified body axes never enter it, logged at 20 Hz.
+        // Open-loop accelerometer runs give the four fans' directions relative
+        // to each other but cannot anchor them to the camera axis (T42), and
+        // free yaw during those runs biases them further; chaining them across
+        // mechanical work on the fans compounded the error three times.
+        else if (sub == 'C') {
+          if (!fans_armed() || fans_killed()) {
+            printBoth("fans not ready -- R to re-arm"); break;
+          }
+          if (telem_busy()) { printBoth("REFUSED: capture still dumping"); break; }
+          if (!controllerEnabled || ctrlMode == CTRL_IDLE) {
+            printBoth("REFUSED: send H<deg> first. Holding heading is the whole "
+                      "point -- a wandering psi is what ruined the open-loop "
+                      "measurements.");
+            break;
+          }
+          if (pi_state() != PI_FRESH) { printBoth("REFUSED: pose not FRESH"); break; }
+          if (fanSel < 1 || fanSel > 4) {
+            printBoth("select a single fan first with S1..S4"); break;
+          }
+          if (v2 <= 0.0f) v2 = 45.0f;
+          tcalPct = v2; tcalActive = true; tcalStartMs = millis();
+          tcap_start(0.0f, 0.0f, ++stepCount);
+          printBoth("FAN PROBE: fan" + String(fanSel) + " at " + String(v2, 0)
+                    + "% -- " + String(TCAL_PRE_MS) + "ms quiet / "
+                    + String(TCAL_HOLD_MS) + "ms thrust / coast. KEEP CLEAR.");
+          break;
+        }
+        else { printBoth("TX<m> TY<m> offsets from magnet, TZ dock, TT go, "
+                         "TS stop, TP/TD/TF gains, TC<pct> fan probe"); break; }
         trans_getTarget(&tx, &ty);
         // Echo the MAGNET position and the resulting error, not just the target.
         // The target is the magnet's destination, but G prints the platform

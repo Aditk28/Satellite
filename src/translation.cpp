@@ -72,15 +72,50 @@ void trans_getGains(float* kp, float* kd, float* ff) {
   if (kp) *kp = s_kp; if (kd) *kd = s_kd; if (ff) *ff = s_ffFrac;
 }
 
-/* Acceleration -> throttle percent. The square-law inversion is the fan
-   analogue of the wheel axis's feedback linearisation, but STATIC -- there is
-   no actuator state to cancel because the ESCs give us nothing back
+/* ---- per-fan thrust constants ----------------------------------------------
+   A(pct) = K * pct^2, one K PER FAN rather than the single TRANS_K_A the plant
+   ID produced. Measured 2026-08-20 from four `I50` runs, as
+   K = (measured net |a| + A_c) / 50^2:
+
+       fan1 0.518 -> 2.07e-4      fan3 0.364 -> 1.46e-4
+       fan4 0.495 -> 1.98e-4      fan2 0.333 -> 1.33e-4
+
+   The whole {2,3} axis delivers 63-69% of {1,4}. B29 originally left this
+   uncompensated on the grounds that the square law makes a weak fan cost
+   1.26x throttle against a 60% ceiling, and that a mechanical fix was proven
+   on this hardware. **REVISED: no mechanical fix is available.**
+
+   The reason to compensate is NOT the direction bias -- closed-loop feedback
+   absorbs a 12 deg allocation error without complaint. It is BREAKAWAY. The
+   Coulomb feedforward asks for ff*A_c = 0.234 m/s^2 to break stiction; along
+   the {2,3} axis that arrives as 0.155 against a 0.26 breakaway, so the
+   platform does not move at all. An actuator deficit that shows up as
+   "sometimes it doesn't start, depending on which way you asked it to go" is
+   the worst thing to tune against, because it looks like a friction problem.
+
+   ⚠️ THESE ARE LOWER BOUNDS ON THE WEAK FANS. `|a|` is averaged over a window
+   in which a barely-moving platform is stationary part of the time, so the
+   accelerometer under-reads exactly where the fan is weakest. Re-measure with
+   four `I50` runs after ANY prop or ESC-direction change -- fan 3 went 0.245
+   to 0.104 across one such change and nothing in firmware could know. */
+static const float FAN_K_A[4] = { 2.07e-4f, 1.33e-4f, 1.46e-4f, 1.98e-4f };
+
+/* Acceleration -> throttle percent for ONE fan. The square-law inversion is the
+   fan analogue of the wheel axis's feedback linearisation, but STATIC -- there
+   is no actuator state to cancel because the ESCs give us nothing back
    (no RPM, no thrust, no per-channel current). */
-static inline float accelToPct(float a) {
+static inline float accelToPct(int fan, float a) {
   if (a <= 0.0f) return 0.0f;
-  float pct = sqrtf(a / TRANS_K_A);
+  float pct = sqrtf(a / FAN_K_A[fan]);
   if (pct > FAN_THROTTLE_MAX) pct = FAN_THROTTLE_MAX;
   return pct;
+}
+
+/* Thrust a fan produces sitting at the idle bias. Not a constant any more --
+   the opposing fan's idle pushes BACK along the axis, and with unequal fans
+   the two no longer cancel. */
+static inline float idleAccel(int fan) {
+  return FAN_K_A[fan] * TRANS_IDLE_PCT * TRANS_IDLE_PCT;
 }
 
 bool trans_update(const EstState* st, bool poseFresh) {
@@ -239,12 +274,15 @@ bool trans_update(const EstState* st, bool poseFresh) {
     float dfwd = cosf(th), drgt = -sinf(th);
     float c = fwd * dfwd + rgt * drgt;           /* projection onto this axis */
 
-    float a_idle = TRANS_K_A * TRANS_IDLE_PCT * TRANS_IDLE_PCT;
+    /* The pushing fan must beat the OPPOSING fan's idle thrust as well as
+       deliver c, so the net along the axis really is c. With one K per fan the
+       two idles no longer cancel, so each side is worked out against its
+       partner's actual idle rather than against a shared constant. */
     if (c >= 0.0f) {
-      pct[ia] = accelToPct(a_idle + c);
+      pct[ia] = accelToPct(ia, c + idleAccel(ib));
       pct[ib] = TRANS_IDLE_PCT;
     } else {
-      pct[ib] = accelToPct(a_idle - c);
+      pct[ib] = accelToPct(ib, -c + idleAccel(ia));
       pct[ia] = TRANS_IDLE_PCT;
     }
   }

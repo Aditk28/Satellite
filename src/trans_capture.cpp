@@ -28,22 +28,9 @@ void tcap_start(float tx, float ty, int testNum) {
   s_pending = false;
 }
 
-void tcap_sample(const EstState* st, uint32_t poseAgeUs) {
-  if (!s_active || !st) return;
-  if (++s_div < TCAP_DECIM) return;
-  s_div = 0;
-
-  if (s_n >= TCAP_MAX) {
-    /* Out of room. Stop rather than wrap: a wrapped buffer of a move that is
-       still running is a trajectory with no beginning, which is the half of it
-       that matters. */
-    tcap_stop("buffer_full");
-    return;
-  }
-
-  float p1, p2, p3, p4, ax, ay;
-  trans_lastCommand(&ax, &ay, &p1, &p2, &p3, &p4);
-
+static void tcap_store(const EstState* st, uint32_t poseAgeUs,
+                       float ax, float ay,
+                       float p1, float p2, float p3, float p4) {
   s_t[s_n]   = micros();
   s_x[s_n]   = st->x;
   s_y[s_n]   = st->y;
@@ -60,6 +47,31 @@ void tcap_sample(const EstState* st, uint32_t poseAgeUs) {
   uint32_t ms = (poseAgeUs == UINT32_MAX) ? 65535u : (poseAgeUs / 1000u);
   s_age[s_n] = (ms > 65535u) ? 65535u : (uint16_t)ms;
   s_n++;
+}
+
+/* Shared front end: decimate, and stop cleanly when the buffer fills rather
+   than wrapping -- a wrapped buffer of a run still in progress is a trajectory
+   with no beginning, which is the half that matters. */
+static bool tcap_tick(void) {
+  if (!s_active) return false;
+  if (++s_div < TCAP_DECIM) return false;
+  s_div = 0;
+  if (s_n >= TCAP_MAX) { tcap_stop("buffer_full"); return false; }
+  return true;
+}
+
+void tcap_sample(const EstState* st, uint32_t poseAgeUs) {
+  if (!st || !tcap_tick()) return;
+  float p1, p2, p3, p4, ax, ay;
+  trans_lastCommand(&ax, &ay, &p1, &p2, &p3, &p4);
+  tcap_store(st, poseAgeUs, ax, ay, p1, p2, p3, p4);
+}
+
+void tcap_sampleProbe(const EstState* st, uint32_t poseAgeUs, const float pct[4]) {
+  if (!st || !pct || !tcap_tick()) return;
+  /* No commanded acceleration exists during a probe -- the fans are being
+     driven open loop -- so those columns are honestly zero rather than stale. */
+  tcap_store(st, poseAgeUs, 0.0f, 0.0f, pct[0], pct[1], pct[2], pct[3]);
 }
 
 void tcap_stop(const char* reason) {
