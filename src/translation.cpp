@@ -16,18 +16,30 @@
    both accuracy and saturation.
 
        omega_n = 5.714/3.0 = 1.90    K_p = 3.63    K_d = 2*0.8*1.90 = 3.05   */
-static float s_kp     = 3.63f;
-static float s_kd     = 3.05f;
-static float s_ffFrac = 0.90f;
+/* Velocity-shaped approach (see trans_update):
+     s_kp  m/s of commanded speed per metre of error -> taper starts at
+           TRANS_V_MAX/s_kp = 0.07/0.5 = 14 cm out
+     s_kd  m/s^2 per m/s of velocity error -> ~0.4 s velocity time constant  */
+static float s_kp     = 0.50f;
+static float s_kd     = 6.00f;
+static float s_ffFrac = 1.00f;
 
 /* Fan push directions, degrees CCW from the camera axis. See translation.h --
    this is the constant that turns a bug into a runaway.
 
-   CORRECTED 2026-08-20 FROM MEASUREMENT, TWICE. The remembered table was right
-   in structure and in its 90 deg spacing; its ZERO was 90 deg off the camera
-   axis. Final value = remembered table rotated -90 deg. See translation.h. */
-static const float FAN_ANGLE_DEG[4] = { -130.0f, -40.0f, +140.0f, +50.0f };
+   SETTLED 2026-08-21, empirically, at the remembered table + 180 deg. Four
+   values were tried over two days; every earlier attempt was diagnosed from a
+   position estimate that was itself broken, which is why three of them were
+   wrong and all three looked convincing. What finally decided it was having a
+   trustworthy stationary reference (averaged vision at rest) and then simply
+   sweeping TA0/90/180/270 against the real loop -- two minutes, once the
+   measurement could be trusted.
+   The lesson is the ordering: fix the instrument, THEN identify the plant. Every
+   hour spent inferring this constant from a broken estimator was wasted. */
+static const float FAN_ANGLE_DEG[4] = { +140.0f, +230.0f, +50.0f, -40.0f };
 
+static float s_vmax   = TRANS_V_MAX;
+static float s_fanRot = 0.0f;    /* runtime rotation on the whole table, deg */
 static bool  s_enabled = false;
 static float s_tx = 0.0f, s_ty = 0.0f;
 static float s_lastAx = 0.0f, s_lastAy = 0.0f, s_lastErr = 0.0f;
@@ -62,6 +74,12 @@ void trans_enable(bool on) {
   }
 }
 bool trans_enabled(void) { return s_enabled; }
+
+void  trans_setVmax(float v) { if (v > 0.0f && v <= 0.30f) s_vmax = v; }
+float trans_getVmax(void)    { return s_vmax; }
+
+void  trans_setFanRot(float deg) { s_fanRot = deg; }
+float trans_getFanRot(void)      { return s_fanRot; }
 
 void trans_setGains(float kp, float kd, float ff) {
   if (kp >= 0.0f) s_kp = kp;
@@ -122,12 +140,23 @@ bool trans_update(const EstState* st, bool poseFresh) {
   if (!s_enabled) return false;
 
   /* No usable pose -> withdraw thrust, but SOFTLY: zero throttle with the ESC
-     left armed, so authority returns the instant vision does. Staying enabled
-     is deliberate -- losing sight of the dock is a normal operating condition
-     (SEARCH, close approach) and must not require an operator to re-arm
-     (B21b). What is NOT acceptable is coasting on a pose we no longer believe
-     (T9), so nothing is commanded until it comes back. */
-  if (!st || !st->valid || !poseFresh) {
+     left armed, so authority returns the instant the estimate does. Staying
+     enabled is deliberate -- losing sight of the dock is a normal operating
+     condition (SEARCH, close approach) and must not require an operator to
+     re-arm (B21b).
+
+     ⚠️ `poseFresh` IS DELIBERATELY NOT CHECKED ANY MORE. B21b gated thrust on
+     vision freshness because vision WAS the position source; with position now
+     dead-reckoned from the IMU (estimator.h, IMU-LED OPERATION) that gate
+     withdraws thrust for a reason that no longer applies. Symptom when it was
+     still in: the fans go completely silent the moment the Pi stops sending --
+     zero throttle every cycle, forever, while the estimate is perfectly good
+     and the controller believes it is commanding a move.
+
+     What still holds from T9 is the part that matters: never act on a pose we
+     do not have. `st->valid` is that test, and it is true from TI onward. */
+  (void)poseFresh;
+  if (!st || !st->valid) {
     fans_setAll(0, 0, 0, 0);
     for (int i = 0; i < 4; i++) s_lastPct[i] = 0.0f;
     /* The divergence guard measures progress, and a blind interval is not
@@ -196,12 +225,30 @@ bool trans_update(const EstState* st, bool poseFresh) {
     return true;
   }
 
-  /* ---- PD. No sign inversion here, unlike the wheel axis: commanding +x
-     acceleration moves the platform +x, whereas the reaction wheel moves the
-     platform OPPOSITE to the wheel (CONTROL_README section 8's minus sign).
-     Do not copy that sign across. */
-  float ax = s_kp * ex - s_kd * st->vx;
-  float ay = s_kp * ey - s_kd * st->vy;
+  /* ---- VELOCITY-SHAPED APPROACH, not a position PD.
+     s_kp is now metres/second of commanded speed per metre of error, and s_kd
+     is m/s^2 per m/s of velocity error. The reason for the change is docking:
+     a position PD demands acceleration proportional to how far away it is, so
+     at 40 cm it asks for 1.45 m/s^2, saturates, and arrives fast -- and the
+     speed cap that was bolted on top had to STRIP the demand once at the limit,
+     which made the throttles chatter 60 -> 12 -> 60 as it went in and out of
+     saturation (measured 2026-08-20).
+
+     Shaping the VELOCITY instead makes the limit part of the law rather than a
+     clamp on it: cruise at TRANS_V_MAX while far away, taper linearly inside
+     TRANS_V_MAX/s_kp of the target, and the acceleration command is whatever it
+     takes to track that profile. Smooth at the cap, and it arrives slow by
+     construction rather than by braking hard at the end.
+
+     No sign inversion here, unlike the wheel axis: commanding +x acceleration
+     moves the platform +x, whereas the reaction wheel moves the platform
+     OPPOSITE to the wheel (CONTROL_README section 8's minus sign). */
+  float vdes = s_kp * err;
+  if (vdes > s_vmax) vdes = s_vmax;
+  float vdx = vdes * (ex / err), vdy = vdes * (ey / err);
+
+  float ax = s_kd * (vdx - st->vx);
+  float ay = s_kd * (vdy - st->vy);
 
   /* ---- Coulomb feedforward. Friction here is 0.26 m/s^2 against manoeuvres of
      a similar size, so it is a dominant term, not a correction.
@@ -249,6 +296,19 @@ bool trans_update(const EstState* st, bool poseFresh) {
   }
   ax += s_ffFrac * ffx;
   ay += s_ffFrac * ffy;
+
+  /* ---- breakaway floor. While stuck, guarantee enough authority to actually
+     start; once moving, the profile above governs and this never applies. The
+     two regimes need different magnitudes and a single constant cannot serve
+     both -- getting that wrong on the rotation axis cost 5/11 terminal
+     corrections until A_static and A_moving were split. */
+  if (speed <= TRANS_V_MOVING) {
+    float m = sqrtf(ax * ax + ay * ay);
+    if (m > 1e-6f && m < TRANS_A_STATIC) {
+      float g = TRANS_A_STATIC / m;
+      ax *= g; ay *= g;
+    }
+  }
   s_lastAx = ax; s_lastAy = ay;
 
   /* ---- dock frame -> body frame.
@@ -268,7 +328,7 @@ bool trans_update(const EstState* st, bool poseFresh) {
 
   for (int p = 0; p < 2; p++) {
     int ia = pairs[p][0], ib = pairs[p][1];
-    float th = FAN_ANGLE_DEG[ia] * (float)M_PI / 180.0f;
+    float th = (FAN_ANGLE_DEG[ia] + s_fanRot) * (float)M_PI / 180.0f;
     /* Fan direction in body coords: CCW from forward means turning toward the
        LEFT, which is negative "right". */
     float dfwd = cosf(th), drgt = -sinf(th);

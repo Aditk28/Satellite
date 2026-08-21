@@ -20,8 +20,17 @@
        turns +-10 deg of per-frame noise into ~+-1.4 deg, while the gyro carries
        the fast changes. Raising this re-admits the noise that was corrupting
        position in the first place.                                          */
-static float s_alphaPos = 0.35f;
-static float s_betaVel  = 0.08f;
+/* DROPPED 0.35 -> 0.05 when position went IMU-led. Vision is now a slow drift
+   corrector, not the source of truth: at ~10 fixes/s a gain of 0.05 pulls the
+   estimate toward vision with a ~2 s time constant, enough to bound accelerometer
+   drift over a docking run while being far too slow to yank the estimate when
+   vision produces one of its 50 cm outliers. */
+static float s_alphaPos = 0.50f;
+/* 0.08 -> 0.0. Velocity now comes from integrating the accelerometer, so
+   inferring it AGAIN from the vision position innovation would double-count the
+   same information (T10's family) and inject the exact 1/dt noise amplification
+   the original comment warned about. */
+static float s_betaVel  = 0.0f;
 static float s_alphaPsi = 0.02f;
 
 /* Reject a fix whose range is outside anything physically reachable on this
@@ -32,10 +41,16 @@ static float s_alphaPsi = 0.02f;
 
 static EstState  s_st;
 static float     s_psiOffset = 0.0f;   /* psi = theta + this                 */
+static float     s_accRot = EST_ACC_ROT_DEG * (float)M_PI / 180.0f;
 static bool      s_haveOffset = false;
 static uint16_t  s_lastSeq = 0;
 static bool      s_haveSeq = false;
 static uint32_t  s_fixes = 0, s_rejects = 0;
+
+static float s_faX = 0.0f, s_faY = 0.0f;   /* low-passed body accel          */
+static float s_bX  = 0.0f, s_bY  = 0.0f;   /* residual accel bias, body frame */
+static int    s_snapWant = 0, s_snapGot = 0;
+static double s_snapSumX = 0.0, s_snapSumY = 0.0;
 
 static inline float wrapPi(float a) {
   while (a >  (float)M_PI) a -= 2.0f * (float)M_PI;
@@ -46,6 +61,8 @@ static inline float wrapPi(float a) {
 void est_init(void) {
   s_st = (EstState){0};
   s_psiOffset = 0.0f;
+  s_faX = s_faY = s_bX = s_bY = 0.0f;
+  s_snapWant = s_snapGot = 0;
   s_haveOffset = false;
   s_haveSeq = false;
   s_fixes = s_rejects = 0;
@@ -53,12 +70,66 @@ void est_init(void) {
 
 /* Magnet position follows from the centre and the heading -- recomputed rather
    than filtered separately, so the two can never disagree. */
+static float s_magLat = EST_MAG_LAT;
+
+/* body forward in dock coords = (-sin psi, -cos psi)
+   body left    in dock coords = (-cos psi, +sin psi)
+   magnet = centre + L_MAG*forward + magLat*left                              */
 static void updateMagnet(void) {
-  s_st.mag_x = s_st.x - EST_L_MAG * sinf(s_st.psi);
-  s_st.mag_y = s_st.y - EST_L_MAG * cosf(s_st.psi);
+  float sp = sinf(s_st.psi), cp = cosf(s_st.psi);
+  s_st.mag_x = s_st.x - EST_L_MAG * sp - s_magLat * cp;
+  s_st.mag_y = s_st.y - EST_L_MAG * cp + s_magLat * sp;
 }
 
-void est_predict(float dt, float theta) {
+void  est_setMagLat(float m) { s_magLat = m; updateMagnet(); }
+float est_getMagLat(void)    { return s_magLat; }
+
+void est_setMagnetPose(float mx, float my) {
+  float sp = sinf(s_st.psi), cp = cosf(s_st.psi);
+  s_st.x = mx + EST_L_MAG * sp + s_magLat * cp;
+  s_st.y = my + EST_L_MAG * cp - s_magLat * sp;
+  s_st.vx = s_st.vy = 0.0f;
+  s_st.valid = true;
+  s_st.lastFixMs = millis();
+  updateMagnet();
+}
+
+/* Zero-velocity AND zero-acceleration update. Velocity is known to be zero, and
+   so is ACCELERATION -- which makes the low-passed reading at this instant a
+   direct measurement of the residual bias that `B` left behind at boot. Folding
+   it in here is the only bias correction the system gets after startup, and it
+   is free: the platform tells us every time it stops.
+   Why this matters more than filtering: the drift is a DC error. A low-pass
+   removes vibration and does nothing at all to a constant offset, and a
+   double integrator turns 0.015 m/s^2 of offset into 0.13 m/s of phantom speed
+   in 9 s -- which the velocity-shaped control law then subtracts straight off
+   the command, so the platform sits there believing it is already moving. */
+void est_zupt(void) {
+  s_st.vx = 0.0f; s_st.vy = 0.0f;
+  s_bX += s_faX;  s_bY += s_faY;
+  s_faX = 0.0f;   s_faY = 0.0f;
+}
+void est_snapBegin(int n) {
+  s_snapWant = (n > 0) ? n : 1;
+  s_snapGot = 0;
+  s_snapSumX = s_snapSumY = 0.0;
+}
+bool est_snapDone(void) { return s_snapWant == 0; }
+void est_snapCancel(void) { s_snapWant = 0; s_snapGot = 0; }
+float est_psiOffset(void) { return s_psiOffset; }
+
+void est_setAccRot(float deg) { s_accRot = deg * (float)M_PI / 180.0f; }
+float est_getAccRot(void)     { return s_accRot * 180.0f / (float)M_PI; }
+
+void est_setPose(float x, float y) {
+  s_st.x = x; s_st.y = y;
+  s_st.vx = s_st.vy = 0.0f;
+  s_st.valid = true;
+  s_st.lastFixMs = millis();
+  updateMagnet();
+}
+
+void est_predict(float dt, float theta, float ax_body, float ay_body) {
   /* Heading is NOT integrated here. The rotation controller already integrates
      the gyro into `theta` and that path is proven; duplicating it would mean
      two integrators that can silently diverge. We only carry the offset that
@@ -69,11 +140,39 @@ void est_predict(float dt, float theta) {
   float th = EST_THETA_SIGN * theta;
   if (s_haveOffset) s_st.psi = wrapPi(th + s_psiOffset);
 
-  /* Constant-velocity propagation. Between vision frames (~36 ms) this is
-     plenty; accelerometer prediction is 5.1b and needs its axis signs checked
-     on hardware before it can be trusted (T11). */
-  s_st.x += s_st.vx * dt;
-  s_st.y += s_st.vy * dt;
+  /* ---- DEAD RECKONING. The accelerometer arrives in its own axes; rotate by
+     s_accRot to get body (forward, left), then by psi to get the dock frame.
+     Checked at psi = 0: a pure forward push gives dock (0,-1), i.e. toward the
+     wall, and a pure left push gives (-1,0), i.e. -X. */
+  /* Low-pass BEFORE integrating, not after. Filtering the position afterwards
+     cannot undo a velocity random walk that has already been committed. */
+  float k = dt / (EST_ACC_TAU + dt);
+  s_faX += k * ((ax_body - s_bX) - s_faX);
+  s_faY += k * ((ay_body - s_bY) - s_faY);
+
+  float cr = cosf(s_accRot), sr = sinf(s_accRot);
+  float fwd  = s_faX * cr - s_faY * sr;
+  float left = s_faX * sr + s_faY * cr;
+
+  float sp = sinf(s_st.psi), cp = cosf(s_st.psi);
+  float ax_dock = fwd * (-sp) + left * (-cp);
+  float ay_dock = fwd * (-cp) + left * ( sp);
+
+  /* Integrate acceleration into velocity, velocity into position. Only runs
+     once there is a pose to integrate FROM -- before est_setPose() or the first
+     vision fix there is no origin, and integrating from (0,0) would look like a
+     platform sitting on the dock. */
+  if (s_st.valid) {
+    s_st.vx += ax_dock * dt;
+    s_st.vy += ay_dock * dt;
+    /* Leak (see EST_V_LEAK_TAU): friction forbids a persistent unforced
+       velocity, so bound what bias can accumulate rather than trusting it. */
+    float leak = 1.0f - dt / EST_V_LEAK_TAU;
+    s_st.vx *= leak;
+    s_st.vy *= leak;
+    s_st.x  += s_st.vx * dt;
+    s_st.y  += s_st.vy * dt;
+  }
   updateMagnet();
 }
 
@@ -157,9 +256,29 @@ bool est_correct(const PiPose* p, float theta, float omega_p) {
     if (dtFix < 0.005f) dtFix = 0.005f;
     if (dtFix > 0.5f)   dtFix = 0.5f;
 
+    /* Snap in progress: accumulate, and once enough frames are in, ADOPT the
+       mean rather than blending toward it. */
+    if (s_snapWant > 0) {
+      s_snapSumX += mx; s_snapSumY += my;
+      if (++s_snapGot >= s_snapWant) {
+        s_st.x = (float)(s_snapSumX / s_snapGot);
+        s_st.y = (float)(s_snapSumY / s_snapGot);
+        s_st.vx = s_st.vy = 0.0f;
+        s_snapWant = 0;
+      }
+      s_st.lastFixMs = millis();
+      updateMagnet();
+      s_fixes++;
+      return true;
+    }
+
     float ix = mx - s_st.x, iy = my - s_st.y;
-    s_st.x  += s_alphaPos * ix;
-    s_st.y  += s_alphaPos * iy;
+    /* Routine correction only while slow -- above EST_VIS_VMAX vision position
+       contributes nothing at all. */
+    float sp2 = sqrtf(s_st.vx * s_st.vx + s_st.vy * s_st.vy);
+    float gp = (sp2 < EST_VIS_VMAX) ? s_alphaPos : 0.0f;
+    s_st.x  += gp * ix;
+    s_st.y  += gp * iy;
     s_st.vx += s_betaVel  * ix / dtFix;
     s_st.vy += s_betaVel  * iy / dtFix;
   }

@@ -23,69 +23,53 @@
   Angles are the direction each fan PUSHES THE PLATFORM, measured from the
   camera axis, CCW POSITIVE (toward the camera's left), in the BODY frame:
 
-        fan 1  -130 deg          fan 4   +50 deg     <- opposing pair
-        fan 2   -40 deg          fan 3  +140 deg     <- opposing pair
+        fan 1  +140 deg          fan 4   -40 deg     <- opposing pair
+        fan 2  +230 deg          fan 3   +50 deg     <- opposing pair
 
-  Two orthogonal axes, rotated 50 deg off the camera axis.
+  Two orthogonal axes, rotated 40 deg off the camera axis. These are the
+  originally remembered values, RESTORED 2026-08-20 after two "corrections"
+  (+180, then -90) both turned out to be derived from vision.
 
-  ⚠️ THIS TABLE WAS WRONG TWICE, and the second time was a wrong FIX. The
-  history is worth keeping because both errors look identical from the outside
-  -- the platform moves confidently in the wrong direction:
+  ⚠️ THE HISTORY IS THE LESSON HERE, not the number. Both wrong tables were
+  produced by measuring the platform's motion with VISION -- displacement in one
+  case, velocity in the other -- and vision position was itself broken:
 
-    as first written    the platform went 166 deg from commanded
-    "corrected" +180    the platform went  75 deg from commanded
-    correct: -90 deg from the ORIGINAL remembered table
+     it put the platform 55 cm off-centre on a 61 cm table
+     it reported four differently-angled fans all pushing along dock X, y flat
+     it reported a COASTING platform accelerating to 0.57 m/s, fans off
 
-  HOW THE WRONG FIX HAPPENED, because the method matters more than the number.
-  Four single-fan `I50` thrust steps were read off the body-frame accelerometer
-  -- a good instrument, immune to psi, to the magnet lever arm, and to the free
-  yaw that ruins a vision-displacement estimate. That gave the four fans'
-  directions RELATIVE to each other correctly. It could not give their
-  relationship to the CAMERA AXIS, so that anchor was taken from two hand-shove
-  `I0` captures, which appeared to put body-forward at +76 deg in the
-  accelerometer's axes. That anchor was an artifact of picking a burst out of a
-  sloppy two-shove record. The accelerometer frame IS the body frame here, to
-  within a few degrees.
+  Every direction "correction" therefore inherited that error, and each one
+  looked exactly as convincing as a real result. A wrong fan table and a broken
+  position estimate produce the same symptom -- the platform moves confidently
+  in the wrong direction -- so the symptom cannot distinguish them.
 
-  WHAT FINALLY SETTLED IT is the closed-loop run itself, which is the only
-  measurement that samples the whole chain -- estimator, transform, allocation,
-  actuators -- at once:
+  WHAT THE TABLE RESTS ON NOW. The accelerometer, which is body-fixed and cares
+  nothing for psi, bearing, the camera lever arm or tag dropout, measured all
+  four fans across THREE separate sessions spanning two rounds of mechanical
+  work on the fans:
 
-        commanded body direction   +2.4 deg   (allocated fans 3 and 4, 57/60%)
-        achieved  body direction  +77.7 deg   (from dv/dt over 0.30 s)
-        magnitude 0.637 m/s2 net vs 0.72 predicted -> both fans WERE thrusting
+        session A   fan1 -127.2  fan2 -49.2  fan3 +126.5  fan4 +47.6
+        session B   fan1 -133.5  fan2 -46.8  fan3 +117.0  fan4 +43.3
+        session C   fan1 -130.4  fan2 -40    fan3 +120    fan4 +34
+        pooled      fan1 -130    fan2 -40    fan3 +121    fan4 +42
 
-  Right magnitude, wrong direction = a rotated table, and the rotation is
-  measured directly. Cross-check, raw `I50` angles against the adopted values:
+  Against the physically known mounting above, that is a UNIFORM +90 deg on all
+  four channels. A common offset across four independent measurements cannot
+  come from noise, and it is far stronger evidence than any single run -- which
+  is precisely what the two failed corrections were built on. The same +90 is
+  the accelerometer-to-body rotation the estimator uses for dead reckoning
+  (EST_ACC_ROT_DEG), so one constant is now doing both jobs and a future error
+  in it will show up in both places at once rather than hiding in one.
 
-        measured  fan1 -127.2  fan2 -49.2  fan3 +126.5  fan4 +47.6
-        adopted   fan1 -130    fan2 -40    fan3 +140    fan4 +50
-        uniform 5.6 deg -- inside the yaw contamination of the I50 runs
+  ⚠️ A SIGN ERROR HERE IS A RUNAWAY. If a fan pushes opposite to what this table
+  says, the controller sees the error GROW and pushes HARDER. With unguarded
+  props (B7) that is the failure worth engineering against rather than
+  inspecting for -- the divergence guard below is what actually caught it, twice.
 
-  The adopted values are the remembered table rotated -90 deg: the remembered
-  angles were right in structure AND spacing, and only their zero was wrong.
-  Measurement confirms the geometry; it does not out-resolve it.
-
-  LESSON: a relative measurement plus a shaky anchor is a shaky answer, and it
-  fails in a way that looks exactly like a correct answer. Anchor on the
-  closed loop, which cannot lie about the end-to-end sign, and keep the
-  divergence guard armed while you do.
-
-  ⚠️ A SIGN ERROR HERE IS A RUNAWAY, not a debugging inconvenience. If a fan
-  pushes opposite to what this table says, the controller sees the error GROW
-  and pushes HARDER. With unguarded props (B7) that is the failure mode worth
-  fearing. The divergence guard below is what actually caught it.
-
-  ⚠️ FANS 2 AND 4 ARE WEAK, measured 2026-08-20 at a nominal 50%:
-        fan 1  0.263 m/s2 -> A = 0.523   (model predicts 0.525)   healthy
-        fan 3  0.245      -> A = 0.505                            healthy
-        fan 2  0.101      -> A = 0.361   behaves like 41% throttle
-        fan 4  0.118      -> A = 0.378   behaves like 42%, and produced
-                                         NOTHING on 3 of 4 attempts
-  That is the T3 backwards-prop / B17 reversed-direction signature on both
-  channels. Fan 4 is the one whose spin direction must be re-sent over DSHOT at
-  every boot because this ESC ignores SAVE_SETTINGS. Allocation currently
-  assumes all four are equal and they are not.
+  ⚠️ PER-FAN STRENGTH IS UNEQUAL AND MOVES AROUND. See FAN_K_A in the .cpp: the
+  {2,3} axis has run at 63-69% of {1,4}, and fan 3 alone went 0.245 -> 0.104
+  across one session's mechanical work. Re-measure all four with `TC` after ANY
+  prop or ESC-direction change; nothing in firmware can detect it.
   ---------------------------------------------------------------------------
 
   UNIDIRECTIONAL ACTUATORS ARE THE GENUINELY NEW PROBLEM. Fans only push. An
@@ -110,6 +94,27 @@
    ~2% measured bare is optimistic with props fitted (T12, guide 6.3 trap 2). */
 #define TRANS_IDLE_PCT   12.0f
 
+/* Approach speed cap, m/s. The docking approach has to be SLOW: the magnet has
+   a couple of centimetres of tolerance, the estimate has more error than that,
+   and an arrival at 0.3 m/s is a collision rather than a dock. Enforced by
+   stripping the ACCELERATING component of the demand once the platform is at
+   the cap -- braking and cross-track correction still get through, so this
+   bounds speed without disabling control. */
+#define TRANS_V_MAX      0.045f   /* default; runtime-settable with TL       */
+
+/* Minimum commanded acceleration WHILE STUCK, m/s^2. Static breakaway exceeds
+   the kinetic A_c the plant ID measured -- the rotation axis found the same
+   thing and had to split A_static 60 from A_moving 34, a factor of 1.76, before
+   small corrections would start at all (CONTROL_README section 12).
+
+   It matters more here than it did there, because the velocity-shaped approach
+   deliberately commands SMALL accelerations near the target: at 12 cm of error
+   the profile asks for 0.38 m/s^2, and through the weak {2,3} axis only about
+   0.25 of that arrives -- just under breakaway, so the fans spin and nothing
+   moves. Guaranteeing a floor while stuck fixes that without making the whole
+   approach aggressive, which is the trap a bigger gain would fall into. */
+#define TRANS_A_STATIC   0.45f
+
 void trans_init(void);
 
 /* Command a dock-frame target for the platform's MAGNET (not its centre) --
@@ -126,6 +131,22 @@ bool trans_update(const EstState* st, bool poseFresh);
 
 void trans_enable(bool on);
 bool trans_enabled(void);
+
+/* Runtime rotation added to every FAN_ANGLE_DEG entry, degrees. The table has
+   now been wrong three times, each time diagnosed from a position estimate that
+   was itself broken, so it is exposed as a knob rather than re-argued: with a
+   trustworthy stationary reference available, sweeping 0/90/180/270 against the
+   real loop settles it in a couple of minutes. Whatever value wins should be
+   folded into FAN_ANGLE_DEG and this returned to zero. */
+/* Approach speed cap, runtime. Lowering it is the first thing to try against
+   overshoot: arrival speed is what the last centimetres have to absorb, and the
+   platform's only brake is friction plus whatever authority is left after the
+   feedforward has cancelled it. */
+void  trans_setVmax(float v);
+float trans_getVmax(void);
+
+void  trans_setFanRot(float deg);
+float trans_getFanRot(void);
 
 void trans_setGains(float kp, float kd, float ffFrac);
 void trans_getGains(float* kp, float* kd, float* ffFrac);
@@ -167,6 +188,14 @@ float trans_lastErr(void);
 #define TRANS_DIVERGE_SLACK 0.03f    /* m                                      */
 #define TRANS_RUNAWAY_M     0.15f    /* m, post-arrival abort distance         */
 #define TRANS_TIMEOUT_MS    15000
+
+/* Largest move TT will accept. Not a control parameter -- an operator guard.
+   TX/TY are offsets from the current magnet position, so a target is only
+   meaningful once BOTH have been set; an unset axis still holds the power-on
+   0.0, which in the dock frame is the WALL. Sending only TX therefore commands
+   a full-authority charge at the dock, observed 2026-08-20. Nothing on a 61 cm
+   table legitimately needs a 40 cm single move. */
+#define TRANS_MAX_MOVE      0.40f
 
 bool        trans_tripped(void);
 const char* trans_tripReason(void);

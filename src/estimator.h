@@ -62,6 +62,14 @@ typedef struct {
 /* Geometry, metres. Measured 2026-08-20. */
 #define EST_L_CAM   0.1346f   /* lens, ahead of the platform centre          */
 #define EST_L_MAG   0.0946f   /* docking magnet, ahead of the centre         */
+/* Lateral offset of the magnet from the camera axis, metres, POSITIVE = to the
+   platform's LEFT. The magnet was modelled as sitting purely ahead of the
+   centre; measured 2026-08-21 it is 2.3 cm off-axis, which showed up as the
+   dock consistently landing left of centre.
+   This is a BODY-frame offset and it ROTATES with heading, which is why it
+   cannot be a constant subtracted from x -- that would only be right at psi = 0
+   and would grow wrong as the platform turned. Trim at runtime with TM<m>. */
+#define EST_MAG_LAT   0.023f
 #define EST_D_DOCK  0.35f     /* ground magnet, out from the wall            */
 
 /* ---- THE TWO HEADING CONVENTIONS DISAGREE, AND THIS IS WHERE THEY MEET ----
@@ -90,12 +98,114 @@ typedef struct {
    on the whole point of the T39 split, and it rotates the thrust vector. */
 #define EST_THETA_SIGN  (-1.0f)
 
+/* ---- IMU-LED OPERATION (2026-08-20) ---------------------------------------
+   Vision position stopped being trustworthy: it reported the platform 55 cm
+   off-centre on a 61 cm table, reported four differently-angled fans all
+   pushing along dock X with y flat, and reported a coasting platform
+   ACCELERATING to 0.57 m/s with the fans off. Range and bearing are fine; the
+   derived x/y are not. So position now dead-reckons on the accelerometer from a
+   known start pose, and vision is demoted to a slow drift corrector.
+
+   EST_ACC_ROT_DEG is the rotation from the accelerometer's own axes to the body
+   frame (CCW from the camera axis). +90 comes from the four fan directions
+   measured on the accelerometer over three sessions -- -130/-40/+121/+42 --
+   against the physically known mounting of -40/+50/+230/+140: a uniform +90
+   across all four, which is a far stronger derivation than any single
+   measurement, because a common offset over four independent channels cannot
+   come from noise. Runtime-settable with TR<deg> so it can be swept without a
+   reflash if the loop disagrees. */
+#define EST_ACC_ROT_DEG  90.0f
+
 void est_init(void);
+
+/* Place the estimate at a known pose and zero its velocity. This is what makes
+   dead reckoning usable: put the platform on a marked spot, declare where it
+   is, and integrate from there. psi keeps coming from the gyro. */
+void est_setPose(float x, float y);
+
+/* Place the estimate so the MAGNET lands exactly here, back-solving the centre
+   through both lever arms at the current heading. This is what TI wants: the
+   ground truth at dock time is where the magnet is, not where the centre is. */
+void est_setMagnetPose(float mag_x, float mag_y);
+
+void  est_setMagLat(float m);
+float est_getMagLat(void);
+
+/* Zero-velocity update. Call when the platform is KNOWN to be stationary.
+   Double-integrated acceleration drifts as t^2, and the velocity term dominates:
+   a 0.02 m/s^2 residual bias is 0.2 m/s of phantom speed after 10 s, which then
+   sprays position error at 0.2 m/s forever. Clamping velocity the moment we know
+   it is zero removes that entire term, and costs nothing -- it is the one instant
+   where the truth is known exactly without a sensor. */
+void est_zupt(void);
+
+/* Collect the next N valid vision fixes, average them, and ADOPT that as the
+   position outright -- not a blend, a replacement.
+
+   Why averaged rather than a single frame: one fix carries the full per-frame
+   noise, and the whole reason to stop is that we intend to believe this number.
+   Averaging N frames cuts that by sqrt(N) -- 8 frames at ~10 fps is under a
+   second and roughly a 3x improvement -- and it costs nothing, because the
+   platform is stationary anyway while it settles.
+
+   Why a replacement rather than a correction: after a hand-move the dead-reckoned
+   position may be tens of centimetres out. Blending a good measurement with a
+   bad estimate produces something between the two; there is no reason to keep
+   any of the dead-reckoned value once a stationary vision fix exists.
+
+   Heading is deliberately untouched -- psi stays gyro-led (T30/T39). */
+#define EST_SNAP_FRAMES  8
+void est_snapBegin(int nframes);
+bool est_snapDone(void);        /* false while still collecting               */
+void est_snapCancel(void);      /* abandon a snap that has not completed      */
+
+/* Accelerometer low-pass, rad/s equivalent. Prop vibration puts +-1.2 m/s^2 of
+   noise on the raw signal (measured with fans at 60%), and a double integrator
+   turns that into a velocity random walk. Translation bandwidth is omega_n ~1.9
+   rad/s, so a 1.6 Hz corner removes the vibration while touching nothing the
+   controller cares about. */
+#define EST_ACC_TAU  0.10f
+
+/* Vision corrects POSITION only when the platform is essentially stationary.
+   This is the whole lesson of the last few hours: vision x/y is good at rest
+   (tag framed, no blur, no lever-arm dynamics, latency irrelevant) and actively
+   destructive while moving -- it reported four differently-angled fans all
+   pushing along dock X, and a coasting platform accelerating to 0.57 m/s.
+   Gating on speed keeps the good half and discards the bad half, instead of
+   trading one against the other with a single blended gain.
+   HEADING is untouched by this: psi stays gyro-led with vision as a slow
+   absolute reference, exactly as before (T30/T39). */
+#define EST_VIS_VMAX  0.020f    /* m/s -- above this, position ignores vision  */
+
+/* Velocity leak time constant, seconds. Bounds bias-driven velocity at
+   bias*tau instead of letting it integrate without limit.
+
+   ⚠️ LENGTHENED 2.0 -> 10.0. The leak cannot tell a bias-driven velocity from a
+   real one, so at tau = 2 s it was eating genuine motion: applied every 5 ms
+   cycle it decays velocity by 0.9975^200 = 39% PER SECOND, so a 3 s hand-slide
+   was integrated at 22% of true and the estimate badly under-reported where the
+   platform had gone. That is fatal for this demo, where the hand move IS the
+   measurement.
+
+   At 10 s the leak costs ~5%/s -- still enough to keep a stuck-at-rest bias from
+   running away over tens of seconds, but it no longer competes with real motion.
+   The real defence against phantom velocity is the zero-velocity update, which
+   sets it to exactly zero whenever the platform is known still. A leak is a
+   blunt instrument standing in for a measurement; keep it weak and let the ZUPT
+   do the work. */
+#define EST_V_LEAK_TAU  10.0f
+
+/* Dock-frame heading offset, so the caller can command the WHEEL to a heading
+   that makes psi = 0 (square-on to the dock). */
+float est_psiOffset(void);
+
+void  est_setAccRot(float deg);
+float est_getAccRot(void);
 
 /* Call every control cycle (200 Hz) with the elapsed time and the rotation
    controller's own integrated heading. Propagates position at constant
    velocity and recomputes psi from theta + the current offset. */
-void est_predict(float dt, float theta);
+void est_predict(float dt, float theta, float ax_body, float ay_body);
 
 /* Call when a NEW vision frame has arrived (check the seq has changed -- never
    apply the same measurement twice, that is trap T10 and it produces an

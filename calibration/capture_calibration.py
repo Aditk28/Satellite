@@ -99,20 +99,49 @@ def stdin_forwarder(ser):
             break
 
 
+# The HC-05's COM number is assigned by Windows when the pairing is made and
+# changes on its own -- it has been COM7, COM8 and COM12 so far. Typing the
+# current one into --port every session is exactly the kind of manual step that
+# gets it wrong once and loses a run, so the port is ranked and opened
+# automatically. Bluetooth outranks the ST-LINK because the HC-05 is the link
+# the platform actually runs on untethered; the USB VCP is the fallback.
+def rank_port(p):
+    text = f"{p.description} {p.manufacturer or ''}".lower()
+    if "bluetooth" in text:
+        return 0
+    if "stlink" in text or "st-link" in text or "stmicro" in text:
+        return 1
+    if "usb" in text or "serial" in text:
+        return 2
+    return 3
+
+
 def pick_port():
     ports = list(list_ports.comports())
     if not ports:
         print("No serial ports found. Plug in the board (or check the HC-05's paired COM port) and try again.")
         sys.exit(1)
+
     print("Available ports:")
-    for i, p in enumerate(ports):
-        print(f"  [{i}] {p.device}  ({p.description})")
-    choice = input("Pick a port number: ").strip()
-    try:
-        return ports[int(choice)].device
-    except (ValueError, IndexError):
-        print("Not a valid choice.")
-        sys.exit(1)
+    for p in ports:
+        print(f"  {p.device}  ({p.description})")
+
+    # A paired HC-05 shows up as TWO 'Standard Serial over Bluetooth link'
+    # ports, outgoing and incoming, and only the outgoing one opens. There is
+    # nothing in the description to tell them apart, so the test is simply
+    # whether it opens -- which is also the test that matters. Ports already
+    # held by another terminal fail here too, which is the behaviour we want.
+    for p in sorted(ports, key=rank_port):
+        try:
+            serial.Serial(p.device, timeout=0.1).close()
+        except Exception:
+            continue
+        print(f"Using {p.device}  ({p.description})")
+        return p.device
+
+    print("None of those ports would open. Close any other terminal holding one,")
+    print("or pass it explicitly with --port.")
+    sys.exit(1)
 
 
 def main():

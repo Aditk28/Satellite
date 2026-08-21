@@ -6,16 +6,20 @@ static uint32_t s_t[TCAP_MAX];
 static float    s_x[TCAP_MAX], s_y[TCAP_MAX], s_psi[TCAP_MAX];
 static float    s_vx[TCAP_MAX], s_vy[TCAP_MAX];
 static float    s_ax[TCAP_MAX], s_ay[TCAP_MAX];
+static float    s_ix[TCAP_MAX], s_iy[TCAP_MAX], s_wp[TCAP_MAX];
 static uint8_t  s_p1[TCAP_MAX], s_p2[TCAP_MAX], s_p3[TCAP_MAX], s_p4[TCAP_MAX];
 static uint16_t s_age[TCAP_MAX];
 
 static int         s_n       = 0;
 static int         s_div     = 0;
 static bool        s_active  = false;
-static bool        s_pending = false;
+static bool        s_pending = false;   /* frozen, dump not yet finished        */
+static bool        s_queued  = false;   /* already handed to telemTask          */
 static float       s_tx = 0.0f, s_ty = 0.0f;
 static int         s_test = 0;
 static const char* s_reason = "unknown";
+static int         s_probeFan = 0;      /* 0 = a normal TT move, 1-4 = TC probe */
+static float       s_probePct = 0.0f;
 
 void tcap_start(float tx, float ty, int testNum) {
   s_n = 0;
@@ -26,11 +30,21 @@ void tcap_start(float tx, float ty, int testNum) {
   s_reason = "running";
   s_active = true;
   s_pending = false;
+  s_queued = false;
+  s_probeFan = 0;
+  s_probePct = 0.0f;
+}
+
+void tcap_startProbe(int fan, float pct, int testNum) {
+  tcap_start(0.0f, 0.0f, testNum);
+  s_probeFan = fan;
+  s_probePct = pct;
 }
 
 static void tcap_store(const EstState* st, uint32_t poseAgeUs,
                        float ax, float ay,
-                       float p1, float p2, float p3, float p4) {
+                       float p1, float p2, float p3, float p4,
+                       float ix, float iy, float wp) {
   s_t[s_n]   = micros();
   s_x[s_n]   = st->x;
   s_y[s_n]   = st->y;
@@ -39,6 +53,9 @@ static void tcap_store(const EstState* st, uint32_t poseAgeUs,
   s_vy[s_n]  = st->vy;
   s_ax[s_n]  = ax;
   s_ay[s_n]  = ay;
+  s_ix[s_n]  = ix;
+  s_iy[s_n]  = iy;
+  s_wp[s_n]  = wp;
   s_p1[s_n]  = (uint8_t)(p1 + 0.5f);
   s_p2[s_n]  = (uint8_t)(p2 + 0.5f);
   s_p3[s_n]  = (uint8_t)(p3 + 0.5f);
@@ -60,29 +77,39 @@ static bool tcap_tick(void) {
   return true;
 }
 
-void tcap_sample(const EstState* st, uint32_t poseAgeUs) {
+void tcap_sample(const EstState* st, uint32_t poseAgeUs,
+                 float imu_ax, float imu_ay, float omega_p) {
   if (!st || !tcap_tick()) return;
   float p1, p2, p3, p4, ax, ay;
   trans_lastCommand(&ax, &ay, &p1, &p2, &p3, &p4);
-  tcap_store(st, poseAgeUs, ax, ay, p1, p2, p3, p4);
+  tcap_store(st, poseAgeUs, ax, ay, p1, p2, p3, p4, imu_ax, imu_ay, omega_p);
 }
 
-void tcap_sampleProbe(const EstState* st, uint32_t poseAgeUs, const float pct[4]) {
+void tcap_sampleProbe(const EstState* st, uint32_t poseAgeUs, const float pct[4],
+                      float imu_ax, float imu_ay, float omega_p) {
   if (!st || !pct || !tcap_tick()) return;
   /* No commanded acceleration exists during a probe -- the fans are being
      driven open loop -- so those columns are honestly zero rather than stale. */
-  tcap_store(st, poseAgeUs, 0.0f, 0.0f, pct[0], pct[1], pct[2], pct[3]);
+  tcap_store(st, poseAgeUs, 0.0f, 0.0f, pct[0], pct[1], pct[2], pct[3],
+             imu_ax, imu_ay, omega_p);
 }
 
 void tcap_stop(const char* reason) {
   if (!s_active) return;
   s_active = false;
   s_pending = (s_n > 0);
+  s_queued = false;
   s_reason = reason ? reason : "unknown";
 }
 
 bool tcap_active(void)  { return s_active; }
 bool tcap_pending(void) { return s_pending; }
+
+bool tcap_takePending(void) {
+  if (!s_pending || s_queued) return false;
+  s_queued = true;
+  return true;
+}
 
 void tcap_dumpTo(Print& out) {
   float kp, kd, ff;
@@ -95,13 +122,23 @@ void tcap_dumpTo(Print& out) {
   out.print(s_test);
   out.print("/");
   out.print(s_test);
-  out.print(": translate to ");
-  out.print(s_tx, 3);
-  out.print(" ");
-  out.print(s_ty, 3);
-  out.println(" m) ---");
+  if (s_probeFan) {
+    out.print(": fan probe fan");
+    out.print(s_probeFan);
+    out.print(" at ");
+    out.print(s_probePct, 0);
+    out.println(" pct) ---");
+  } else {
+    out.print(": translate to ");
+    out.print(s_tx, 3);
+    out.print(" ");
+    out.print(s_ty, 3);
+    out.println(" m) ---");
+  }
 
-  out.print("mode=translate");
+  out.print(s_probeFan ? "mode=fan_probe" : "mode=translate");
+  out.print(" probe_fan=");  out.print(s_probeFan);
+  out.print(" probe_pct=");  out.print(s_probePct, 1);
   out.print(" target_x=");   out.print(s_tx, 4);
   out.print(" target_y=");   out.print(s_ty, 4);
   out.print(" trans_kp=");   out.print(kp, 3);
@@ -117,7 +154,7 @@ void tcap_dumpTo(Print& out) {
   out.print(" stop_reason="); out.println(s_reason);
 
   out.println("t_us,x,y,psi_deg,vx,vy,magx,magy,errm,ax_cmd,ay_cmd,"
-              "pct1,pct2,pct3,pct4,poseage_ms");
+              "ax_imu,ay_imu,omega_p,pct1,pct2,pct3,pct4,poseage_ms");
 
   for (int i = 0; i < s_n; i++) {
     /* Recomputed here rather than stored -- see the header. The magnet arm
@@ -138,6 +175,9 @@ void tcap_dumpTo(Print& out) {
     out.print(sqrtf(ex * ex + ey * ey), 4);  out.print(",");
     out.print(s_ax[i], 3);                   out.print(",");
     out.print(s_ay[i], 3);                   out.print(",");
+    out.print(s_ix[i], 4);                   out.print(",");
+    out.print(s_iy[i], 4);                   out.print(",");
+    out.print(s_wp[i], 4);                   out.print(",");
     out.print(s_p1[i]);                      out.print(",");
     out.print(s_p2[i]);                      out.print(",");
     out.print(s_p3[i]);                      out.print(",");
@@ -146,4 +186,5 @@ void tcap_dumpTo(Print& out) {
   }
   out.println("--- capture end ---");
   s_pending = false;
+  s_queued  = false;
 }

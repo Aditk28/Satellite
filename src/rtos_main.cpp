@@ -558,6 +558,24 @@ static inline float signf(float x) { return (x > 0.0f) ? 1.0f : ((x < 0.0f) ? -1
 // Direct-writes during boot (telemTask can't drain until the control loop yields).
 void printBoth(const String &s) { telem_print(s); }
 
+/* ---- stepped docking sequencer ---------------------------------------------
+   Dead reckoning error grows as bias*T^2, so the fix is not a better filter but
+   a shorter T: hop a short distance, stop, take a vision fix while stationary
+   (the only condition vision is trustworthy in), then hop again. Each leg only
+   has to survive ~1.5 s of integration instead of the whole trip, which turns a
+   quadratic error into a bounded per-hop one.
+   MOVE  -> translation drives to an intermediate waypoint
+   SETTLE-> thrust off, wait for the rest latch (ZUPT + one vision snap)        */
+#define DOCK_HOP_M      0.06f   /* default metres per leg; runtime via TH      */
+static float dockHopM = DOCK_HOP_M;
+#define DOCK_DONE_M     0.015f  /* close enough to call it docked              */
+#define DOCK_SETTLE_MS  4500    /* rest detect + 8 frames at ~10 fps, plus slack */
+#define DOCK_MAX_HOPS   10
+enum DockPhase { DOCK_OFF, DOCK_MOVE, DOCK_SETTLE };
+static DockPhase dockPhase = DOCK_OFF;
+static uint32_t  dockPhaseMs = 0;
+static int       dockHops = 0;
+
 void stopMotor(const String &why) {
   // Phase 1.3: fans FIRST -- with the props unguarded (B7) they outrank the wheel.
   // This is the HARD kill (pins low as GPIO, latched), not "throttle to zero": a
@@ -569,6 +587,7 @@ void stopMotor(const String &why) {
   fans_stopAll();
   transActive = false;          // Phase 2: X aborts a thrust step mid-sequence
   trans_enable(false);          // Phase 6: X aborts closed-loop translation
+  dockPhase = DOCK_OFF;         // ...and abandons any stepped docking sequence
   controllerEnabled = false;
   ctrlMode = CTRL_IDLE;
   capturing = false;
@@ -968,6 +987,32 @@ void printTimingStats() {
 #define TCAL_PRE_MS   500
 #define TCAL_HOLD_MS  900
 #define TCAL_TOTAL_MS 4000
+/* ---- rest detector (demo) ---------------------------------------------------
+   Answers "has the operator finished moving it by hand", which the demo needs
+   for two separate reasons: it is the cue to announce the tracked position, and
+   it is the instant at which velocity is KNOWN to be zero, which is the only
+   free correction dead reckoning ever gets (est_zupt).
+
+   Thresholds are deliberately loose on time and tight on magnitude. A spurious
+   "at rest" while the platform is still sliding would zero a real velocity and
+   corrupt the position; a late one costs nothing but a second. */
+#define REST_ACCEL     0.10f    /* m/s^2, bias-removed                         */
+#define REST_OMEGA     0.06f    /* rad/s                                       */
+#define REST_MS        500      /* continuously quiet for this long            */
+#define MOVING_ACCEL   0.25f    /* re-arms the detector                        */
+/* TB: accel-bias measurement with the fans at idle. Sequenced in the control
+   loop rather than blocking in the command path, because it has to keep petting
+   the fan dead-man for the whole window (B12) and must not stall the 200 Hz loop. */
+#define TBIAS_SPIN_MS  1500     /* let the props reach steady state first      */
+#define TBIAS_MEAS_MS  2500     /* ~500 samples at 200 Hz                      */
+static bool     tbiasActive  = false;
+static uint32_t tbiasStartMs = 0;
+static double   tbiasSumX = 0.0, tbiasSumY = 0.0;
+static uint32_t tbiasN = 0;
+
+static bool     restLatched = false;
+static uint32_t restQuietMs = 0;
+
 static bool     tcalActive  = false;
 static float    tcalPct     = 0.0f;
 static uint32_t tcalStartMs = 0;
@@ -1051,7 +1096,7 @@ void controlUpdate(float dt) {
   // and having a converged estimate the moment control is enabled is worth
   // more than the handful of microseconds it costs. Predict every cycle;
   // correct only when pi_link has a frame we have not already used (T10).
-  est_predict(dt, theta);
+  est_predict(dt, theta, accel_x, accel_y);
   {
     PiPose pp;
     if (pi_getPose(&pp)) est_correct(&pp, theta, omega_p);
@@ -1069,18 +1114,33 @@ void controlUpdate(float dt) {
     // Record the move. Sampling happens AFTER trans_update so the throttles and
     // commanded acceleration in the row are the ones this cycle produced, not
     // last cycle's.
-    if (tcap_active()) {
-      if (haveEst) tcap_sample(&es, pi_ageUs());
+    // ⚠️ `&& !tcalActive` IS LOAD-BEARING. A TC probe drives one fan open loop
+    // and never enables the translation CONTROLLER, so without it the
+    // "controller stopped -> freeze the capture" test below is true on the very
+    // first control cycle of every probe. tcap_sample decimates 10:1, so at that
+    // moment s_n == 0, and tcap_stop() only marks a capture pending `if (s_n>0)`
+    // -- so the probe was being discarded silently, one cycle in, every time.
+    // The fans still ran and the FAN PROBE line still printed, which is exactly
+    // what made it look like the dump had failed rather than the recorder.
+    /* `dockPhase == DOCK_OFF` is load-bearing for the same reason `!tcalActive`
+       is: a stepped dock spends whole seconds with translation DISABLED between
+       hops, and TG enters via SETTLE so it is disabled on the very first cycle.
+       Without this the capture is stopped one cycle in with zero samples and
+       silently discarded -- which is exactly why the vision runs produced empty
+       folders. The sequencer stops the capture itself when it finishes. */
+    if (tcap_active() && !tcalActive) {
+      if (haveEst) tcap_sample(&es, pi_ageUs(), accel_x, accel_y, omega_p);
       // The controller disables itself on a trip; TS and X disable it from the
       // command path. Either way the recorder finds out here, from one place,
-      // rather than every stop path having to remember to call it.
-      //
-      // Checked AFTER the sample, and via tcap_pending() rather than by testing
-      // trans_enabled() alone: a full buffer stops the recorder from INSIDE
-      // tcap_sample while the controller is still happily running, so a
-      // stop-condition test that only looks at the controller would leave that
-      // capture frozen and never dumped.
-      if (!trans_enabled() && tcap_active()) {
+      // rather than every stop path having to remember to call it. Re-checking
+      // tcap_active() after the sample matters because a full buffer stops the
+      // recorder from INSIDE tcap_sample.
+      /* Only the STOP test is gated on the sequencer: a stepped dock spends whole
+         seconds with translation disabled between hops, and TG enters via SETTLE
+         so it is disabled on the very first cycle. Sampling must keep running
+         through all of that -- gating the sample as well recorded nothing at all
+         and then discarded the empty buffer. The sequencer stops it itself. */
+      if (dockPhase == DOCK_OFF && tcap_active() && !trans_enabled()) {
         tcap_stop(trans_tripped() ? (strstr(trans_tripReason(), "TIMEOUT")
                                        ? "timeout" : "diverged")
                                   : "operator_stop");
@@ -1096,7 +1156,7 @@ void controlUpdate(float dt) {
       applyFanStep(pct);
       float p[4] = {0, 0, 0, 0};
       if (fanSel >= 1 && fanSel <= 4) p[fanSel - 1] = pct;
-      if (haveEst) tcap_sampleProbe(&es, pi_ageUs(), p);
+      if (haveEst) tcap_sampleProbe(&es, pi_ageUs(), p, accel_x, accel_y, omega_p);
       if (el >= TCAL_TOTAL_MS) {
         tcalActive = false;
         applyFanStep(0.0f);
@@ -1104,7 +1164,133 @@ void controlUpdate(float dt) {
       }
     }
 
-    if (tcap_pending()) telem_run(dumpTransCapture);
+    // take-once, NOT tcap_pending(): pending stays true until the dump FINISHES
+    // (~0.5 s over HC-05), and this line runs at 200 Hz, so polling pending
+    // re-enqueues the same dump every 5 ms until the depth-24 queue fills --
+    // the CSV emitted ~24 times and the remainder counted as telem drops.
+    /* ---- TB bias-at-idle sequencer. */
+    if (tbiasActive) {
+      uint32_t el = millis() - tbiasStartMs;
+      fans_setAll(TRANS_IDLE_PCT, TRANS_IDLE_PCT, TRANS_IDLE_PCT, TRANS_IDLE_PCT);
+      if (el >= TBIAS_SPIN_MS) {
+        /* accel_x/y already have the OLD bias removed, so what accumulates here
+           is the residual -- exactly the correction to apply. */
+        tbiasSumX += accel_x; tbiasSumY += accel_y; tbiasN++;
+      }
+      if (el >= TBIAS_SPIN_MS + TBIAS_MEAS_MS) {
+        tbiasActive = false;
+        fans_setAll(0, 0, 0, 0);
+        if (tbiasN > 0) {
+          float dx = (float)(tbiasSumX / tbiasN), dy = (float)(tbiasSumY / tbiasN);
+          accelBiasX += dx; accelBiasY += dy;
+          est_zupt();
+          telem_print(String("BIAS @ IDLE: residual was (") + String(dx, 4) + ", "
+                      + String(dy, 4) + ") m/s^2 over " + String(tbiasN)
+                      + " samples -> bias now (" + String(accelBiasX, 4) + ", "
+                      + String(accelBiasY, 4) + "). Compare with B (fans off).");
+        }
+      }
+    }
+
+    /* ---- rest detection. Only meaningful when the controller is NOT driving:
+       during a commanded move the platform is legitimately slow at both ends and
+       a ZUPT there would erase real velocity mid-approach. */
+    if (!trans_enabled() && !tcalActive && !tbiasActive) {
+      float am = sqrtf(accel_x * accel_x + accel_y * accel_y);
+      bool quiet = (am < REST_ACCEL) && (fabsf(omega_p) < REST_OMEGA);
+      if (quiet) {
+        if (restQuietMs == 0) restQuietMs = millis();
+        if (!restLatched && (millis() - restQuietMs) >= REST_MS) {
+          restLatched = true;
+          est_zupt();                 /* velocity is known-zero: take the fix  */
+          /* And take ONE vision fix, if there is one. This is the only moment
+             vision is at its best -- stationary, tag framed, no motion blur --
+             and it is the moment dead reckoning has drifted furthest. One
+             snapshot per hand-move, rather than the continuous correction that
+             was corrupting position while moving. */
+          /* Averaged pose adoption, not a single frame -- see est_snapBegin. */
+          if (pi_state() == PI_FRESH) est_snapBegin(EST_SNAP_FRAMES);
+          EstState e;
+          if (est_get(&e)) {
+            telem_print(String("AT REST -- magnet at (") + String(e.mag_x, 3)
+                        + ", " + String(e.mag_y, 3) + ")  psi="
+                        + String(degrees(e.psi), 1) + "deg   dock is "
+                        + String(sqrtf(e.mag_x * e.mag_x
+                            + (e.mag_y - EST_D_DOCK) * (e.mag_y - EST_D_DOCK))
+                            * 100.0f, 1) + " cm away.  TG to dock, X to stop.");
+          }
+        }
+      } else {
+        restQuietMs = 0;
+        if (am > MOVING_ACCEL) restLatched = false;   /* moving again          */
+      }
+    }
+
+    /* ---- stepped docking sequencer. */
+    if (dockPhase != DOCK_OFF) {
+      EstState de;
+      bool haveDe = est_get(&de);
+      float rem = haveDe ? sqrtf(de.mag_x * de.mag_x
+                    + (de.mag_y - EST_D_DOCK) * (de.mag_y - EST_D_DOCK)) : 0.0f;
+
+      if (dockPhase == DOCK_MOVE) {
+        if (!trans_enabled()) {
+          /* Tripped or stopped by the guard -- do not quietly start another leg. */
+          dockPhase = DOCK_OFF;
+          tcap_stop("dock_aborted");
+          telem_print("DOCK ABORTED -- translation stopped mid-leg.");
+        } else if (trans_lastErr() < TRANS_DEADZONE) {
+          trans_enable(false);
+          restLatched = false; restQuietMs = 0;   /* re-arm the rest detector  */
+          dockPhase = DOCK_SETTLE; dockPhaseMs = millis();
+        }
+      } else if (dockPhase == DOCK_SETTLE) {
+        /* Leave as soon as the platform is confirmed at rest (that latch is what
+           applies the ZUPT and the one vision fix), or on a timeout so a missing
+           Pi cannot stall the sequence. */
+        /* Wait for BOTH: the platform confirmed at rest, and the averaged vision
+           fix actually collected. Leaving on rest alone would step off with the
+           snap half-finished, which is the moment the estimate is worst. The
+           timeout still bounds it so a missing Pi cannot stall the sequence. */
+        bool ready = (restLatched && est_snapDone())
+                     || (millis() - dockPhaseMs) > DOCK_SETTLE_MS;
+        if (ready && haveDe) {
+          if (rem < DOCK_DONE_M) {
+            dockPhase = DOCK_OFF;
+            tcap_stop("docked");
+            telem_print(String("DOCKED -- magnet at (") + String(de.mag_x, 3)
+                        + ", " + String(de.mag_y, 3) + "), " + String(rem * 100.0f, 1)
+                        + " cm from target, in " + String(dockHops) + " hops.");
+          } else if (dockHops >= DOCK_MAX_HOPS) {
+            dockPhase = DOCK_OFF;
+            tcap_stop("dock_gave_up");
+            telem_print(String("DOCK GAVE UP after ") + String(dockHops)
+                        + " hops, still " + String(rem * 100.0f, 1) + " cm out.");
+          } else {
+            /* Next waypoint: one hop along the line to the dock, or the dock
+               itself if that is closer. Aiming at an intermediate point rather
+               than the dock keeps each leg short enough to dead-reckon. */
+            float ux = (0.0f - de.mag_x) / rem;
+            float uy = (EST_D_DOCK - de.mag_y) / rem;
+            float step = (rem < dockHopM) ? rem : dockHopM;
+            trans_setTarget(de.mag_x + ux * step, de.mag_y + uy * step);
+            /* Abandon any snap still collecting. If the settle timed out with
+               frames outstanding, those frames would land DURING the hop and be
+               adopted as the position -- a stationary measurement applied to a
+               moving platform, which is the one thing this whole design exists
+               to avoid. */
+            est_snapCancel();
+            trans_enable(true);
+            dockHops++;
+            dockPhase = DOCK_MOVE; dockPhaseMs = millis();
+            telem_print(String("hop ") + String(dockHops) + ": " + String(step * 100.0f, 1)
+                        + " cm, " + String(rem * 100.0f, 1) + " cm to go");
+          }
+        }
+      }
+    }
+
+    if (tcap_takePending()) telem_run(dumpTransCapture);
   }
 
   if (!controllerEnabled || ctrlMode == CTRL_IDLE) {
@@ -1319,7 +1505,17 @@ void handleLine(String s) {
   // 'Y' and 'I' are captures too and MUST be in this guard -- omitting them let a
   // second Y reset capN while the first dump was still streaming out of cap_*,
   // which silently lost the run (observed 2026-08-13).
-  if ((c == 'T' || c == 'O' || c == 'C' || c == 'Y' || c == 'I') && telem_busy()) {
+  // ...but this guard is about the SHARED cap_* buffer, and the translation
+  // sub-commands (TX/TY/TZ/TT/TS/TP/TD/TF/TC) do not touch it -- they use the
+  // separate tcap buffer, which guards itself. Letting them fall in here is a
+  // deadlock waiting to happen: TT and TC now REQUIRE heading control, CTRL_HOLD
+  // queues a telemetry row every 100 ms, and telem_busy() is "anything queued",
+  // so a translation command landing in that window is rejected for a capture
+  // that is not running. Intermittent by construction, and the refusal scrolls
+  // past inside the 10 Hz HOLD stream.
+  bool transSub = (c == 'T' && s.length() > 1 && isAlpha(s.charAt(1)));
+  if ((c == 'T' || c == 'O' || c == 'C' || c == 'Y' || c == 'I')
+      && !transSub && telem_busy()) {
     printBoth("busy: previous capture still dumping -- wait, then resend");
     return;
   }
@@ -1376,15 +1572,25 @@ void handleLine(String s) {
           else                 trans_setTarget(0.0f, EST_D_DOCK);
         }
         else if (sub == 'T') {
-          if (pi_state() != PI_FRESH) {
-            printBoth("REFUSED: pose is not FRESH. Translation will not start "
-                      "blind -- check the Pi is sending and the tags are seen.");
-            break;
+          /* Asks whether we HAVE a pose, not whether VISION does -- position is
+             dead-reckoned now, and a valid estimate outlives tag visibility.
+             Requiring PI_FRESH here refused every move whenever the Pi was off. */
+          {
+            EstState ev;
+            if (!est_get(&ev)) {
+              printBoth("REFUSED: no pose. Send TI first (TI = docked, TI<m> = "
+                        "centre <m> out) so dead reckoning has an origin.");
+              break;
+            }
           }
           // The recorder's buffer stays live until its dump finishes, so a new
           // move cannot start on top of one still being written out. Same guard
           // the T/O/C captures use, and the one T22 found missing.
-          if (telem_busy()) {
+          // tcap_pending(), NOT telem_busy(). The question is whether the
+          // TRANSLATION buffer is still being written out; telem_busy() answers
+          // "is anything at all queued", which under CTRL_HOLD -- now mandatory
+          // below -- is true for a slice of every 100 ms telemetry row.
+          if (tcap_pending()) {
             printBoth("REFUSED: previous capture still dumping. Wait for "
                       "'--- capture end ---'.");
             break;
@@ -1402,6 +1608,26 @@ void handleLine(String s) {
                       "translation steers by psi and the fans themselves yaw "
                       "the platform.");
             break;
+          }
+          // Sanity-check the implied move BEFORE arming. TX/TY are offsets, so
+          // a target is only meaningful once both axes have been set against the
+          // current pose -- and the power-on default of (0,0) is the WALL. Sending
+          // only TX left ty at 0.0 and commanded the magnet 45 cm into the dock at
+          // full authority, which is exactly what it did (2026-08-20). A move
+          // larger than the table is never intended.
+          {
+            EstState e;
+            if (est_get(&e)) {
+              float ex = tx - e.mag_x, ey = ty - e.mag_y;
+              float d = sqrtf(ex * ex + ey * ey);
+              if (d > TRANS_MAX_MOVE) {
+                printBoth("REFUSED: that target is " + String(d * 100.0f, 0)
+                          + " cm away. Set BOTH axes (TX<off> and TY<off>) -- an "
+                          "unset one still holds the power-on default of 0.0, "
+                          "which is the wall.");
+                break;
+              }
+            }
           }
           trans_enable(true);
           trans_getTarget(&tx, &ty);
@@ -1433,6 +1659,160 @@ void handleLine(String s) {
                     + " t_settle=" + String((wn > 0.0f) ? 5.714f / wn : 0.0f, 1) + "s");
           break;
         }
+        // TI<m> -- declare the start pose: on the dock centreline, <m> metres
+        // out from the wall. Dead reckoning has to integrate FROM somewhere, and
+        // with vision position untrusted that somewhere is a marked spot on the
+        // table rather than a fix. x is 0 because the centreline is the one line
+        // you can place the platform on repeatably by eye.
+        else if (sub == 'I') {
+          /* No argument = DOCKED, which is where the demo starts. The magnet
+             sits on the dock, so the CENTRE is one magnet arm further out. */
+          /* Declared in MAGNET coordinates -- the ground truth at dock time is
+             where the magnet is. The centre is back-solved through both lever
+             arms, so the lateral offset is handled once, here, rather than being
+             re-applied at every use. */
+          if (v2 > 0.0f) est_setMagnetPose(0.0f, v2);
+          else           est_setMagnetPose(0.0f, EST_D_DOCK);
+          restLatched = false; restQuietMs = 0;
+          EstState e0; est_get(&e0);
+          printBoth(String("pose SET: magnet (") + String(e0.mag_x, 3) + ", "
+                    + String(e0.mag_y, 3) + (v2 > 0.0f ? ") " : ") = DOCKED ")
+                    + " centre (" + String(e0.x, 3) + ", " + String(e0.y, 3)
+                    + ")  magLat=" + String(est_getMagLat(), 3));
+          break;
+        }
+        /* TG -- go dock. Exempt from TRANS_MAX_MOVE because it is a NAMED
+           destination rather than a typed offset: the guard exists to catch an
+           unset axis defaulting to the wall, and this target is the dock by
+           construction. Also points the wheel square-on, since the magnet only
+           mates if the platform faces the dock. */
+        else if (sub == 'G') {
+          if (!fans_armed() || fans_killed()) {
+            printBoth("fans not ready -- R to re-arm"); break;
+          }
+          EstState e;
+          if (!est_get(&e)) { printBoth("no pose yet -- send TI first"); break; }
+          if (tcap_pending()) { printBoth("REFUSED: capture still dumping"); break; }
+          target = wrapPi(est_psiOffset());   /* wheel target that makes psi=0 */
+          ctrlMode = CTRL_HOLD; controllerEnabled = true;
+          tcap_start(0.0f, EST_D_DOCK, ++stepCount);
+          /* Enter via SETTLE so the first thing that happens is a rest check and
+             a vision fix, before any thrust -- the estimate at TG time is the
+             least trustworthy it will ever be, having just dead-reckoned a hand
+             move. */
+          dockHops = 0;
+          dockPhase = DOCK_SETTLE; dockPhaseMs = millis();
+          restLatched = false; restQuietMs = 0;
+          printBoth("DOCKING from (" + String(e.mag_x, 3) + ", "
+                    + String(e.mag_y, 3) + ") in " + String(DOCK_HOP_M * 100.0f, 0)
+                    + " cm hops, max " + String(TRANS_V_MAX * 100.0f, 0)
+                    + " cm/s.  PROPS ARE LIVE.  X to stop.");
+          break;
+        }
+        // TR<deg> -- accelerometer-to-body rotation, the one constant dead
+        // reckoning cannot derive for itself. Runtime-settable so it can be
+        // swept 0/90/180/270 against the real loop instead of re-argued.
+        else if (sub == 'R') {
+          if (s.length() > 2) est_setAccRot(v2);
+          printBoth("accel->body rotation = " + String(est_getAccRot(), 1) + " deg");
+          break;
+        }
+        /* TL<m/s> -- approach speed cap. */
+        else if (sub == 'L') {
+          if (s.length() > 2) trans_setVmax(v2);
+          printBoth("approach speed cap = " + String(trans_getVmax() * 100.0f, 1)
+                    + " cm/s   (taper starts "
+                    + String(trans_getVmax() / 0.50f * 100.0f, 1) + " cm out)");
+          break;
+        }
+        /* TH<m> -- hop length for the stepped dock. Shorter hops mean less
+           dead reckoning per leg and more vision fixes on the way in, at the
+           cost of more stop/start cycles -- and each start has to break stiction
+           again, so there is a floor below which it simply stops moving. */
+        else if (sub == 'H') {
+          if (s.length() > 2 && v2 >= 0.02f && v2 <= 0.30f) dockHopM = v2;
+          printBoth("dock hop = " + String(dockHopM * 100.0f, 1) + " cm");
+          break;
+        }
+        /* TW<0|1> -- arm/disarm the INA219 power trips (undervoltage 10.0 V and
+           overcurrent 2500 mA). Monitoring is UNAFFECTED either way: min/max
+           bus volts and peak current keep being recorded and still show up in
+           G, so nothing is lost from the data, only the safe-stop.
+           Why it exists: the fans sag the shared pack well below 10 V under
+           thrust (8.40 V measured), and the trip is on the WHEEL supply, so it
+           fires on fan draw it was never sized for (B9) and kills a docking run
+           mid-approach for a condition that is not actually dangerous.
+           ⚠️ The undervoltage trip is also the only thing watching the LiPo. It
+           is fine to run without it for a demo; it is not fine to leave it off
+           and walk away with a discharging pack. */
+        else if (sub == 'W') {
+          bool on = (v2 >= 0.5f);
+          if (on) safety_setPowerLimits(10.0f, 2500.0f);
+          else    safety_setPowerLimits(0.0f, 0.0f);
+          printBoth(on ? "power trips ARMED (<10.0V, >2500mA)"
+                       : "power trips DISABLED -- monitoring still runs, no "
+                         "safe-stop. Watch the pack yourself.");
+          break;
+        }
+        /* TM<m> -- magnet lateral offset, + = left of the camera axis. */
+        else if (sub == 'M') {
+          if (s.length() > 2) est_setMagLat(v2);
+          printBoth("magnet lateral offset = " + String(est_getMagLat(), 4) + " m");
+          break;
+        }
+        /* TA<deg> -- rotate the whole fan table at runtime. 0/90/180/270. */
+        else if (sub == 'A') {
+          if (s.length() > 2) trans_setFanRot(v2);
+          printBoth("fan table rotation = " + String(trans_getFanRot(), 0)
+                    + " deg  (fan1 " + String(-40.0f + trans_getFanRot(), 0)
+                    + ", fan2 " + String(50.0f + trans_getFanRot(), 0)
+                    + ", fan3 " + String(230.0f + trans_getFanRot(), 0)
+                    + ", fan4 " + String(140.0f + trans_getFanRot(), 0) + ")");
+          break;
+        }
+        /* TB -- measure accel bias WITH THE FANS AT IDLE, which is the condition
+           the estimator actually runs in. `B` measures with the fans off, and a
+           MEMS accelerometer rectifies vibration: prop shake is not zero-mean
+           after the sensor's own nonlinearity, so the DC offset with four props
+           spinning is not the one measured while still. The bias is not wrong,
+           it is measured in the wrong condition -- and a double integrator turns
+           the difference into position drift within seconds.
+           Spins all four at TRANS_IDLE_PCT (12%, far below the ~35% breakaway),
+           lets them settle, then averages. The platform must be still. */
+        else if (sub == 'B') {
+          if (!fans_armed() || fans_killed()) {
+            printBoth("fans not ready -- R to re-arm"); break;
+          }
+          printBoth("BIAS @ IDLE: spinning all four at "
+                    + String(TRANS_IDLE_PCT, 0) + "% -- hold still, ~4 s. KEEP CLEAR.");
+          tbiasActive = true; tbiasStartMs = millis();
+          tbiasSumX = tbiasSumY = 0.0; tbiasN = 0;
+          break;
+        }
+        /* TN -- snap position to vision NOW, one frame, full weight. Manual
+           version of what the AT REST latch does automatically; use it if the
+           printed position looks wrong before committing to a dock. */
+        else if (sub == 'N') {
+          if (pi_state() != PI_FRESH) { printBoth("no fresh pose to snap to"); break; }
+          est_snapBegin(EST_SNAP_FRAMES);
+          printBoth("adopting position from the next " + String(EST_SNAP_FRAMES)
+                    + " vision frames (averaged)");
+          break;
+        }
+        /* TV<gain> -- how hard vision corrects dead-reckoned POSITION.
+           TV0 switches vision off entirely and runs pure IMU, which is the
+           fallback if vision produces another 50 cm outlier mid-demo. Heading
+           correction is untouched: psi from vision has always been fine, it is
+           the derived x/y that is not. */
+        else if (sub == 'V') {
+          float a, b, c;
+          est_getGains(&a, &b, &c);
+          if (s.length() > 2) est_setGains(v2 <= 0.0f ? 1e-6f : v2, -1.0f, -1.0f);
+          est_getGains(&a, &b, &c);
+          printBoth("vision position gain aPos=" + String(a, 3)
+                    + (a < 0.001f ? "  (OFF -- pure IMU)" : ""));
+          break;
+        }
         // TC<pct> -- single-fan direction probe. The one measurement that has
         // survived every attempt to infer this indirectly: ONE fan, heading
         // HELD by the wheel so psi cannot wander, position from VISION so the
@@ -1445,27 +1825,32 @@ void handleLine(String s) {
           if (!fans_armed() || fans_killed()) {
             printBoth("fans not ready -- R to re-arm"); break;
           }
-          if (telem_busy()) { printBoth("REFUSED: capture still dumping"); break; }
+          if (tcap_pending()) { printBoth("REFUSED: capture still dumping"); break; }
           if (!controllerEnabled || ctrlMode == CTRL_IDLE) {
             printBoth("REFUSED: send H<deg> first. Holding heading is the whole "
                       "point -- a wandering psi is what ruined the open-loop "
                       "measurements.");
             break;
           }
-          if (pi_state() != PI_FRESH) { printBoth("REFUSED: pose not FRESH"); break; }
+          {
+            EstState ev;
+            if (!est_get(&ev)) { printBoth("REFUSED: no pose -- send TI first"); break; }
+          }
           if (fanSel < 1 || fanSel > 4) {
             printBoth("select a single fan first with S1..S4"); break;
           }
           if (v2 <= 0.0f) v2 = 45.0f;
           tcalPct = v2; tcalActive = true; tcalStartMs = millis();
-          tcap_start(0.0f, 0.0f, ++stepCount);
+          tcap_startProbe(fanSel, v2, ++stepCount);
           printBoth("FAN PROBE: fan" + String(fanSel) + " at " + String(v2, 0)
                     + "% -- " + String(TCAL_PRE_MS) + "ms quiet / "
                     + String(TCAL_HOLD_MS) + "ms thrust / coast. KEEP CLEAR.");
           break;
         }
-        else { printBoth("TX<m> TY<m> offsets from magnet, TZ dock, TT go, "
-                         "TS stop, TP/TD/TF gains, TC<pct> fan probe"); break; }
+        else { printBoth("TI[m] set pose (no arg = docked) | TG dock now | "
+                         "TX/TY offsets | TZ dock target | TT go | TS stop | "
+                         "TP/TD/TF gains | TR<deg> accel rot | TV<g> vision gain | "
+                         "TC<pct> fan probe"); break; }
         trans_getTarget(&tx, &ty);
         // Echo the MAGNET position and the resulting error, not just the target.
         // The target is the magnet's destination, but G prints the platform
