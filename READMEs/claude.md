@@ -147,15 +147,41 @@ psi = theta + psi_offset, and ONLY the offset is estimated
 `PI_FLAG_AMBIGUOUS` drops the heading gain to a quarter. Accelerometer prediction
 deliberately not used yet -- its body-frame axis signs are unverified (T11).
 
-**Phase 6 WRITTEN BUT NEVER RUN (2026-08-20).** `src/translation.*` builds and is wired
-into the control loop and the command parser. PD in ACCELERATION units -- no mass term,
-because B14 identified the plant so mass cancels; the guide's `K_p = omega_n^2 * m` is
-wrong for this build. Coulomb feedforward ported from rotation (opposite-signed branches,
-CONTROL_README section 6). Dock->body rotation by psi. Allocation onto two opposing fan
-pairs with 12% idle bias, then `throttle = sqrt(A / 2.1e-4)`.
+**Phase 6 RUNS AND CONVERGES (2026-08-20): 3.5 cm -> 1.6 mm. NOT TUNED.**
+`src/translation.*` is PD in ACCELERATION units -- no mass term, because B14 identified
+the plant so mass cancels; the guide's `K_p = omega_n^2 * m` is wrong for this build.
+Dock->body rotation by psi, allocation onto two opposing fan pairs with 12% idle bias,
+then `throttle = sqrt(A / 2.1e-4)`.
 
-Fan geometry, degrees CCW from the camera axis: **fan1 -40, fan2 +50, fan4 +140,
-fan3 +230.** Pairs are 1/4 and 2/3.
+**Four latent bugs stood between "builds" and "converges." All fixed; all in
+`TRANSLATION_DOCKING.md` Appendix A, and all worth reading before touching this again:**
+
+- **T41 -- the estimator mixed two rotation conventions.** `theta` is CW-positive,
+  the dock frame is CCW-positive, and `psi = theta + offset` silently requires them to
+  agree. **Every static Phase 5 test was structurally incapable of seeing this** --
+  with `theta` constant the offset absorbs any sign error. Fixed with a named
+  `EST_THETA_SIGN` where the conventions meet, NOT by touching `GYRO_SIGN`.
+- **T42 / B28 -- the fan angle table was wrong twice**, 166 deg then 75 deg, both
+  times looking plausible. A good relative measurement plus a shaky anchor is a shaky
+  answer. The closed loop is the only thing that samples the whole chain at once.
+- **T43 -- the Coulomb feedforward MOVING branch carried rotation's sign without
+  rotation's `-a`**, so it ADDED drag instead of cancelling it. Translation needs
+  `+A_c*v_hat`; rotation needs negative only because the wheel pushes the platform the
+  other way. Check: with the correct sign the two branches agree when moving toward
+  target, so the `V_MOVING` crossing is smooth.
+- **T44 -- the divergence guard derived its threshold from `bestErr`**, so it tightened
+  as the controller improved and shot the first successful run. Now fixed-distance once
+  arrived, and the timeout stops applying after arrival.
+
+Fan geometry, degrees CCW from the camera axis: **fan1 -130, fan2 -40, fan3 +140,
+fan4 +50** (the originally remembered table rotated -90). Pairs are 1/4 and 2/3.
+
+⚠️ **Fans 2 and 3 deliver 63-69% of fans 1 and 4.** Not compensated in software (B29).
+**Re-measure all four with `I50` after any prop or ESC-direction change.**
+
+New tools: `src/trans_capture.*` records a `TT` move at 20 Hz to CSV; `TP`/`TD`/`TF`
+set `Kp`/`Kd`/`ff` at runtime. `TT` refuses if heading control is IDLE (T46), and
+`TX`/`TY` echo the implied move so a centre-vs-magnet mix-up shows before arming (T45).
 
 ```
 TX<m> TY<m>   set the dock-frame target for the MAGNET (not the platform centre)

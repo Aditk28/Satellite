@@ -153,6 +153,7 @@
 #include "pi_link.h"         // Translation 3.1: USART6 pose link, sole owner of that port
 #include "estimator.h"       // Translation 5.1: dock-relative pose estimator
 #include "translation.h"     // Translation 6: x/y control via the fans
+#include "trans_capture.h"   // Translation 6: 20 Hz recorder for a closed-loop move
 #include <Adafruit_INA219.h>
 
 // ------------------------- hardware -------------------------
@@ -886,6 +887,11 @@ void dumpCaptureTo(Print &out) {
 // control task once telem_activate() has run.
 void dumpCapture() { dumpCaptureTo(Serial); dumpCaptureTo(hc05Serial); }
 
+// Translation 6. Same two-port pattern, same telemTask-only rule. Separate from
+// dumpCapture because the translation recorder is a separate buffer with its own
+// CSV format -- see trans_capture.h for why it is not more columns on the main one.
+void dumpTransCapture() { tcap_dumpTo(Serial); tcap_dumpTo(hc05Serial); }
+
 extern TaskHandle_t hControl;    // defined with the task bodies further down
 extern TaskHandle_t hFoc;
 
@@ -1030,8 +1036,31 @@ void controlUpdate(float dt) {
   // says nothing about whether the fans should be holding station.
   {
     EstState es;
-    if (est_get(&es)) trans_update(&es, pi_state() == PI_FRESH);
-    else              trans_update(NULL, false);
+    bool haveEst = est_get(&es);
+    if (haveEst) trans_update(&es, pi_state() == PI_FRESH);
+    else         trans_update(NULL, false);
+
+    // Record the move. Sampling happens AFTER trans_update so the throttles and
+    // commanded acceleration in the row are the ones this cycle produced, not
+    // last cycle's.
+    if (tcap_active()) {
+      if (haveEst) tcap_sample(&es, pi_ageUs());
+      // The controller disables itself on a trip; TS and X disable it from the
+      // command path. Either way the recorder finds out here, from one place,
+      // rather than every stop path having to remember to call it.
+      //
+      // Checked AFTER the sample, and via tcap_pending() rather than by testing
+      // trans_enabled() alone: a full buffer stops the recorder from INSIDE
+      // tcap_sample while the controller is still happily running, so a
+      // stop-condition test that only looks at the controller would leave that
+      // capture frozen and never dumped.
+      if (!trans_enabled() && tcap_active()) {
+        tcap_stop(trans_tripped() ? (strstr(trans_tripReason(), "TIMEOUT")
+                                       ? "timeout" : "diverged")
+                                  : "operator_stop");
+      }
+    }
+    if (tcap_pending()) telem_run(dumpTransCapture);
   }
 
   if (!controllerEnabled || ctrlMode == CTRL_IDLE) {
@@ -1303,16 +1332,81 @@ void handleLine(String s) {
                       "blind -- check the Pi is sending and the tags are seen.");
             break;
           }
+          // The recorder's buffer stays live until its dump finishes, so a new
+          // move cannot start on top of one still being written out. Same guard
+          // the T/O/C captures use, and the one T22 found missing.
+          if (telem_busy()) {
+            printBoth("REFUSED: previous capture still dumping. Wait for "
+                      "'--- capture end ---'.");
+            break;
+          }
+          // HEADING CONTROL MUST BE RUNNING. The allocator rotates the demand
+          // from the dock frame into the body frame by psi, so an uncontrolled
+          // heading rotates the thrust vector out from under the controller
+          // WHILE it is thrusting -- and the fans themselves supply the yaw
+          // torque that does it (2-3 rad/s^2, guide 2.4). Measured 2026-08-20
+          // with the wheel IDLE: psi swept 0.7 -> 25 deg during one 3 s move,
+          // which is 25 deg of thrust misdirection accumulated by the fans'
+          // own disturbance. That is a positive feedback path, not a nuisance.
+          if (!controllerEnabled || ctrlMode == CTRL_IDLE) {
+            printBoth("REFUSED: heading control is IDLE. Send H<deg> first -- "
+                      "translation steers by psi and the fans themselves yaw "
+                      "the platform.");
+            break;
+          }
           trans_enable(true);
           trans_getTarget(&tx, &ty);
+          tcap_start(tx, ty, ++stepCount);
           printBoth("TRANSLATE -> magnet target (" + String(tx, 3) + ", "
-                    + String(ty, 3) + ")  PROPS ARE LIVE");
+                    + String(ty, 3) + ")  PROPS ARE LIVE, capturing at "
+                    + String(200 / TCAP_DECIM) + " Hz");
           break;
         }
         else if (sub == 'S') { trans_enable(false); printBoth("translation STOP"); break; }
-        else { printBoth("TX<m> TY<m> set target, TT go, TS stop"); break; }
+        // Runtime gains. trans_setGains() existed from the start but nothing
+        // ever called it, so every gain change meant a reflash -- which is not
+        // a tuning loop. Same role as P/D/F on the rotation axis.
+        else if (sub == 'P' || sub == 'D' || sub == 'F') {
+          float kp, kd, ff;
+          trans_getGains(&kp, &kd, &ff);
+          if      (sub == 'P') trans_setGains(v2, -1.0f, -1.0f);
+          else if (sub == 'D') trans_setGains(-1.0f, v2, -1.0f);
+          else                 trans_setGains(-1.0f, -1.0f, v2);
+          trans_getGains(&kp, &kd, &ff);
+          // zeta and omega_n are the units the gains were actually designed in
+          // (CONTROL_README section 9) -- print them so a change is judged as
+          // "how fast and how damped", not as two bare numbers.
+          float wn = (kp > 0.0f) ? sqrtf(kp) : 0.0f;
+          printBoth("trans gains: Kp=" + String(kp, 2) + " Kd=" + String(kd, 2)
+                    + " ff=" + String(ff, 2)
+                    + "   -> omega_n=" + String(wn, 2)
+                    + " zeta=" + String((wn > 0.0f) ? kd / (2.0f * wn) : 0.0f, 2)
+                    + " t_settle=" + String((wn > 0.0f) ? 5.714f / wn : 0.0f, 1) + "s");
+          break;
+        }
+        else { printBoth("TX<m> TY<m> target, TT go, TS stop, "
+                         "TP/TD/TF Kp/Kd/ff"); break; }
         trans_getTarget(&tx, &ty);
-        printBoth("target (" + String(tx, 3) + ", " + String(ty, 3) + ")");
+        // Echo the MAGNET position and the resulting error, not just the target.
+        // The target is the magnet's destination, but G prints the platform
+        // CENTRE right next to it, and typing the centre's y is a silent 9.46 cm
+        // command -- exactly EST_L_MAG, the lever arm. That happened twice on
+        // 2026-08-20 and both runs read as controller faults. Showing the error
+        // the command just created makes it obvious before TT is ever sent.
+        {
+          EstState e;
+          if (est_get(&e)) {
+            float ex = tx - e.mag_x, ey = ty - e.mag_y;
+            printBoth("target (" + String(tx, 3) + ", " + String(ty, 3) + ")"
+                      + "   magnet now (" + String(e.mag_x, 3) + ", "
+                      + String(e.mag_y, 3) + ")"
+                      + "   -> move " + String(sqrtf(ex * ex + ey * ey) * 100.0f, 1)
+                      + " cm  d=(" + String(ex, 3) + "," + String(ey, 3) + ")");
+          } else {
+            printBoth("target (" + String(tx, 3) + ", " + String(ty, 3)
+                      + ")   [no fix yet -- cannot show the implied move]");
+          }
+        }
         break;
       }
       parked = false; stallCount = 0; stallHold = false; stallStartMs = 0;

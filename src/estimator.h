@@ -64,6 +64,32 @@ typedef struct {
 #define EST_L_MAG   0.0946f   /* docking magnet, ahead of the centre         */
 #define EST_D_DOCK  0.35f     /* ground magnet, out from the wall            */
 
+/* ---- THE TWO HEADING CONVENTIONS DISAGREE, AND THIS IS WHERE THEY MEET ----
+   The rotation controller's `theta` is CLOCKWISE-positive seen from above; the
+   dock frame's `psi` is COUNTER-CLOCKWISE-positive. Both are internally
+   consistent, and rotation-only control never had to care -- but psi = theta +
+   offset is an identity that requires them to turn the SAME way, and they do
+   not.
+
+   MEASURED 2026-08-20, twice, by hand-rotating the platform 30 deg CCW:
+       theta  -6.19 -> -36.19  (-30.0)      relyaw  4.19 -> 33.30  (+29.1)
+       theta   0.00 -> -30.07  (-30.1)      relyaw  4.20 -> 31.05  (+26.9)
+
+   psi is the one that matches the dock frame: translation.cpp puts body-forward
+   at (-sin psi, -cos psi), so psi = +90 aims at -X_dock, the observer's left,
+   i.e. CCW. So `theta` is the quantity that gets flipped, here, once, rather
+   than anywhere downstream (T11) -- and NOT by touching GYRO_SIGN, which would
+   invert the tuned and working rotation axis.
+
+   WHY PHASE 5 PASSED ANYWAY: every 5.1 test was static. With theta constant the
+   offset absorbs any sign error and psi converges to the vision heading
+   regardless, which is why psi tracks relyaw almost exactly in every static G.
+   The error only appears while TURNING -- the gyro then contributes heading in
+   the wrong direction, the offset has to chase 2x the rotation through a
+   0.02-per-frame filter, and psi is wrong for seconds. That is a direct attack
+   on the whole point of the T39 split, and it rotates the thrust vector. */
+#define EST_THETA_SIGN  (-1.0f)
+
 void est_init(void);
 
 /* Call every control cycle (200 Hz) with the elapsed time and the rotation

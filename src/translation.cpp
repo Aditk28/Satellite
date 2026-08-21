@@ -21,14 +21,19 @@ static float s_kd     = 3.05f;
 static float s_ffFrac = 0.90f;
 
 /* Fan push directions, degrees CCW from the camera axis. See translation.h --
-   this is the constant that turns a bug into a runaway. */
-static const float FAN_ANGLE_DEG[4] = { -40.0f, +50.0f, +230.0f, +140.0f };
+   this is the constant that turns a bug into a runaway.
+
+   CORRECTED 2026-08-20 FROM MEASUREMENT, TWICE. The remembered table was right
+   in structure and in its 90 deg spacing; its ZERO was 90 deg off the camera
+   axis. Final value = remembered table rotated -90 deg. See translation.h. */
+static const float FAN_ANGLE_DEG[4] = { -130.0f, -40.0f, +140.0f, +50.0f };
 
 static bool  s_enabled = false;
 static float s_tx = 0.0f, s_ty = 0.0f;
 static float s_lastAx = 0.0f, s_lastAy = 0.0f, s_lastErr = 0.0f;
 static float s_lastPct[4] = {0, 0, 0, 0};
 static float s_bestErr = 1e9f;
+static bool s_converged = false;   /* latched once err has been inside deadzone */
 static uint32_t s_enableMs = 0;
 static bool s_tripped = false;
 static const char* s_tripWhy = "";
@@ -47,6 +52,7 @@ void trans_getTarget(float* mx, float* my) { if (mx) *mx = s_tx; if (my) *my = s
 void trans_enable(bool on) {
   s_enabled = on;
   s_bestErr = 1e9f;
+  s_converged = false;
   s_enableMs = millis();
   s_tripped = false;
   s_tripWhy = "";
@@ -103,14 +109,38 @@ bool trans_update(const EstState* st, bool poseFresh) {
   s_lastErr = err;
 
   /* ---- divergence guard. Checked BEFORE any thrust is computed, so a trip
-     cannot be followed by one more push in the wrong direction. */
+     cannot be followed by one more push in the wrong direction.
+
+     THE TEST CHANGES ONCE THE MOVE HAS ARRIVED, and it has to. The approach
+     test is RELATIVE -- error must not grow much past its own best -- which is
+     what catches a wrong fan angle within centimetres. But `bestErr` keeps
+     falling, so on a successful move the threshold falls with it: a run that
+     reached 1.6 mm ended up with a trip threshold of 32 mm and was killed by
+     ordinary station-keeping drift (measured, 2026-08-20). A guard that fires
+     BECAUSE the controller did well is worse than no guard, because the next
+     person turns it off.
+
+     So: relative while approaching, fixed once arrived. After arrival the only
+     thing worth aborting for is a genuine runaway, and TRANS_RUNAWAY_M is far
+     enough out that drift cannot reach it but a reversed actuator crosses it in
+     well under a second. */
   if (err < s_bestErr) s_bestErr = err;
-  if (err > s_bestErr * TRANS_DIVERGE_MULT + TRANS_DIVERGE_SLACK) {
+  if (err < TRANS_DEADZONE) s_converged = true;   /* latches                   */
+
+  float trip = s_converged ? TRANS_RUNAWAY_M
+                           : (s_bestErr * TRANS_DIVERGE_MULT + TRANS_DIVERGE_SLACK);
+  if (err > trip) {
     s_tripped = true;
-    s_tripWhy = "DIVERGING -- error growing under thrust. Suspect a fan "
-                "pushing opposite to the allocation table, a backwards prop, "
-                "or a frame-transform sign.";
-  } else if (millis() - s_enableMs > TRANS_TIMEOUT_MS) {
+    s_tripWhy = s_converged
+        ? "RUNAWAY -- arrived, then left. Station-keeping lost the target."
+        : "DIVERGING -- error growing under thrust. Suspect a fan pushing "
+          "opposite to the allocation table, a backwards prop, or a "
+          "frame-transform sign.";
+  } else if (!s_converged && millis() - s_enableMs > TRANS_TIMEOUT_MS) {
+    /* The timeout asks "did this move ever arrive", so it stops applying once
+       it has. Otherwise a converged run is killed 14 s after succeeding, which
+       is what the first working run would have hit. Holding station is ended by
+       the operator (TS / X), not by a clock. */
     s_tripped = true;
     s_tripWhy = "TIMEOUT -- did not converge. Suspect too little authority, "
                 "friction feedforward too low, or a stuck platform.";
@@ -138,16 +168,43 @@ bool trans_update(const EstState* st, bool poseFresh) {
   float ax = s_kp * ex - s_kd * st->vx;
   float ay = s_kp * ey - s_kd * st->vy;
 
-  /* ---- Coulomb feedforward. Structure ported verbatim from the rotation axis
-     (CONTROL_README section 6): friction here is 0.26 m/s^2 against manoeuvres
-     of a similar size, so it is a dominant term, not a correction.
-     THE TWO BRANCHES HAVE OPPOSITE SIGNS and getting the moving one backwards
-     is worse than no feedforward at all. */
+  /* ---- Coulomb feedforward. Friction here is 0.26 m/s^2 against manoeuvres of
+     a similar size, so it is a dominant term, not a correction.
+
+     ⚠️ THE MOVING BRANCH IS POSITIVE HERE, AND IT IS NEGATIVE ON THE ROTATION
+     AXIS. This was shipped backwards -- ported verbatim from rotation, which
+     carried the sign across without the reason for it:
+
+       ROTATION     theta_ddot = -a*alpha - A_f*sign(w)     <- MINUS on alpha
+         cancel:    -a*alpha_ff = +A_f*sign(w)
+                 -> alpha_ff = -(A_f/a)*sign(w)                   NEGATIVE
+       TRANSLATION  x_ddot = A_cmd - A_c*sign(v)            <- no minus, no 'a'
+         cancel:    A_ff - A_c*sign(v) = 0
+                 -> A_ff = +A_c*sign(v)                            POSITIVE
+
+     The rotation minus comes entirely from the -a, i.e. from the wheel pushing
+     the platform the OTHER way. A fan pushes the platform the way it points.
+     The PD term above already carries a comment saying not to copy rotation's
+     sign; the feedforward copied it anyway.
+
+     What the wrong sign did, measured: instead of cancelling drag it ADDED it,
+     so the platform fought 1.9*A_c = 0.49 m/s^2 while moving. In the 2026-08-20
+     run it commanded -0.306 m/s^2 while needing +x and moving +x at 0.05 m/s --
+     a +0.084 proportional term buried under -0.156 of damping and -0.233 of
+     backwards feedforward.
+
+     SECOND, INDEPENDENT REASON THE SIGN MUST BE POSITIVE, and a good way to
+     check any future change here: with the correct sign the two branches AGREE
+     whenever the platform is moving toward its target (both push along the
+     demand), so crossing TRANS_V_MOVING is smooth. With the wrong sign they
+     point 180 deg apart, so every crossing of a 0.015 m/s threshold reverses a
+     0.23 m/s^2 term -- a chatter generator, and the runs chattered. A branch
+     switch that is discontinuous is telling you one of the branches is wrong. */
   float speed = sqrtf(st->vx * st->vx + st->vy * st->vy);
   float ffx = 0.0f, ffy = 0.0f;
   if (speed > TRANS_V_MOVING) {
-    ffx = -TRANS_A_COULOMB * (st->vx / speed);   /* MOVING: cancel drag       */
-    ffy = -TRANS_A_COULOMB * (st->vy / speed);
+    ffx = +TRANS_A_COULOMB * (st->vx / speed);   /* MOVING: cancel drag       */
+    ffy = +TRANS_A_COULOMB * (st->vy / speed);
   } else {
     float m = sqrtf(ax * ax + ay * ay);
     if (m > 1e-6f) {

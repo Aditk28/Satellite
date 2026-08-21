@@ -62,8 +62,12 @@ void est_predict(float dt, float theta) {
   /* Heading is NOT integrated here. The rotation controller already integrates
      the gyro into `theta` and that path is proven; duplicating it would mean
      two integrators that can silently diverge. We only carry the offset that
-     turns platform-relative heading into dock-relative heading. */
-  if (s_haveOffset) s_st.psi = wrapPi(theta + s_psiOffset);
+     turns platform-relative heading into dock-relative heading.
+
+     theta is CW-positive and psi is CCW-positive -- converted ONCE, here, see
+     EST_THETA_SIGN in estimator.h. */
+  float th = EST_THETA_SIGN * theta;
+  if (s_haveOffset) s_st.psi = wrapPi(th + s_psiOffset);
 
   /* Constant-velocity propagation. Between vision frames (~36 ms) this is
      plenty; accelerometer prediction is 5.1b and needs its axis signs checked
@@ -75,6 +79,14 @@ void est_predict(float dt, float theta) {
 
 bool est_correct(const PiPose* p, float theta, float omega_p) {
   if (!p) return false;
+
+  /* Both gyro quantities arrive CW-positive; the dock frame is CCW-positive.
+     Converted once, here (EST_THETA_SIGN, estimator.h). omega_p needs it just
+     as much as theta does -- it advances the VISION heading over the frame's
+     age below, so a wrong sign there pushes psi_meas the wrong way by
+     omega_p*age, which at 140 ms of age and 1 rad/s is ~8 deg per fix. */
+  float th = EST_THETA_SIGN * theta;
+  float wz = EST_THETA_SIGN * omega_p;
 
   /* Never apply the same measurement twice -- trap T10. The symptom is an
      overconfident estimate that drifts, which reads as a tuning problem. */
@@ -100,12 +112,12 @@ bool est_correct(const PiPose* p, float theta, float omega_p) {
 
   /* Heading first: psi_meas is where vision says we were pointing, advanced by
      the gyro rate over the measurement's age. */
-  float psi_meas = wrapPi(p->relyaw_rad + omega_p * age);
+  float psi_meas = wrapPi(p->relyaw_rad + wz * age);
 
   if (!s_haveOffset) {
     /* First fix: adopt it outright rather than easing in from zero. There is
        nothing to average yet and a slow ramp would just be wrong for seconds. */
-    s_psiOffset = wrapPi(psi_meas - theta);
+    s_psiOffset = wrapPi(psi_meas - th);
     s_haveOffset = true;
     s_st.psi = psi_meas;
   } else {
@@ -114,8 +126,8 @@ bool est_correct(const PiPose* p, float theta, float omega_p) {
     float g = (p->flags & PI_FLAG_AMBIGUOUS) ? (s_alphaPsi * 0.25f)
                                              : s_alphaPsi;
     s_psiOffset = wrapPi(s_psiOffset +
-                         g * wrapPi(psi_meas - wrapPi(theta + s_psiOffset)));
-    s_st.psi = wrapPi(theta + s_psiOffset);
+                         g * wrapPi(psi_meas - wrapPi(th + s_psiOffset)));
+    s_st.psi = wrapPi(th + s_psiOffset);
   }
 
   /* ---- position. Vision gives where the DOCK is relative to the CAMERA; we
