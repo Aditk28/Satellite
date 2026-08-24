@@ -1,0 +1,4 @@
+# test 2/2: translate to 0.000 0.350 m
+# mode=translate probe_fan=0 probe_pct=0.0 target_x=0.0000 target_y=0.3500 trans_kp=0.500 trans_kd=6.000 trans_ff=1.000 idle_pct=12.0 deadzone_m=0.0100 v_moving=0.0150 K_A=0.000210 A_c=0.2600 l_mag=0.0946 rate_hz=20 stop_reason=running
+t_us,x,y,psi_deg,vx,vy,magx,magy,errm,ax_cmd,ay_cmd,ax_imu,ay_imu,omega_p,pct1,pct2,pct3,pct4,poseage_ms
+

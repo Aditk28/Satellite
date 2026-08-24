@@ -139,6 +139,9 @@
 #include <Wire.h>
 #include <Adafruit_MPU6050.h>
 #include <Adafruit_Sensor.h>
+#include "timebase.h"
+#include "hw_timers.h"
+#include "timing_stats.h"
 
 // ------------------------- hardware -------------------------
 #define POLE_PAIRS      11
@@ -185,6 +188,9 @@ static const float A_2          = 5.35f;    // 1/s
 // raise until small corrections close reliably, lower if it overshoots.
 float A_FRICTION  = 28.3f;    // rad/s^2 (wheel) to break platform free
 static const float GYRO_SIGN   = -1.0f;    // aligns gyro with wheel convention
+
+// ------------------- control loop timing -------------------
+static stat_t st_foc, st_move, st_mpu, st_ina, st_law, st_telem, st_period;
 
 // ------------------- runtime-tunable gains -------------------
 // Start conservative (3.0 s row) and work down using P/D over serial --
@@ -427,7 +433,7 @@ void dumpCapture() { dumpCaptureTo(Serial); dumpCaptureTo(hc05Serial); }
 void controlUpdate(float dt) {
   // ---- sense ----
   sensors_event_t a, g, t;
-  mpu.getEvent(&a, &g, &t);
+  TIME_BLOCK(st_mpu, { mpu.getEvent(&a, &g, &t); });
   float gyro_dps = (g.gyro.z * 180.0f / PI) - gyroBias;
   omega_p = GYRO_SIGN * gyro_dps * PI / 180.0f;     // rad/s, model convention
   omega_w = motor.shaft_velocity;                    // rad/s, alignment-corrected
@@ -655,6 +661,33 @@ void handleLine(String s) {
       printBoth("hold still, measuring bias...");
       measureGyroBias();
       break;
+    case 'M':
+      // Timing dump. `M` prints min/mean/MAX for every instrumented block;
+      // `M!` resets all accumulators so the next window starts clean (run a
+      // T90 + H0 first, then M! and repeat if you want a fresh worst-case).
+      if (s.length() > 1 && s.charAt(1) == '!') {
+        stat_reset(&st_foc);   stat_reset(&st_move);  stat_reset(&st_mpu);
+        stat_reset(&st_ina);   stat_reset(&st_law);   stat_reset(&st_telem);
+        stat_reset(&st_period);
+        printBoth("timing stats reset");
+      } else {
+        // Dump to BOTH channels -- if this only went to USB, sending M over
+        // HC-05 would land the reply on USB and look like nothing happened.
+        Print* outs[2] = { &Serial, &hc05Serial };
+        for (int i = 0; i < 2; i++) {
+          Print& o = *outs[i];
+          o.println("--- timing (us) ---");
+          stat_print(o, "loopFOC",      &st_foc);
+          stat_print(o, "move",         &st_move);
+          stat_print(o, "MPU6050 read", &st_mpu);
+          stat_print(o, "INA219 read",  &st_ina);   // no samples: no INA219 here
+          stat_print(o, "control law",  &st_law);   // incl. MPU; compute = law - MPU
+          stat_print(o, "telem row",    &st_telem);
+          stat_print(o, "superloop",    &st_period);
+          o.println("-------------------");
+        }
+      }
+      break;
     case 'X': stopMotor("operator"); break;
     case 'R':
       controllerEnabled = true; ctrlMode = CTRL_IDLE;
@@ -684,7 +717,12 @@ void pollSerial() {
 // =====================================================================
 void setup() {
   Serial.begin(115200);
-  delay(1000);
+  while (!Serial && millis() < 3000) {}
+  us_init();
+
+  timers_dumpAll("BEFORE SimpleFOC init");
+
+  // ... existing SPI/encoder/driver/motor init, initFOC(), Wire, MPU6050, INA219
 
   pinMode(HC05_EN_PIN, OUTPUT);
   digitalWrite(HC05_EN_PIN, LOW);
@@ -719,6 +757,11 @@ void setup() {
   motor.initFOC();
   motor.target = 0.0f;
 
+  timers_dumpAll("AFTER SimpleFOC init");
+  Serial.print("TIM2 CR1=0x"); Serial.println(TIM2->CR1, HEX);
+
+  // ... rest of your existing setup
+
   printBoth("");
   printBoth("=== Heading controller ===");
   printBoth("Platform must be STILL for bias measurement.");
@@ -730,7 +773,7 @@ void setup() {
   printBoth("Commands: O<V> openloop | C<V> comp-test | T<deg> step+capture | H<deg> hold");
   printBoth("          Z zero | P/D gains | K<0-1.2> compFrac | F<0-1> ff");
   printBoth("          W<deg> coarse dz | N<deg> fine dz | A<val> friction magnitude");
-  printBoth("          G status | B rebias | X stop | R resume");
+  printBoth("          G status | B rebias | M timing | M! reset timing | X stop | R resume");
   printBoth("Start at K_theta=19.1 K_omega=14.0, then work down the gain table.");
   printBoth("Mode is IDLE -- send H0 or T<deg> to engage.");
 
@@ -738,9 +781,14 @@ void setup() {
 }
 
 void loop() {
+  static uint32_t t_prev = 0;
+  uint32_t t_now = us_now();
+  if (t_prev) stat_add(&st_period, t_now - t_prev);
+  t_prev = t_now;
+  
   // FOC must run as fast as possible, every iteration, uninterrupted.
-  motor.loopFOC();
-  motor.move();
+  TIME_BLOCK(st_foc,  { motor.loopFOC(); });
+  TIME_BLOCK(st_move, { motor.move();    });
 
   pollSerial();
 
@@ -749,7 +797,7 @@ void loop() {
     float dt = (now - lastControlUs) * 1e-6f;
     lastControlUs = now;
 
-    controlUpdate(dt);
+    TIME_BLOCK(st_law, { controlUpdate(dt); });
 
     if (capturing) {
       if (capN < MAX_CAP) {
@@ -782,10 +830,12 @@ void loop() {
   // watch it recover without needing a full capture.
   if (ctrlMode == CTRL_HOLD && !capturing && (millis() - lastTelemMs) >= TELEM_PERIOD_MS) {
     lastTelemMs = millis();
-    String s = String(degrees(theta), 2) + "," + String(degrees(target), 2) + ","
-             + String(omega_p, 3) + "," + String(omega_w, 2) + ","
-             + String(lastAlpha, 2) + "," + String(lastU, 3);
-    Serial.println(s);
-    hc05Serial.println(s);
+    TIME_BLOCK(st_telem, {
+      String s = String(degrees(theta), 2) + "," + String(degrees(target), 2) + ","
+               + String(omega_p, 3) + "," + String(omega_w, 2) + ","
+               + String(lastAlpha, 2) + "," + String(lastU, 3);
+      Serial.println(s);
+      hc05Serial.println(s);
+    });
   }
 }
