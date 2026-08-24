@@ -9,6 +9,10 @@ time on an STM32 under FreeRTOS.
 Slide the platform anywhere on the table by hand, and it finds its way back to the dock
 and re-mates on its own.
 
+## Here's a short demo video showing it in action
+
+https://github.com/user-attachments/assets/00179884-edae-40fa-b7e2-14f87d2f1fc0
+
 ---
 
 ## How it works
