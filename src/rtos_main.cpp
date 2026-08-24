@@ -1717,6 +1717,14 @@ void handleLine(String s) {
           printBoth("accel->body rotation = " + String(est_getAccRot(), 1) + " deg");
           break;
         }
+        /* TE<0|1> -- brake assist. OFF by default; changes nothing until set. */
+        else if (sub == 'E') {
+          if (s.length() > 2) trans_setBrakeAssist(v2 >= 0.5f);
+          printBoth(String("brake assist ") + (trans_getBrakeAssist()
+                    ? "ON -- friction is left uncancelled while decelerating"
+                    : "OFF (default) -- drag cancelled whenever moving"));
+          break;
+        }
         /* TL<m/s> -- approach speed cap. */
         else if (sub == 'L') {
           if (s.length() > 2) trans_setVmax(v2);

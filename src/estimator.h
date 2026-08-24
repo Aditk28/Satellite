@@ -107,14 +107,22 @@ typedef struct {
    known start pose, and vision is demoted to a slow drift corrector.
 
    EST_ACC_ROT_DEG is the rotation from the accelerometer's own axes to the body
-   frame (CCW from the camera axis). +90 comes from the four fan directions
-   measured on the accelerometer over three sessions -- -130/-40/+121/+42 --
-   against the physically known mounting of -40/+50/+230/+140: a uniform +90
-   across all four, which is a far stronger derivation than any single
-   measurement, because a common offset over four independent channels cannot
-   come from noise. Runtime-settable with TR<deg> so it can be swept without a
-   reflash if the loop disagrees. */
-#define EST_ACC_ROT_DEG  90.0f
+   frame (CCW from the camera axis).
+
+   VERIFIED 270 ON HARDWARE 2026-08-21. It was reasoned to +90 from the fan
+   directions and that was 180 deg wrong -- the same flip the fan table needed,
+   which in hindsight is the tell: one inverted convention showing up in two
+   places, not two independent errors.
+
+   How the wrong value presented, because it looks nothing like a sign error:
+   the platform physically moved the RIGHT way, but dead reckoning integrated it
+   backwards, so `err` GREW during every hop. The controller responded by
+   pushing harder -- correct behaviour on a lie -- and the divergence guard fired
+   on 13 of 15 runs. At rest, vision kept correcting position back to truth, so
+   the estimate looked fine every time anyone stopped to check it.
+   Swept with TR0/90/180/270 against the real loop once vision-at-rest gave a
+   reference worth trusting. Still runtime-settable with TR. */
+#define EST_ACC_ROT_DEG  270.0f
 
 void est_init(void);
 

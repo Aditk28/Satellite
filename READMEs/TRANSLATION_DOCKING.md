@@ -25,135 +25,55 @@ Never propose a solution that requires a scope.
 
 ## Current position
 
-**Phases 0-5 COMPLETE. Phase 6 HAS RUN ON HARDWARE AND CONVERGES — 3.5 cm to
-1.6 mm, 2026-08-20 — but is NOT TUNED. That is the next thing to do.**
+**Phases 0-6 COMPLETE. THE DOCKING DEMO WORKS**, somewhat consistently, as of
+2026-08-21: place the platform on the dock, `TI`, slide it anywhere by hand, and
+`TG` returns it to the dock in short hops with a vision fix at each stop.
 
-Four latent bugs stood between "written" and "converges", and every one of them
-is worth reading before touching this code again: **T41** (the estimator mixed a
-CW-positive `theta` with a CCW-positive `psi`, which every static Phase 5 test
-was structurally incapable of detecting), **T42/B28** (the fan angle table was
-wrong twice; the closed loop, not an open-loop anchor, is what settled it),
-**T43** (the Coulomb feedforward carried rotation's sign without rotation's
-`-a`, so it doubled friction instead of cancelling it), and **T44** (the
-divergence guard derived its threshold from `bestErr`, so it shot the first
-successful run for converging too well).
+```
+DEMO SEQUENCE
+  B            gyro + accel bias, platform dead still
+  R            arm fans
+  TB           accel bias again WITH FANS AT IDLE -- do NOT re-run B after this
+  TI           "the magnet is on the dock" -- the only ground truth in the loop
+  (slide it somewhere by hand -- SLIDE, never lift; tilt is 0.17 m/s^2 per degree)
+  TG           docks in 6-10 cm hops.  X stops everything, any time.
+```
 
-⚠️ **Fans 2 and 3 deliver 63-69% of fans 1 and 4** — the whole `{2,3}` axis is
-down. Deliberately NOT compensated in software (B29): the square-law inversion
-would need 1.26x throttle against a 60% ceiling that already binds. **Re-measure
-all four with `I50` after ANY prop or ESC-direction change** — fan 3 went 0.245
-to 0.104 across exactly such a change and nothing in firmware could know.
+## What was hard, and what to read before touching this again
 
-**Tools that now exist for tuning:** `src/trans_capture.*` records a `TT` move at
-20 Hz and dumps a CSV through the normal capture path (`G` is a snapshot and a
-move is a trajectory — the first run's one useful number, velocity at the stop,
-had to be back-calculated from the commanded acceleration). `TP`/`TD`/`TF` set
-`Kp`/`Kd`/`ff` at runtime and echo `omega_n`, `zeta` and `t_settle`.
+**Position is dead-reckoned from the IMU (B30).** Vision x/y proved unusable
+while moving, so above 2 cm/s it contributes nothing at all, and at rest it is
+ADOPTED -- 8 frames averaged, replacing the estimate rather than blending into
+it. Heading stays gyro-led throughout.
 
-⚠️ **The Pi runs at 600 MHz, undervolt-throttled, and this is ACCEPTED (B26).**
-No confident diagnosis was reached — the regulator stays cool, 300 µF of bulk
-capacitance changed nothing, and a meter reads a healthy 5.15 V at the Pi while
-the Pi's own detector disagrees (T40: a DMM structurally cannot see this). Cost
-is ~7 fps at ~140 ms latency instead of 28.6 fps at 61 ms. Workable — the loop
-runs at 200 Hz on the IMU between fixes and `age_us` compensates. **The real fix
-is a dedicated 5 V/3 A buck for the Pi alone**, off the shared rail it currently
-competes for with the STM32, camera and other ICs. **Do NOT reach for
-`force_turbo`/`avoid_warnings`** — that disables the protection rather than
-supplying power, and this project has already lost a Pi and an SD card to
-brownouts.
+**Docking is stepped (B31)** because dead-reckoning error grows as `bias*T^2`;
+the fix is a shorter `T`, not a better filter.
+
+**Two constants were wrong for two days and cost more time than everything else
+combined: `EST_ACC_ROT_DEG` (270, not the reasoned 90) and `FAN_ANGLE_DEG`
+(remembered table +180).** Both were finally settled by RUNTIME SWEEP -- `TR`
+and `TA` -- in about two minutes each, once averaged vision-at-rest provided a
+reference worth trusting. Read **T47**: a wrong actuator map and a broken
+position estimate produce the identical symptom, so three earlier "corrections"
+were each derived from the very estimator that was lying. Fix the instrument,
+then identify the plant.
+
+⚠️ **Accel bias measured with the fans OFF does not apply with the fans ON
+(T49).** Rectified prop vibration shifts it by **0.158 m/s^2** -- ten times the
+boot bias. `TB` measures it at 12% idle and folds it in; a hop runs the pushing
+fans at 30-60%, so the correction is real but partial.
+
+⚠️ **Known open:** arrival still biases RIGHT. Traced to accel drift that
+reverses sign between the fans-off settle (+31 mm/s) and the fans-on hop
+(-42 mm/s), same run. `TM` trims where it lands (larger = further right); the
+structural fix is measuring bias at hop throttle rather than idle.
+
+**Every constant that has ever been wrong is now runtime-settable (B32)** --
+`TA TR TM TL TH TP TD TF TV TE TW TB`. Sweep, then fold the winner into the
+compiled default and return the knob to zero.
+
 Tags: `trans-p1-fans`, `trans-p2-plantid`, `trans-p3-link`, `trans-p4-vision`,
 `trans-p5-estimator`.
-
-**The estimator produces dock-relative platform pose** (`src/estimator.*`,
-200 Hz): `x`, `y`, `psi`, velocity, and the magnet position that actually has to
-land on the target. Vision drives position; the gyro drives fast heading; vision
-corrects heading only slowly. `age_us` latency compensated. **5.2 Kalman
-deferred** — revisit only if Phase 6 is limited by estimate quality rather than
-by actuation.
-
-**Vision produces pose (2026-08-20).** 1280×720 MJPG, grayscale decode,
-`decimate=2.0`, threaded capture with `BUFFERSIZE=4` → **60.9 ms capture→pose,
-28.6 fps, 3 of 3 tags every frame** (B22/B23). Bundle `solvePnP` (IPPE) over every
-visible tag gives range / bearing / rel-yaw plus an ambiguity ratio. Range matches
-a tape measure at 0.5 and 1.0 m. Detector is Debian `python3-apriltag`.
-
-```
-SIGN CONVENTIONS -- verified on hardware, never compensate downstream (T11)
-  bearing  0 = dead ahead   POSITIVE = counter-clockwise
-                            sliding the platform LEFT -> bearing POSITIVE
-  relyaw   0 = square-on    POSITIVE = viewing from the dock's RIGHT
-```
-
-**⚠️ Camera exposure is locked manually and must stay that way** —
-`auto_exposure=1`, `exposure_time_absolute=100`. Auto-exposure caps the frame
-rate, blurs ~15 px at 30 °/s, and changes effective focal length (T35).
-
-**⚠️ `f = 947 px` was MEASURED, and the camera is ~76° FOV, not the advertised
-120°** (B25). Every geometry figure derived from the spec sheet was wrong in both
-directions — detection range is better than planned, close-range framing much
-tighter. **The dock wall moved from 25 cm to 35 cm behind the magnet** so all
-three tags stay in frame when docked. Chessboard calibration is deliberately
-skipped (B24): distortion and principal point remain uncorrected, which is the
-first thing to revisit if terminal alignment shows a bias no tuning fixes.
-
-**⚠️ Hardware changed:** the Pi 3B+ died mid-phase (PMIC failure — 3.3 V rail
-absent, cold, would not boot from SD or USB). Replaced with a **Pi 3A+**:
-identical BCM2837B0 at 1.4 GHz, so identical detection performance; 512 MB RAM,
-one USB port, no Ethernet, ~1/5 the current draw. Nothing architectural changed.
-`pupil-apriltags` cannot be built on 512 MB — use the Debian package.
-**`tools/pi_setup.sh` rebuilds a fresh Pi in one command.**
-
-**The Pi link is up, framed, and fail-safe.** USART6 PC6/PC7, Pi moved onto the
-PL011 rather than the mini-UART (**T28** — the one that would otherwise have bitten
-in Phase 4, as framing errors appearing exactly when AprilTag loads the CPU).
-`pi_link.*` is sole reader *and* sole writer of the port, polled from `commsTask`
-and deliberately outside the operator parser (**B18**).
-
-```
-wire     [0xA5][0x5A][len=28][payload][crc16]   CRC-16/CCITT-FALSE, little-endian
-payload  seq, flags, tag_id, range_m, bearing_rad, relyaw_rad, quality,
-         age_us, n_tags                          POLAR not Cartesian (B19)
-                                                 AGE not a timestamp (B20)
-ladder   250 ms -> pose invalid, estimator coasts
-         1 s    -> fans zeroed
-         3 s    -> terminal hook (NOT stopMotor yet -- B21)
-```
-
-**Verified 2026-08-19:** RTT 2.61/3.52/5.32 ms (3.1); 62 frames / 2508 B
-reconciling exactly with 14 CRC rejects and 26 gaps, `badlen=0 resync=0`, pose
-decoding correctly, ladder reaching DEAD and zeroing the fans (3.2). **Tested
-with synthetic frames — no camera involved yet.**
-
-**Both plants are identified and the rotation axis is retuned and working:**
-
-```
-TRANSLATION (acceleration units -- mass and force cancel, B14)
-  x_ddot = A(throttle) - A_c*sign(v)
-  A(throttle) = 2.1e-4 * pct^2  m/s^2      A(60%) = 0.76
-  A_c         = 0.26 m/s^2                 breakaway ~35% throttle
-  GO/NO-GO    = 2.9x single fan, 4.2x diagonal   -> PASS
-
-ROTATION (re-identified 2026-08-15, retuned 2026-08-19)
-  A_1 47.9   A_2 4.97   a 0.098   K' 9.64   compFrac 0.90
-  K_theta 216   K_omega 52  (zeta 0.54, NOT 0.7 -- friction already damps)
-  ffFrac 0.95   A_static 60   A_moving 34   A_viscous 0
-  deadzone 1.5/0.8 deg   ALPHA_STALL_MAX 70   WHEEL_SAT_LIMIT 55
-  --> 0.47 deg mean over +-5 to +-180 deg, EVERY slew in one move,
-      wheel returns fully to rest
-```
-
-**Yaw coupling (2.4):** thrust-line offset, 2–3 rad/s², wheel peaks 4–12 rad/s.
-Small enough that **no mechanical correction is needed** — the Phase-7 saturation
-warning is retired.
-
-**Firmware state:** six FreeRTOS tasks. `fanTask` (prio 2, 333 Hz) is the sole fan
-writer; fans are killed ahead of the wheel in every fault path; fan 4's spin direction
-is re-applied automatically at every boot because this ESC ignores SAVE_SETTINGS.
-Control loop measured at 4999/5000/5001 µs throughout — fans cost it nothing.
-
-**Data:** every raw capture is in `calibration/runs/`, renamed by what it established
-and indexed in `calibration/runs/INDEX.md`. `capture_calibration.py` writes new runs
-there automatically.
 
 ## What is NOT done
 
@@ -203,6 +123,30 @@ there automatically.
    ~25,000 RPM plus an untethered flywheel. `X` stops everything. Never propose a
    test with hands near props or wheel.
 4. Go to the step named under "Current position" and follow Concept → Do → Verify → Trap.
+
+## Translation command reference (Phase 6)
+
+All under the `T` prefix; `T<number>` is still the rotation step, `T<letter>` is
+translation. Everything here is live -- no reflash (B32).
+
+| cmd | does |
+|---|---|
+| `TI` / `TI<m>` | Declare the pose. No argument = **DOCKED** (magnet on the dock). `TI<m>` puts the magnet `<m>` out on the centreline. Back-solves the centre through both lever arms (T53). |
+| `TG` | Dock now, in hops. Points the wheel square-on, enters via a settle+fix, then alternates move/settle. |
+| `TX<m>` / `TY<m>` | Target as an **offset from the magnet's current position**. Echoes the implied move in cm. Set BOTH -- an unset axis holds the power-on 0.0, which is the wall (T45). |
+| `TZ` | Target = the dock, absolute. |
+| `TT` / `TS` | Enable / stop a single move. `TT` refuses if heading control is IDLE (T46). |
+| `TC<pct>` | Single-fan direction probe: one fan, heading HELD, position from vision, 20 Hz capture. |
+| `TB` | Accel bias **with the fans at idle** -- the condition that matters (T49). Run after `B`, never before. |
+| `TR<deg>` | Accelerometer-to-body rotation. **270.** Settled by sweeping 0/90/180/270. |
+| `TA<deg>` | Rotate the whole fan table. **0** -- the +180 is compiled in now. |
+| `TM<m>` | Magnet lateral offset. Larger = lands further right, about 1:1. |
+| `TL<m/s>` | Approach speed cap (0.045). |
+| `TH<m>` | Hop length (0.06). |
+| `TP` / `TD` / `TF` | Velocity-shaped gains: m/s per m, m/s^2 per m/s, feedforward fraction. Prints `omega_n`/`zeta`/`t_settle`. |
+| `TV<g>` | Vision position gain. `TV0` = pure IMU. |
+| `TE<0\|1>` | Brake assist -- leave friction uncancelled while decelerating. **OFF by default.** |
+| `TW<0\|1>` | INA219 power trips. `TW0` disables the safe-stop (monitoring continues) -- the trip is on the WHEEL supply but fires on FAN draw (B9). |
 
 ## Build & flash cheat-sheet
 
@@ -278,7 +222,8 @@ These are in addition to `RTOS_migration.md`'s list, which all still applies.
 | 3 Pi ↔ STM32 wired link | ✅ **(2026-08-19)** `trans-p3-link` | USART6 PC6/PC7, Pi forced onto the PL011 (T28). `pi_link.*` is sole reader *and* writer of the port, polled from `commsTask`, deliberately outside the operator parser (B18 — verified: `comms rx=4` against 2508 Pi bytes). Framed `[A5 5A][len][28B][crc16]`, polar pose + `age_us` not a timestamp (B19/B20). 3-tier staleness ladder, tier 3 not wired to `stopMotor()` yet (B21). 62 frames / 2508 B reconcile exactly. ⚠️ tier 2 hard-kills the fans — Phase 6 must make it a soft zero. |
 | 4 vision: AprilTag pose on the Pi | ✅ **(2026-08-20)** | **4.2** 720p MJPG grey / `decimate=2.0` / threaded, `BUFFERSIZE=4`: **60.9 ms capture→pose, 28.6 fps, 3/3 tags** (B22, B23). **4.3** bundle `solvePnP` (IPPE) over all visible tags → range / bearing / relyaw / ambiguity ratio; range matches a tape measure at 0.5 and 1.0 m; signs verified on hardware. **4.1 chessboard calibration SKIPPED (B24)** — focal length measured directly instead, `f = 947 px`, which revealed the camera is **~76° FOV, not the advertised 120°** (B25) and forced the dock standoff from 25 → 35 cm. Pi 3B+ died mid-phase (PMIC), replaced by a **3A+**: same SoC and clock, same performance. |
 | 5 estimator: fuse tag + IMU | ✅ **(2026-08-20)** | **5.1** complementary filter, `src/estimator.*`, 200 Hz. Vision → `x`,`y` (hard, `aPos` 0.35); gyro → fast `psi`; vision → slow absolute `psi` (`aPsi` 0.02, ~1.8 s). `psi = theta + psi_offset`, only the offset estimated, so the proven heading integrator is reused. `age_us` latency compensated. Forced by measurement: raw vision yaw was compressing `x` to ~35% of true (T39). **5.2 Kalman DEFERRED** — revisit only if Phase 6 is limited by estimate quality. |
-| 6 translation control (LQR, x/y) | 🔶 **RUN ON HARDWARE, CONVERGES, NOT YET TUNED** | **First closed-loop convergence 2026-08-20: 3.5 cm → 1.6 mm.** Getting there cost four separate latent bugs, all now fixed and all in Appendix A: the estimator's `theta`/`psi` sign conflict (**T41**, invisible to every static Phase 5 test), the fan angle table — wrong twice, corrected on closed-loop evidence (**T42**, B28), the Coulomb feedforward MOVING branch ported with rotation's sign but not its reason (**T43**), and a divergence guard whose threshold tightened as the controller improved, so it shot the first successful run (**T44**). Two operator traps also fixed in firmware: `TT` now refuses with heading control IDLE (**T46**) and `TX`/`TY` echo the implied move so a centre-vs-magnet mix-up is visible before arming (**T45**). New: `src/trans_capture.*`, a 20 Hz recorder for a `TT` move (separate buffer — see its header for why not more columns on the main one), and `TP`/`TD`/`TF` runtime gains. **Still open:** gains untuned (`Kp` 3.63 / `Kd` 3.05, ζ 0.80 by design, never swept); per-fan thrust asymmetry left in the plant (B29); station-keeping inside the deadzone commands nothing, so arrival drift is uncontrolled. |
+| 6 translation control (LQR, x/y) | ✅ **DOCKS, SOMEWHAT CONSISTENTLY (2026-08-21)** | The platform is placed on the dock, told `TI`, slid anywhere by hand, and returns to the dock on `TG` in 6-10 cm hops with a vision fix at each stop. Getting there took **eight** latent bugs, all documented as traps: the estimator's `theta`/`psi` sign conflict (T41), the fan table wrong four times (T42/T47, settled empirically at remembered+180 via `TA`), the Coulomb feedforward's MOVING branch ported with rotation's sign but not its reason (T43), a divergence guard whose threshold tightened as the controller improved (T44), operator traps around centre-vs-magnet targets and heading-idle (T45/T46), bias vs noise confusion (T48), fan-vibration rectification of the accel bias (T49), a silent rest detector (T50), captures discarded one cycle in (T51), and a thrust gate still asking about vision after position had moved to the IMU (T52). **`EST_ACC_ROT_DEG = 270` and `FAN_ANGLE_DEG = {+140,+230,+50,-40}` were both settled by runtime sweep, not by argument.** ⚠️ Still open: a rightward bias on arrival, traced to accel drift that reverses sign when the fans spin (T49) and only partly corrected by `TB` at 12% idle. Gains untuned in any systematic sense. |
+| ~~6 (superseded row)~~ | |  **First closed-loop convergence 2026-08-20: 3.5 cm → 1.6 mm.** Getting there cost four separate latent bugs, all now fixed and all in Appendix A: the estimator's `theta`/`psi` sign conflict (**T41**, invisible to every static Phase 5 test), the fan angle table — wrong twice, corrected on closed-loop evidence (**T42**, B28), the Coulomb feedforward MOVING branch ported with rotation's sign but not its reason (**T43**), and a divergence guard whose threshold tightened as the controller improved, so it shot the first successful run (**T44**). Two operator traps also fixed in firmware: `TT` now refuses with heading control IDLE (**T46**) and `TX`/`TY` echo the implied move so a centre-vs-magnet mix-up is visible before arming (**T45**). New: `src/trans_capture.*`, a 20 Hz recorder for a `TT` move (separate buffer — see its header for why not more columns on the main one), and `TP`/`TD`/`TF` runtime gains. **Still open:** gains untuned (`Kp` 3.63 / `Kd` 3.05, ζ 0.80 by design, never swept); per-fan thrust asymmetry left in the plant (B29); station-keeping inside the deadzone commands nothing, so arrival drift is uncontrolled. |
 | 7 combined 3-DOF + allocation | ⬜ | — |
 | 8 acquisition and docking sequence | ⬜ | — |
 | 9 consolidation and evidence | ⬜ | — |
@@ -1973,6 +1918,14 @@ write-up more credible, not less. Do the same here.
 | T45 | **Commanding the platform CENTRE when the target is the MAGNET** | `G` prints `est: x= y=` (centre of rotation) immediately beside `mag=( )`, and `TX`/`TY` take the magnet's destination. Typing the centre's `y` is a silent **9.46 cm** command — exactly `EST_L_MAG` — and it happened twice in one session, both times reading as a controller fault (the platform confidently retreating from the dock while "commanded" to nudge sideways). Neither the command nor the capture said anything was odd, because nothing was: the controller did exactly as asked. Fixed by making `TX`/`TY` echo the current magnet position and the implied move in cm, so the mistake is visible before `TT` is ever sent. **Any command taking a coordinate in a frame with lever arms should print the move it just implied, not the number it just stored.** |
 | T46 | **Translating with heading control IDLE** | The allocator rotates the demand into the body frame by `psi`, and the fans themselves supply 2–3 rad/s² of yaw torque (2.4). Run translation with the wheel idle and that torque rotates the thrust vector, which changes the torque — measured `psi` sweeping **0.7° → 25°** during one 3 s move. It is a positive feedback path, not a nuisance, and it is invisible in the translation capture because `theta` is not one of its columns. `TT` now refuses unless the heading controller is engaged. |
 
+| T47 | **Identifying a plant with a broken instrument — the meta-trap of this whole phase** | The fan angle table was "corrected" FOUR times over two days. Three of those corrections were derived from the platform's measured motion, and the position estimate doing the measuring was itself wrong (vision reporting the platform 55 cm off-centre on a 61 cm table; a coasting platform accelerating to 0.57 m/s with the fans off; four differently-angled fans all producing pure-lateral motion). **A wrong actuator map and a broken position estimate produce the SAME symptom** — the platform moves confidently in the wrong direction — so the symptom can never distinguish them, and every "fix" looked exactly as convincing as a real one. What finally settled it took two minutes: once averaged vision-at-rest gave a reference worth trusting, sweeping `TA0/90/180/270` against the real loop answered it on the first attempt. **Fix the instrument, THEN identify the plant.** Every hour spent inferring a plant constant from a broken estimator was wasted, and the wasted hours were indistinguishable from progress while they were happening. |
+| T48 | **A double integrator turns a DC offset into a runaway, and no amount of filtering touches it** | Repeated requests to "filter it better" could not fix drift, because the drift was bias, not noise. 0.012 m/s² of residual offset becomes 0.13 m/s of phantom velocity in 9 s — and under a velocity-shaped control law that phantom is subtracted straight off the command, so the platform sits still believing it is already moving at the speed cap. A low-pass removes vibration and does **nothing** to a constant. The corrections that work are the ones that measure the offset: a zero-velocity update whenever the platform is known still, and a zero-acceleration update at the same moment (at rest, the reading IS the bias). Distinguish "my signal is noisy" from "my signal is offset" before reaching for a filter — they look identical in a plot of position and have completely different fixes. |
+| T49 | **Accelerometer bias measured with the fans OFF does not apply with the fans ON** | Measured 2026-08-21: `B` (fans off) then `TB` (fans at 12% idle) differ by **0.158 m/s² on one axis** — ten times the boot bias. MEMS accelerometers rectify vibration: prop shake is not zero-mean after the sensor's own nonlinearity, so the effective DC offset shifts the moment the props spin. It is provably sensor error and not motion — a real 0.158 m/s² would have moved the platform half a metre during the 2.5 s measurement, and it sat still. The signature in flight is that **x drift REVERSES SIGN between the fans-off settle and the fans-on hop** (+31 mm/s vs −42 mm/s, same run). Measure the bias in the condition the estimator actually runs in. ⚠️ Still only a partial fix: `TB` measures at 12% idle while a hop runs the pushing fans at 30–60%, and rectification scales with vibration amplitude. |
+| T50 | **A detector whose failure is SILENT, gating everything downstream** | The rest detector drives three separate corrections — the zero-velocity update, the accel-bias refresh, and the vision snap. Its thresholds (`\|a\| < 0.10`, `\|w\| < 0.06`) were chosen against a quiet platform, but during a dock the reaction wheel spins under heading hold the whole time and its vibration alone holds `\|a\|` above the gate. So the latch never fired and **all three corrections silently did not happen**, with the only visible symptom being that `SETTLE` always ran its full timeout — something nobody would look at twice. Measured consequence: 27 cm of x drift in 4 s while sitting still with the fans off. ⚠️ Loosening the thresholds (0.30/0.12) made behaviour WORSE and was reverted — latching earlier means latching while the platform is still genuinely creeping, and the ZUPT then erases real velocity. The gate is a genuine tradeoff, not a number to turn up. **Anything that gates several corrections at once should announce when it fires, and when it has not fired for a suspiciously long time.** |
+| T51 | **A capture that stops itself one cycle in, and reports nothing** | Hit TWICE in one session, both times costing a full round of hardware runs that produced empty folders. `tcap_stop()` marks a capture pending only `if (s_n > 0)`, so a capture stopped before its first decimated sample is discarded in silence. Both triggers were the same shape: a stop-condition of "the translation controller is not enabled" evaluated true on the very first cycle, because (a) the `TC` fan probe drives fans open-loop and never enables the controller at all, and (b) the `TG` dock sequence deliberately ENTERS via its settle phase, so the controller is disabled at t=0. The second fix then over-corrected — gating the SAMPLING on the sequencer as well as the stop test, so a whole dock recorded nothing. **A recorder that can discard a run must say so; and gate the stop test, never the sampling.** |
+| T52 | **A safety gate asking a question that has stopped being relevant** | `trans_update` withdrew thrust whenever vision was not FRESH, and `TT`/`TC` refused to start for the same reason — correct under B21b, when vision WAS the position source. Once position moved to IMU dead reckoning that gate withdrew thrust for a reason that no longer applied, and the symptom was total: **the fans go completely silent the moment the Pi stops sending**, zero throttle every cycle, while the estimate is perfectly good and the controller believes it is commanding a move. The surviving requirement from T9 is "never act on a pose we do not have", and the test for that is `st->valid`, not sensor freshness. **When the source of a quantity changes, re-read every guard that mentions the old source.** |
+| T53 | **Offsets in a frame with lever arms cannot be constants** | A 2.3 cm lateral error at the magnet was nearly patched by subtracting 2.3 cm from `x`. That is only correct at `psi = 0`: the magnet sits on an arm that ROTATES with heading, so the correct model is a body-frame offset resolved through `psi` (`mag_x = x − L_MAG·sin psi − lat·cos psi`). The same reasoning applies to `TI`, which must declare the pose in MAGNET coordinates and back-solve the centre through both arms — setting the centre directly quietly placed the magnet 2.3 cm off. ⚠️ Also worth knowing: that 2.3 cm was measured while the estimator was still integrating backwards, so it may have been an artifact rather than geometry. Re-derive a geometric constant after fixing anything upstream of the measurement that produced it. |
+
 Plus **every trap in `RTOS_migration.md` Appendix A** — the one-writer/one-reader
 invariants, `delay()`, watchdogs measuring iterations instead of time, and the rest.
 
@@ -2011,6 +1964,9 @@ invariants, `delay()`, watchdogs measuring iterations instead of time, and the r
 | **B26** | **Running the Pi at 600 MHz (undervolt-throttled) and accepting it, rather than fixing the supply** | 2026-08-20, user decision under time pressure. The Pi browns out under load on the shared 5 V rail and the firmware clamps it to 600 MHz. **Everything tried, and ruled out:** thermal foldback (regulator stays cool), transient sag (300 µF of parallel bulk changed *nothing*), resistive drop between buck and Pi (measured ~5.15 V at the Pi end under load), and the load path (already direct, not through the breadboard). **No confident diagnosis was reached** — the meter says the rail is fine and the Pi's own detector says it is not, and a DMM averaging over ~100 ms structurally cannot resolve what a fast detector sees (same blind spot as T6, "a DC voltmeter verifies duty cycle, not pulse width"). **Cost of accepting it:** roughly **7 fps at ~140 ms latency** instead of 28.6 fps at 61 ms. Tolerable because the control loop runs at 200 Hz on the IMU between fixes and `age_us` compensates the delay — docking is a slow manoeuvre. **Rejected `force_turbo=1` + `avoid_warnings=2`**, which would hold max clock by *disabling the protection* rather than supplying more power: this project has already lost one Pi and corrupted one SD card to brownouts, and under-voltage protection is what stands between a sagging rail and the next one. **The real fix, when not racing: a dedicated 5 V/3 A buck for the Pi alone.** Everything above was trying to make one marginal LM2596 feed a Pi, an STM32, a camera and a pile of ICs. |
 | **B27** | **V4L2 buffer depth follows whether the CPU outruns the camera — 1 when throttled, 4 when not** | 2026-08-20. At 1400 MHz, depth 1 left the driver nowhere to capture while userspace held a frame, so it missed every other one: **15.9 fps against the camera's 30**. Depth 4 fixed that (28.6 fps) and cost 16 ms of latency to processing contention, which was a good trade. **At 600 MHz the trade inverts.** Processing takes ~140 ms against a 33 ms frame interval, so the queue backs up and `grab()` returns frames up to 130 ms old — **deep buffering silently converts a rate problem into a LATENCY problem**, and latency is the one thing the estimator cannot absorb. Depth 1 makes the driver drop stale frames instead of queueing them. Exposed as `--buffersize`, defaulted to **1** to match the throttled reality. **The rule: buffer deep when you are faster than the source, shallow when you are slower.** |
 | **B28** | **Phase 6 first light: the fan angle table is anchored on the CLOSED LOOP, not on an open-loop anchor measurement** | 2026-08-20. Three successive tables were tried and the first two were wrong in ways that looked identical from outside — the platform moving confidently in the wrong direction (166° off, then 75° off). **What settled it:** the four single-fan `I50` accelerometer runs give the fans' directions relative to one another reliably (two opposing pairs, 174.8° and 175.7°, pairing `{1,4}` and `{2,3}` exactly as coded), but they cannot relate that geometry to the CAMERA AXIS. That anchor was first taken from hand-shove `I0` captures and was wrong by ~76° (T42). The closed loop supplies it in one run: commanded body direction versus achieved `dv/dt`, with the achieved *magnitude* confirming the actuators were working (0.637 m/s² measured against 0.72 predicted), so a direction mismatch can only be a rotated table. **Adopted value = the remembered table rotated −90°**: `fan1 −130, fan2 −40, fan3 +140, fan4 +50`. The remembered angles were right in structure AND in their 90° spacing; only their zero was wrong. Cross-check against the raw `I50` angles is a uniform 5.6°, inside the yaw contamination of those runs, and a repeat measurement after mechanical work on the fans reproduced the same common reference to ~6°. **Adopt the physical 90° geometry the user knows, use measurement to confirm it, and do not let measurement out-resolve it** — the residuals track which runs yawed most, because an accelerometer that is not at the centre of rotation picks up centripetal and tangential terms. |
+| **B30** | **Position is IMU dead reckoning from a declared start pose; vision is demoted to a stationary-only fix** | 2026-08-21, forced by measurement over a long debugging session. Vision-derived `x`/`y` proved unusable while moving -- it reported the platform 55 cm off-centre on a 61 cm table, four differently-angled fans all producing pure-lateral motion, and a coasting platform ACCELERATING to 0.57 m/s with the fans off. Range and bearing are fine; the derived Cartesian position is not. **The split adopted is by CONDITION, not by weight:** above `EST_VIS_VMAX` (2 cm/s) vision contributes nothing at all to position, and at rest it is ADOPTED outright -- 8 frames averaged and used to REPLACE `x`/`y`, not blended into them. Averaging beats one frame by sqrt(N) and costs nothing because the platform is stationary anyway; replacing beats blending because after a hand-move the dead-reckoned position can be tens of centimetres out and there is no reason to keep any of it. Observed working: a single adoption moved `magx` by 22 cm. **Heading is deliberately untouched** -- `psi` stays gyro-led with vision as a slow absolute reference (T30/T39). Gains: `aPos` 0.05 -> 0.50 but speed-gated, `betaVel` 0.08 -> 0 (velocity now comes from integrating accel; inferring it again from the vision innovation would double-count the same measurement). |
+| **B31** | **Docking is a STEPPED sequence of short hops, not one continuous approach** | 2026-08-21. Dead-reckoning error grows as `bias*T^2`, so the lever that matters is not a better filter but a shorter `T`. `TG` alternates `MOVE` (6-10 cm toward the dock) with `SETTLE` (thrust off, wait for the rest latch, take an averaged vision fix), so each leg only has to survive ~1.5 s of integration instead of the whole trip -- turning a quadratic error into a bounded per-hop one. It ENTERS via `SETTLE` deliberately: the estimate at `TG` time is the worst it will ever be, having just dead-reckoned a hand-move, so the first action is a fix rather than thrust. Bounded by `DOCK_MAX_HOPS` (10) and a per-settle timeout so a missing Pi cannot stall it. Approach speed is capped (`TL`, default 4.5 cm/s) via a VELOCITY-SHAPED law rather than a position PD with a clamp bolted on -- the clamp version had to strip the demand at the limit, which chattered the throttles 60 -> 12 -> 60 as it moved in and out of saturation. |
+| **B32** | **Every constant that has ever been wrong is now runtime-settable** | 2026-08-21, adopted after the fan table was "corrected" four times (T47). Reflash cycles were the bottleneck on every diagnosis, and a constant that can only be changed by rebuilding gets ARGUED about instead of TESTED. Exposed: `TA` fan-table rotation, `TR` accel-to-body rotation, `TM` magnet lateral offset, `TL` speed cap, `TH` hop length, `TP`/`TD`/`TF` gains, `TV` vision gain, `TE` brake assist, `TW` power trips, `TB` bias-at-idle. The two that actually settled long-running arguments were `TA` and `TR`, each in about two minutes. **Whatever wins a sweep should be folded back into the compiled default and the knob returned to zero** -- `TA180` and `TR270` both have been. |
 | **B29** | **Per-fan thrust asymmetry is left in the plant, NOT compensated in the allocator** | 2026-08-20. Measured net acceleration at a nominal 50%, against a model predicting 0.265 m/s²: `fan1 0.258, fan4 0.235` healthy; `fan2 0.073, fan3 0.104` — i.e. the entire `{2,3}` axis delivers **63–69%** of the `{1,4}` axis. That is a systematic direction bias (a demand at 45° between the axes comes out ~12° rotated toward `{1,4}`) and it makes tuning feel non-repeatable. **Not fixed in software**, for two reasons: the square-law inversion means a 63%-efficient fan needs `sqrt(1/0.63) = 1.26x` the throttle for the same thrust, against a `FAN_THROTTLE_MAX` of 60% that already binds on large moves — so the compensation would buy direction accuracy with authority we do not have; and a per-fan efficiency table silently goes stale the moment a prop is touched, which on this machine is often. **The mechanical fix is proven on this hardware**: the same intervention took fan 4 from 0.118 to 0.235 in one session. Revisit only if the asymmetry survives mechanical work. ⚠️ Whatever is done, **re-measure with four `I50` runs after any prop or ESC-direction change** — fan 3 went 0.245 → 0.104 across exactly such a change, and nothing in the firmware could have known. |
 
 ---

@@ -26,40 +26,32 @@
         fan 1  +140 deg          fan 4   -40 deg     <- opposing pair
         fan 2  +230 deg          fan 3   +50 deg     <- opposing pair
 
-  Two orthogonal axes, rotated 40 deg off the camera axis. These are the
-  originally remembered values, RESTORED 2026-08-20 after two "corrections"
-  (+180, then -90) both turned out to be derived from vision.
+  Two orthogonal axes. SETTLED 2026-08-21 at the remembered mounting + 180 deg,
+  verified on hardware by sweeping TA0/90/180/270 against the real loop.
 
-  ⚠️ THE HISTORY IS THE LESSON HERE, not the number. Both wrong tables were
-  produced by measuring the platform's motion with VISION -- displacement in one
-  case, velocity in the other -- and vision position was itself broken:
+  ⚠️ THE HISTORY IS THE LESSON, not the number. Four values were tried over two
+  days. The first three were each diagnosed from the platform's measured motion
+  -- and the position estimate doing the measuring was itself broken:
 
      it put the platform 55 cm off-centre on a 61 cm table
      it reported four differently-angled fans all pushing along dock X, y flat
      it reported a COASTING platform accelerating to 0.57 m/s, fans off
 
-  Every direction "correction" therefore inherited that error, and each one
-  looked exactly as convincing as a real result. A wrong fan table and a broken
-  position estimate produce the same symptom -- the platform moves confidently
-  in the wrong direction -- so the symptom cannot distinguish them.
+  So every "correction" inherited that error and every one looked convincing. A
+  wrong fan table and a broken position estimate produce the SAME symptom -- the
+  platform moves confidently in the wrong direction -- so the symptom can never
+  distinguish them. Only after vision-at-rest gave a reference worth trusting
+  did a two-minute sweep settle it.
 
-  WHAT THE TABLE RESTS ON NOW. The accelerometer, which is body-fixed and cares
-  nothing for psi, bearing, the camera lever arm or tag dropout, measured all
-  four fans across THREE separate sessions spanning two rounds of mechanical
-  work on the fans:
+  The accelerometer measured the four fans consistently across three sessions
+  (pooled: fan1 -130, fan2 -40, fan3 +121, fan4 +42), which pinned the GEOMETRY
+  -- the pairing, the 90 deg spacing -- but not its relationship to the camera
+  axis. That anchor is what took four attempts, and it is 180 deg from what was
+  reasoned. The same flip appears in EST_ACC_ROT_DEG (270, not the reasoned 90):
+  one inverted convention showing up in two places, not two separate errors.
 
-        session A   fan1 -127.2  fan2 -49.2  fan3 +126.5  fan4 +47.6
-        session B   fan1 -133.5  fan2 -46.8  fan3 +117.0  fan4 +43.3
-        session C   fan1 -130.4  fan2 -40    fan3 +120    fan4 +34
-        pooled      fan1 -130    fan2 -40    fan3 +121    fan4 +42
-
-  Against the physically known mounting above, that is a UNIFORM +90 deg on all
-  four channels. A common offset across four independent measurements cannot
-  come from noise, and it is far stronger evidence than any single run -- which
-  is precisely what the two failed corrections were built on. The same +90 is
-  the accelerometer-to-body rotation the estimator uses for dead reckoning
-  (EST_ACC_ROT_DEG), so one constant is now doing both jobs and a future error
-  in it will show up in both places at once rather than hiding in one.
+  RULE THIS EARNED: fix the instrument, THEN identify the plant. Hours spent
+  inferring this constant from a broken estimator were all wasted.
 
   ⚠️ A SIGN ERROR HERE IS A RUNAWAY. If a fan pushes opposite to what this table
   says, the controller sees the error GROW and pushes HARDER. With unguarded
@@ -142,6 +134,20 @@ bool trans_enabled(void);
    overshoot: arrival speed is what the last centimetres have to absorb, and the
    platform's only brake is friction plus whatever authority is left after the
    feedforward has cancelled it. */
+/* OPTIONAL: stop cancelling Coulomb drag while BRAKING. Default OFF -- with it
+   off the feedforward behaves exactly as before.
+
+   Rationale: the MOVING branch cancels 0.26 m/s^2 of friction so the platform
+   can cruise, but when the demand OPPOSES current velocity the controller is
+   trying to stop, and friction is then the best brake the platform has.
+   Cancelling it there throws that away at the one moment it is most useful,
+   which is what lets a stick-slip release run all the way to the dock.
+   Left as an option rather than made default because it was tried once and made
+   things worse -- though that attempt was while the estimator was integrating
+   backwards (EST_ACC_ROT_DEG was 180 deg out), so it never had a fair test. */
+void  trans_setBrakeAssist(bool on);
+bool  trans_getBrakeAssist(void);
+
 void  trans_setVmax(float v);
 float trans_getVmax(void);
 

@@ -20,11 +20,11 @@ reaction wheel — a benchtop analogue of spacecraft attitude control. Long-term
 
 goal is autonomous vision-guided docking (translation via four fans, AprilTag
 
-on the dock, camera on the platform). **Vision, the Pi link and the dock-relative
+on the dock, camera on the platform). **That goal is MET as of 2026-08-21: the
 
-estimator all work; translation CONTROL is Phase 6 and not started** — see
+platform docks itself.** Slide it anywhere by hand and it returns to the dock in
 
-`TRANSLATION_DOCKING.md`. All *actuation* today is rotation-only.
+short hops, correcting against vision at each stop — see `TRANSLATION_DOCKING.md`.
 
 The project exists to demonstrate a full engineering stack: system
 
@@ -36,10 +36,12 @@ depth matters as much as the demo working.
 
 ## 2. Current state
 
-**Phases 0-5 of `TRANSLATION_DOCKING.md` are COMPLETE.** Tags `trans-p1-fans`,
+**Phases 0-6 of `TRANSLATION_DOCKING.md` are COMPLETE.** Tags `trans-p1-fans`,
 `trans-p2-plantid`, `trans-p3-link`, `trans-p4-vision`, `trans-p5-estimator`. The RTOS
 migration was completed before them (`rtos-p7-complete`). **Phase 6 -- translation
-control -- is NEXT and is the first time fans will be driven by a controller.**
+control -- WORKS: the platform docks itself, somewhat consistently.** Phases 7
+(combined 3-DOF) and 8 (SEARCH/ACQUIRE state machine) remain, but the demo the
+project was built for is running.
 
 **Rotation control: re-identified and retuned 2026-08-19. 0.47 deg mean final error
 over +-5 to +-180 deg, every slew in ONE move, wheel returning fully to rest.**
@@ -48,8 +50,8 @@ pre-translation platform and are no longer comparable.
 
 **Translation plant: identified in ACCELERATION units** (mass and force cancel — see
 guide decision B14). `A(throttle) = 2.1e-4*pct^2 m/s^2`, `A_c = 0.26 m/s^2`, breakaway
-~35% throttle, thrust-to-friction ratio **2.9x — PASS**. **No translation controller
-is written yet**; that is Phase 6.
+~35% throttle, thrust-to-friction ratio **2.9x — PASS**. Per-fan constants since
+measured separately (`FAN_K_A`) because the four channels are NOT equal.
 
 **Firmware: six FreeRTOS tasks.** `fanTask` (prio 2, 333 Hz) is the sole fan writer,
 driving four DSHOT300 channels over TIM1 + DMA burst. Fans are killed ahead of the
@@ -147,63 +149,39 @@ psi = theta + psi_offset, and ONLY the offset is estimated
 `PI_FLAG_AMBIGUOUS` drops the heading gain to a quarter. Accelerometer prediction
 deliberately not used yet -- its body-frame axis signs are unverified (T11).
 
-**Phase 6 RUNS AND CONVERGES (2026-08-20): 3.5 cm -> 1.6 mm. NOT TUNED.**
-`src/translation.*` is PD in ACCELERATION units -- no mass term, because B14 identified
-the plant so mass cancels; the guide's `K_p = omega_n^2 * m` is wrong for this build.
-Dock->body rotation by psi, allocation onto two opposing fan pairs with 12% idle bias,
-then `throttle = sqrt(A / 2.1e-4)`.
-
-**Four latent bugs stood between "builds" and "converges." All fixed; all in
-`TRANSLATION_DOCKING.md` Appendix A, and all worth reading before touching this again:**
-
-- **T41 -- the estimator mixed two rotation conventions.** `theta` is CW-positive,
-  the dock frame is CCW-positive, and `psi = theta + offset` silently requires them to
-  agree. **Every static Phase 5 test was structurally incapable of seeing this** --
-  with `theta` constant the offset absorbs any sign error. Fixed with a named
-  `EST_THETA_SIGN` where the conventions meet, NOT by touching `GYRO_SIGN`.
-- **T42 / B28 -- the fan angle table was wrong twice**, 166 deg then 75 deg, both
-  times looking plausible. A good relative measurement plus a shaky anchor is a shaky
-  answer. The closed loop is the only thing that samples the whole chain at once.
-- **T43 -- the Coulomb feedforward MOVING branch carried rotation's sign without
-  rotation's `-a`**, so it ADDED drag instead of cancelling it. Translation needs
-  `+A_c*v_hat`; rotation needs negative only because the wheel pushes the platform the
-  other way. Check: with the correct sign the two branches agree when moving toward
-  target, so the `V_MOVING` crossing is smooth.
-- **T44 -- the divergence guard derived its threshold from `bestErr`**, so it tightened
-  as the controller improved and shot the first successful run. Now fixed-distance once
-  arrived, and the timeout stops applying after arrival.
-
-Fan geometry, degrees CCW from the camera axis: **fan1 -130, fan2 -40, fan3 +140,
-fan4 +50** (the originally remembered table rotated -90). Pairs are 1/4 and 2/3.
-
-⚠️ **Fans 2 and 3 deliver 63-69% of fans 1 and 4.** Not compensated in software (B29).
-**Re-measure all four with `I50` after any prop or ESC-direction change.**
-
-New tools: `src/trans_capture.*` records a `TT` move at 20 Hz to CSV; `TP`/`TD`/`TF`
-set `Kp`/`Kd`/`ff` at runtime. `TT` refuses if heading control is IDLE (T46), and
-`TX`/`TY` echo the implied move so a centre-vs-magnet mix-up shows before arming (T45).
+**PHASE 6 DONE -- THE DOCKING DEMO WORKS (2026-08-21).** Place the platform on the
+dock, `TI`, slide it anywhere by hand, `TG` and it returns in 6-10 cm hops with a
+vision fix at each stop. Somewhat consistent; still biases right on arrival.
 
 ```
-TX<m> TY<m>   set the dock-frame target for the MAGNET (not the platform centre)
-TT            enable -- REFUSES unless pose is FRESH
-TS            stop.   X also stops it.
+DEMO:  B  ->  R  ->  TB  ->  TI  ->  (slide by hand)  ->  TG        X stops all
+       TB re-measures accel bias WITH FANS AT IDLE. Never re-run B after it.
+       SLIDE it, never lift -- 1 deg of tilt is 0.17 m/s^2, 14x the bias.
 ```
 
-Safety: a **divergence guard** kills all four fans if the error grows under thrust
-(catches a wrong fan angle, backwards prop, reversed ESC or a frame-sign slip without
-caring which), plus a 15 s no-convergence timeout. B21b is fixed -- `PI_LOST` is now a
-SOFT zero with the ESC left armed, and the controller withdraws thrust itself when the
-pose is not FRESH.
+**Architecture: position is IMU dead reckoning; vision is a stationary-only fix.**
+Vision x/y proved unusable in motion, so above 2 cm/s it contributes nothing, and
+at rest 8 frames are averaged and ADOPTED (replacing, not blending). Heading stays
+gyro-led. Docking is STEPPED because dead-reckoning error grows as `bias*T^2` --
+short hops bound it. See guide B30/B31.
 
-⚠️ **The Pi runs at 600 MHz, undervolt-throttled, and that is ACCEPTED (B26).** ~7 fps
-at ~140 ms latency. No diagnosis was reached: regulator cool, 300 uF changed nothing,
-meter reads 5.15 V at the Pi while the Pi disagrees (T40). Real fix is a dedicated
-5 V/3 A buck for the Pi alone. **Do NOT use `force_turbo`/`avoid_warnings`** -- that
-disables protection rather than supplying power, and this project has already lost a Pi
-and an SD card to brownouts. Vision settings retuned for it: `--decimate 3.0`,
-`--buffersize 1` (B27 -- buffer deep when faster than the source, shallow when slower).
+**Two constants cost two days and were both settled by runtime sweep, not
+argument:** `EST_ACC_ROT_DEG = 270` (not the reasoned 90) and `FAN_ANGLE_DEG =
+{+140,+230,+50,-40}` (remembered table +180). **Read trap T47 before touching
+either:** a wrong actuator map and a broken position estimate produce the
+identical symptom, so three earlier "corrections" were each derived from the
+estimator that was lying. Fix the instrument, then identify the plant.
 
-**NEXT: run and tune Phase 6.** Nothing in it has touched hardware.
+⚠️ **Accel bias with fans OFF does not apply with fans ON (T49)** -- rectified
+prop vibration shifts it 0.158 m/s^2, ten times the boot bias. `TB` corrects at
+12% idle; hops run 30-60%, so it is partial. This is the leading suspect for the
+remaining rightward bias.
+
+⚠️ **Fans 2 and 3 deliver ~65% of fans 1 and 4**, compensated per-fan in
+`FAN_K_A`. Re-measure with `TC` after any prop or ESC-direction change.
+
+**Every constant that has ever been wrong is runtime-settable** -- `TA TR TM TL
+TH TP TD TF TV TE TW TB`. Full table in the guide's command reference.
 
 **Raw calibration data** lives in `calibration/runs/`, one folder per experiment named
 by what it established, indexed in `calibration/runs/INDEX.md`.

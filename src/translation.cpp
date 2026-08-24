@@ -39,6 +39,7 @@ static float s_ffFrac = 1.00f;
 static const float FAN_ANGLE_DEG[4] = { +140.0f, +230.0f, +50.0f, -40.0f };
 
 static float s_vmax   = TRANS_V_MAX;
+static bool  s_brakeAssist = false;   /* OFF = original behaviour          */
 static float s_fanRot = 0.0f;    /* runtime rotation on the whole table, deg */
 static bool  s_enabled = false;
 static float s_tx = 0.0f, s_ty = 0.0f;
@@ -74,6 +75,9 @@ void trans_enable(bool on) {
   }
 }
 bool trans_enabled(void) { return s_enabled; }
+
+void  trans_setBrakeAssist(bool on) { s_brakeAssist = on; }
+bool  trans_getBrakeAssist(void)    { return s_brakeAssist; }
 
 void  trans_setVmax(float v) { if (v > 0.0f && v <= 0.30f) s_vmax = v; }
 float trans_getVmax(void)    { return s_vmax; }
@@ -116,7 +120,13 @@ void trans_getGains(float* kp, float* kd, float* ff) {
    accelerometer under-reads exactly where the fan is weakest. Re-measure with
    four `I50` runs after ANY prop or ESC-direction change -- fan 3 went 0.245
    to 0.104 across one such change and nothing in firmware could know. */
-static const float FAN_K_A[4] = { 2.07e-4f, 1.33e-4f, 1.46e-4f, 1.98e-4f };
+/* fan3 TRIMMED 1.46e-4 -> 1.20e-4 (2026-08-21, from watching it dock). These
+   are inverse-thrust constants -- pct = sqrt(a/K) -- so LOWERING K raises the
+   throttle commanded for a given demand. sqrt(1.46/1.20) = 1.10, so fan 3 now
+   gets ~10% more throttle, i.e. ~21% more thrust if the square law holds.
+   Trim, not measurement: the measured value is in the comment above and should
+   be restored if fan 3 is ever serviced or re-probed with TC. */
+static const float FAN_K_A[4] = { 2.07e-4f, 1.33e-4f, 1.20e-4f, 1.98e-4f };
 
 /* Acceleration -> throttle percent for ONE fan. The square-law inversion is the
    fan analogue of the wheel axis's feedback linearisation, but STATIC -- there
@@ -285,8 +295,13 @@ bool trans_update(const EstState* st, bool poseFresh) {
   float speed = sqrtf(st->vx * st->vx + st->vy * st->vy);
   float ffx = 0.0f, ffy = 0.0f;
   if (speed > TRANS_V_MOVING) {
-    ffx = +TRANS_A_COULOMB * (st->vx / speed);   /* MOVING: cancel drag       */
-    ffy = +TRANS_A_COULOMB * (st->vy / speed);
+    /* Brake assist (OFF by default, TE1): skip the drag cancellation when the
+       demand opposes velocity, i.e. when we are trying to slow down. */
+    bool braking = s_brakeAssist && (ax * st->vx + ay * st->vy <= 0.0f);
+    if (!braking) {
+      ffx = +TRANS_A_COULOMB * (st->vx / speed); /* MOVING: cancel drag       */
+      ffy = +TRANS_A_COULOMB * (st->vy / speed);
+    }
   } else {
     float m = sqrtf(ax * ax + ay * ay);
     if (m > 1e-6f) {
