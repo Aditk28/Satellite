@@ -102,4 +102,4 @@ pio run -e rtos -t upload
 
 ## License
 
-No license file yet — all rights reserved by default until one is added.
+MIT — see [LICENSE](LICENSE).
