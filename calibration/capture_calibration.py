@@ -1,46 +1,21 @@
 #!/usr/bin/env python3
 """
-capture_calibration.py
+Capture the firmware's CSV dumps from the serial port into per-test files.
 
-Companion script for calibration.cpp. The Nucleo-F446RE in this project has
-no SD card / filesystem, so it can't write files itself -- this script runs
-on your PC, connects to the board over the SAME serial link you'd normally
-watch in PuTTY, triggers the sweep's start signal itself, and writes each
-test's CSV dump straight into its own file. Everything else the board
-prints (bring-up messages, per-test status lines) is echoed to the console
-live, same as you'd see in PuTTY. This is meant to fully replace PuTTY for
-actual data-collection runs, not run alongside it -- only one program can
-hold a COM port open at a time, which is also why closing PuTTY was
-necessary before this script could open the port at all.
+The board has no filesystem, so this runs on the PC in place of a serial
+terminal. Board output is echoed to the console, and each block between
+"--- capture start (test N/M: label) ---" and "--- capture end ---" is saved
+as testNN_<label>.csv. Lines typed into the console are sent to the board.
+If the firmware prints the bring-up prompt, the start signal is sent
+automatically.
 
-TWO-WAY, like a terminal: anything you type in this console + Enter gets
-sent straight to the board, same as typing in PuTTY -- e.g. to manually
-trigger an abort (any byte) if something looks wrong mid-sweep. A background
-thread handles this so it doesn't block the reading/logging loop.
-
-USAGE:
+Usage:
     pip install pyserial
-    python capture_calibration.py --port COM5
-    python capture_calibration.py --port /dev/ttyACM0 --baud 115200
+    python capture_calibration.py                 # auto-pick a port
+    python capture_calibration.py --port COM5 --baud 115200
 
-    (omit --port to see a list of available ports and pick one)
-
-WORKFLOW:
-    1. Press the Nucleo's physical RESET button (or power-cycle it) so the
-       sketch is at the very start of setup() -- same as the "reset the
-       board to run again" instruction already printed by the firmware.
-    2. Run this script. It waits for the exact prompt
-       "Hardware bring-up done. Send any character..." that
-       waitForStartSignal() prints, then sends a single byte to trigger
-       the sweep -- you don't need to type anything to start it.
-    3. Watch the console for live progress, and type + Enter at any time to
-       send something manually (e.g. to abort). When the sweep finishes, a
-       timestamped folder will contain one .csv file per test, named from
-       that test's number and label.
-
-NOTE: this works over either link (USB Serial or the HC-05 Bluetooth COM
-port) -- they carry identical data, so just point --port at whichever one
-you're connected to. Don't run this against both at once; it only needs one.
+Works over USB or the HC-05 Bluetooth port. Only one program can hold the
+port, so close any other terminal first.
 """
 
 import argparse
@@ -59,20 +34,12 @@ except ImportError:
 
 START_PROMPT = "Hardware bring-up done. Send any character on Serial or HC-05 to start the sweep..."
 
-# Matches: --- capture start (test 3/9: spin to 1.0V, then reverse to -1.0V) ---
+# e.g. "--- capture start (test 3/9: spin to 1.0V) ---"
 RE_START = re.compile(r"^--- capture start \(test (\d+)/(\d+): (.*)\) ---$")
-# Matches: from=1.00V to=-1.00V hold=2000ms stop_reason=platform_settled
-RE_META = re.compile(r"^from=([-\d.]+)V to=([-\d.]+)V hold=(\d+)ms stop_reason=(\w+)$")
 RE_END = re.compile(r"^--- capture end ---$")
 
-# The CSV header is whatever line starts with the time column. Detecting the
-# header rather than pattern-matching the metadata line is deliberate: the
-# firmware's metadata fields change as the sweep evolves (repeats, phase
-# flags, bias, staircase parameters), and an exact-match regex on that line
-# silently stalls the whole capture whenever it changes -- which is exactly
-# what happened when repeats and the phase-A flags were added. Everything
-# between the start marker and this header is treated as opaque metadata and
-# copied through verbatim, so new fields never break capture again.
+# Everything between the start marker and the CSV header is copied through as
+# metadata without parsing, so new firmware fields don't break capture.
 RE_HEADER = re.compile(r"^t_us\s*,")
 
 
@@ -83,11 +50,7 @@ def sanitize(label):
 
 
 def stdin_forwarder(ser):
-    """Runs in a background thread: whatever you type + Enter in the console
-    gets written straight to the serial port, so this script works as a
-    normal two-way terminal (like PuTTY) in addition to auto-capturing CSV
-    data. Daemon thread -- dies with the main thread on exit/Ctrl+C, no
-    special shutdown handling needed."""
+    """Background thread: send each console line to the board."""
     while True:
         try:
             line = input()
@@ -99,12 +62,8 @@ def stdin_forwarder(ser):
             break
 
 
-# The HC-05's COM number is assigned by Windows when the pairing is made and
-# changes on its own -- it has been COM7, COM8 and COM12 so far. Typing the
-# current one into --port every session is exactly the kind of manual step that
-# gets it wrong once and loses a run, so the port is ranked and opened
-# automatically. Bluetooth outranks the ST-LINK because the HC-05 is the link
-# the platform actually runs on untethered; the USB VCP is the fallback.
+# Windows reassigns the HC-05's COM number, so ports are ranked and tried in
+# order: Bluetooth first (the untethered link), then ST-LINK, then other USB.
 def rank_port(p):
     text = f"{p.description} {p.manufacturer or ''}".lower()
     if "bluetooth" in text:
@@ -126,11 +85,8 @@ def pick_port():
     for p in ports:
         print(f"  {p.device}  ({p.description})")
 
-    # A paired HC-05 shows up as TWO 'Standard Serial over Bluetooth link'
-    # ports, outgoing and incoming, and only the outgoing one opens. There is
-    # nothing in the description to tell them apart, so the test is simply
-    # whether it opens -- which is also the test that matters. Ports already
-    # held by another terminal fail here too, which is the behaviour we want.
+    # A paired HC-05 shows up as two Bluetooth ports and only the outgoing one
+    # opens, so take the first port that opens.
     for p in sorted(ports, key=rank_port):
         try:
             serial.Serial(p.device, timeout=0.1).close()
@@ -147,15 +103,12 @@ def pick_port():
 def main():
     parser = argparse.ArgumentParser(description="Capture the calibration sweep's CSV output into per-test files.")
     parser.add_argument("--port", default=None, help="Serial port, e.g. COM5 or /dev/ttyACM0")
-    parser.add_argument("--baud", type=int, default=115200, help="Baud rate (default 115200, matches the firmware)")
+    parser.add_argument("--baud", type=int, default=115200, help="Baud rate (default 115200)")
     parser.add_argument("--outdir", default=None, help="Output folder (default: calibration/runs/run_<timestamp>/)")
     args = parser.parse_args()
 
     port = args.port or pick_port()
-    # Default output lives in calibration/runs/ next to this script, NOT in the
-    # project root -- 25 timestamped folders had accumulated there by Phase 2.
-    # Resolved from __file__ so it lands in the same place whether you run this
-    # from the project root or from calibration/.
+    # Resolved from __file__ so the default is the same from any working directory.
     if args.outdir:
         outdir = args.outdir
     else:
@@ -166,10 +119,7 @@ def main():
 
     print(f"Opening {port} at {args.baud} baud...")
     ser = serial.Serial(port, args.baud, timeout=1)
-    # Nucleo's ST-LINK VCP does not auto-reset the target on connect, so this
-    # just starts reading whatever the board is currently printing -- press
-    # the physical reset button before running this script if you want the
-    # full bring-up sequence from the top.
+    # Opening the port does not reset the Nucleo. Press RESET to see bring-up.
 
     forwarder = threading.Thread(target=stdin_forwarder, args=(ser,), daemon=True)
     forwarder.start()
@@ -191,14 +141,12 @@ def main():
         while True:
             raw = ser.readline()
             if not raw:
-                continue  # timeout with nothing received, keep waiting
+                continue
             try:
                 line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
             except Exception:
                 continue
 
-            # Trigger the sweep ourselves once we see the exact prompt --
-            # removes the need for a second terminal to type into.
             if not sent_start_signal and START_PROMPT in line:
                 print(line)
                 print(">> Sending start signal...")
@@ -217,19 +165,16 @@ def main():
                     state = "AWAIT_HEADER"
                     print(f">> Capturing test {cur_test_num}/{cur_total}: {cur_label}")
                 else:
-                    print(line)  # ordinary status line -- just echo it
+                    print(line)
 
             elif state == "AWAIT_HEADER":
                 if RE_HEADER.match(line):
                     cur_header = line
                     state = "IN_DATA"
                 else:
-                    # Opaque metadata -- copied through without being parsed.
                     cur_meta_lines.append(line)
                     stall_guard += 1
-                    # If the header never arrives, don't silently swallow the
-                    # rest of the sweep the way the old parser did. Bail back
-                    # to IDLE and say so, loudly.
+                    # No header after a dozen lines: give up on this block.
                     if stall_guard > 12:
                         print("!! No CSV header found after the capture-start marker.")
                         print("!! Expected a line beginning with 't_us,'. Skipping this block.")
@@ -261,8 +206,8 @@ def main():
         if files_written:
             print(f"{files_written} test file(s) in {outdir}/")
         else:
-            print(f"No files written. If the board was streaming data, the capture-start "
-                  f"marker or CSV header didn't match what this script expects.")
+            print("No files written. If the board was streaming data, the capture-start "
+                  "marker or CSV header didn't match what this script expects.")
 
 
 if __name__ == "__main__":

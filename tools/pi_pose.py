@@ -1,71 +1,34 @@
 #!/usr/bin/env python3
 """
-Translation Phase 4, Step 4.3 -- pose extraction. Runs ON THE PI.
+Dock pose from the AprilTags, printed to the console. Runs on the Pi.
 
-Turns tag detections into the three quantities the Phase 3 payload carries:
-range, bearing, rel_yaw -- plus a quality figure the estimator uses to decide
-how much to believe the yaw.
+Prints range, bearing and rel_yaw (the values pi_pose_send.py sends to the
+STM32), the IPPE ambiguity ratio, and the derived platform and magnet position
+in the dock frame. Use it to check signs and geometry by hand. Also provides
+solve() and make_detector() for pi_pose_send.py.
 
-THIS PRINTS. It does not send yet. Verify the signs by hand first (see SIGN
-CHECK below) -- trap T11 is a frame-transform sign error producing plausible
-motion in the wrong direction, and open-loop verification is the cheap way to
-catch it. Wiring to USART6 comes after the signs are confirmed.
-
------------------------------------------------------------------------------
-BUNDLE, NOT PER-TAG. One solvePnP over every visible tag's corners, treated as
-a single rigid body with known geometry (measured 2026-08-20):
+All visible dock tags are solved together as one rigid, coplanar target:
 
       tag 1 (4 cm)        tag 0 (12 cm)        tag 2 (4 cm)
          |<----- 14.15 cm ---|--- 14.15 cm ---->|
-                     all coplanar, all centres at 9 cm height
 
-Why a bundle and not three independent solves: relative yaw from a SINGLE planar
-tag is ill-conditioned at range -- two orientations project almost identically
-and the solver flips between them frame to frame (T30). Estimating orientation
-from widely-separated points instead of one square's perspective distortion is
-far better conditioned. It also degrades gracefully: any visible subset still
-gives a fix, and the geometry tells you which tags they were.
+Widely spaced points give a much better conditioned yaw than a single tag,
+which flips between two near-identical solutions at range.
 
-NOTE the tags are still COPLANAR, so the ambiguity is improved, not eliminated.
-Mounting the flanking tags on ~2 cm standoffs would kill it structurally, at the
-cost of another measured geometry parameter. Held in reserve -- see T30.
+Frames:
+    dock:   origin at tag 0 centre, +X right as you face the wall, +Y up,
+            +Z out of the wall toward the camera
+    camera: OpenCV, +X right, +Y down, +Z out of the lens
 
------------------------------------------------------------------------------
-FRAMES AND SIGNS -- read before trusting any number.
+    range   = hypot(t.x, t.z)   horizontal distance, camera to dock origin
+    bearing = atan2(t.x, t.z)   positive = dock is to the camera's right
+    rel_yaw = 0 when square-on
 
-DOCK frame (origin at tag 0's centre, as you LOOK AT the wall):
-    +X right      +Y up      +Z out of the wall, toward the camera
-
-CAMERA frame (OpenCV convention, and it is NOT the same as the dock frame):
-    +X right      +Y DOWN    +Z forward, out of the lens
-
-solvePnP returns the pose of the DOCK in CAMERA coordinates. From `t`:
-
-    range   = hypot(t.x, t.z)      horizontal distance, camera -> dock origin.
-                                   Vertical is ignored on purpose: this is a
-                                   planar problem and t.y is just the 2.65 cm
-                                   height offset between lens and tag centres.
-    bearing = atan2(t.x, t.z)      POSITIVE = dock is to the camera's RIGHT
-    rel_yaw = atan2(R[0,2], R[2,2])  the dock's facing versus the camera's.
-                                   ZERO = square-on. Sign convention verified
-                                   by the SIGN CHECK below, not by derivation.
-
-SIGN CHECK -- do this once, on hardware, before believing anything:
-    slide the platform LEFT  -> the dock moves RIGHT in view -> bearing POSITIVE
-    slide the platform RIGHT -> bearing NEGATIVE
-    view the dock from its left side -> rel_yaw one sign, consistently
-If a sign is inverted, fix it HERE and note it, do not compensate downstream.
-
------------------------------------------------------------------------------
-QUALITY. For a planar target, solvePnPGeneric with IPPE returns up to two
-solutions and their reprojection errors. The RATIO of those errors is a direct
-ambiguity measure: near 1.0 means the solver cannot tell them apart and the yaw
-is untrustworthy; a large ratio means one solution clearly wins. That number
-becomes the payload's `quality` field and drives PI_FLAG_AMBIGUOUS, which is how
-the estimator widens R on yaw instead of believing a flipped solution (T30).
+Sign check on hardware: slide the platform left and bearing should go
+positive. If a sign is wrong, fix it here rather than downstream.
 
     ~/vision/bin/python pi_pose.py
-    ~/vision/bin/python pi_pose.py --hz 5        # slower print, easier to read
+    ~/vision/bin/python pi_pose.py --hz 5        # slower print
 """
 
 import argparse
@@ -78,73 +41,48 @@ import numpy as np
 
 from pi_camcfg import lock_exposure, load_intrinsics
 
-# --- measured geometry, 2026-08-20 -------------------------------------------
-# x = horizontal offset of the tag CENTRE from tag 0's centre, metres, +ve right
-# as you look at the wall. All three are at the same height and coplanar, so y
-# and z are 0 for every tag. size = black square edge; MEASURE IT, printers
-# scale, and this multiplies range directly.
+# x = offset of each tag centre from tag 0, metres, +ve right as you face the
+# wall. All tags are coplanar at the same height. size = black square edge.
 TAGS = {
     0: {"size": 0.120, "x":  0.0},
-    1: {"size": 0.040, "x": -0.1415},     # left  as you look at the wall
+    1: {"size": 0.040, "x": -0.1415},     # left as you face the wall
     2: {"size": 0.040, "x": +0.1415},     # right
 }
 
-# Measured focal length, NOT the spec sheet (which claims 120 deg DFOV -> 424).
-# Two known distances gave 958 and 937; see decision B24/B25.
+# Measured focal length at 1280 wide, used when there is no calibration file.
 F_PX_AT_1280 = 947.0
 
-# --- platform geometry, metres ------------------------------------------------
-# Both offsets are along the platform's FACING direction, measured from the
-# platform's centre of rotation (the reaction wheel axis, which is what psi
-# rotates about).
-L_CAM = 0.1346      # lens, ahead of centre
-L_MAG = 0.0946      # docking magnet, ahead of centre (13.46 - 4 cm behind lens)
-D_DOCK = 0.35       # ground magnet, out from the wall. Update if the wall moves.
+# Platform geometry, metres, along the facing direction from the centre of
+# rotation (the reaction wheel axis).
+L_CAM = 0.1346      # lens ahead of centre
+L_MAG = 0.0946      # docking magnet ahead of centre
+D_DOCK = 0.35       # ground magnet distance out from the wall
 
 
 def platform_pose(rng, bearing, relyaw):
-    """Vision measures where the DOCK is relative to the CAMERA. The controller
-    needs where the PLATFORM is relative to the DOCK. Two chained transforms:
+    """Convert the camera's view of the dock into the platform pose in the
+    dock frame, including the lever arm from lens to platform centre and on to
+    the magnet (the arm rotates with heading, so it matters).
 
-      1. invert the measurement -> camera position in the dock frame
-      2. walk the lever arm back from the lens to the platform centre, then
-         forward again to the magnet
-
-    Step 2 matters because the arm ROTATES with heading: a 10 deg heading error
-    swings the lens 2.3 cm from where a naive 'camera ~= platform' model puts
-    it, which is twice the docking tolerance from heading alone.
-
-    DOCK FRAME (2D, horizontal plane; the vertical axis is irrelevant here):
-        origin  tag 0 projected to the table
-          +X    right, as you FACE the wall
-          +Y    out from the wall, toward the approach side
-        psi     platform heading; 0 = facing the wall square-on
-
-    Sanity checks built into the algebra, both confirmed on hardware:
-      psi=0, bearing=0        -> (0, rng)   dead in front at the measured range
-      bearing POSITIVE        -> x NEGATIVE  platform is LEFT of the dock,
-                                 which is what sliding left produced (T11 check)
+    Dock frame (2D, horizontal): origin at tag 0 on the table, +X right as you
+    face the wall, +Y out from the wall, psi = heading, 0 = facing the wall.
+    With psi=0 and bearing=0 the result is (0, rng); positive bearing gives
+    negative x (platform left of the dock).
 
     Returns (x, y, psi, mag_x, mag_y), metres and radians.
     """
     psi = relyaw
-    # Direction from camera to dock, rotated out of the camera axis by bearing;
-    # the camera sits at minus that, scaled by range.
     cam_x = rng * math.sin(psi - bearing)
     cam_y = rng * math.cos(psi - bearing)
-    # Lens is AHEAD of centre, so the centre is behind it along the facing dir.
     plat_x = cam_x + L_CAM * math.sin(psi)
     plat_y = cam_y + L_CAM * math.cos(psi)
-    # Magnet is ahead of centre by a shorter arm.
     mag_x = plat_x - L_MAG * math.sin(psi)
     mag_y = plat_y - L_MAG * math.cos(psi)
     return plat_x, plat_y, psi, mag_x, mag_y
 
 
 def tag_object_points(size, cx):
-    """Corners in DOCK coordinates, in the order the detector reports them:
-    lb, rb, rt, lt (left-bottom, right-bottom, right-top, left-top).
-    Dock frame is +X right, +Y up, so 'bottom' is -Y."""
+    """Tag corners in dock coordinates, in detector order lb, rb, rt, lt."""
     h = size / 2.0
     return np.array([
         [cx - h, -h, 0.0],
@@ -157,8 +95,7 @@ def tag_object_points(size, cx):
 def make_detector(decimate, threads):
     try:
         from apriltag import apriltag as ATag
-        # kwarg is `threads`, NOT `Nthreads` -- the docstring is wrong and it
-        # defaults to 1, which costs ~3x on a quad-core (T32).
+        # The kwarg is `threads`, not `Nthreads`; it defaults to 1.
         return ATag("tag36h11", threads=threads, decimate=decimate,
                     refine_edges=True)
     except Exception as e:
@@ -166,12 +103,12 @@ def make_detector(decimate, threads):
 
 
 def solve(dets, K, dist):
-    """Bundle solve over every recognised tag. Returns dict or None."""
+    """Solve PnP over all recognised dock tags. Returns a dict or None."""
     obj, img, used = [], [], []
     for d in dets:
         tid = int(d["id"])
         if tid not in TAGS:
-            continue                      # not part of the dock -- ignore
+            continue
         obj.append(tag_object_points(TAGS[tid]["size"], TAGS[tid]["x"]))
         img.append(np.array(d["lb-rb-rt-lt"], dtype=np.float64))
         used.append(tid)
@@ -181,9 +118,7 @@ def solve(dets, K, dist):
     obj = np.concatenate(obj).reshape(-1, 1, 3)
     img = np.concatenate(img).reshape(-1, 1, 2)
 
-    # IPPE is the planar-target solver and returns BOTH candidate poses with
-    # their errors, which is what gives us an honest ambiguity measure. It needs
-    # >= 4 points; we always have a multiple of 4.
+    # IPPE (planar target) returns both candidate poses with their errors.
     try:
         n, rvecs, tvecs, errs = cv2.solvePnPGeneric(
             obj, img, K, dist, flags=cv2.SOLVEPNP_IPPE)
@@ -194,26 +129,16 @@ def solve(dets, K, dist):
 
     rvec, tvec = rvecs[0], tvecs[0]
     e = [float(x) for x in np.array(errs).ravel()[:n]]
-    # ratio ~1.0 -> solver cannot separate the two poses -> yaw untrustworthy.
-    #
-    # The 0.1 px floor on the denominator is load-bearing, not cosmetic. Dividing
-    # by a raw e[0] makes "both solutions fit PERFECTLY" -- the maximally
-    # AMBIGUOUS case -- come out as a huge ratio, i.e. maximally confident,
-    # which is exactly backwards. Flooring at a realistic corner-noise level
-    # means two equally-good fits produce a SMALL ratio and get flagged. Found
-    # via a synthetic square-on case, which is also the docking configuration
-    # and the worst one for planar ambiguity (T30).
+    # Error ratio of the two solutions: near 1 means yaw is ambiguous. The
+    # 0.1 px floor stops two near-perfect fits (the most ambiguous case) from
+    # producing a huge ratio.
     ratio = (e[1] / max(e[0], 0.1)) if n > 1 else 99.0
 
     R, _ = cv2.Rodrigues(rvec)
     t = tvec.ravel()
 
-    # relyaw: note the NEGATED arguments. The dock frame's +Z points out of the
-    # wall toward the camera while the camera's +Z points forward into it, so
-    # square-on is genuinely a 180 deg relative rotation -- correct geometry,
-    # useless as a control signal. Negating both arguments of atan2 rotates the
-    # reported angle by exactly pi and stays correctly wrapped to (-pi, pi].
-    # Measured on hardware 2026-08-20: square-on read -180 before this.
+    # The dock and camera +Z axes face each other, so square-on is a 180 deg
+    # rotation. Negating both atan2 arguments shifts that to 0.
     return {
         "range":   float(math.hypot(t[0], t[2])),
         "bearing": float(math.atan2(t[0], t[2])),
@@ -235,8 +160,7 @@ def main():
     ap.add_argument("--hz", type=float, default=10.0, help="print rate")
     args = ap.parse_args()
 
-    # Must match the exposure the calibration was taken at (T35).
-    lock_exposure(args.device)
+    lock_exposure(args.device)   # must match the calibration exposure
 
     cap = cv2.VideoCapture(args.device, cv2.CAP_V4L2)
     if not cap.isOpened():
@@ -249,11 +173,8 @@ def main():
 
     W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    # Real intrinsics if we have them. The fallback is a MEASURED focal length
-    # with the principal point assumed centred and no distortion model -- that
-    # assumption is what made rel-yaw wander under pure translation, because
-    # uncorrected barrel distortion shears an off-centre target and solvePnP
-    # fits the shear as a rotation.
+    # Without a calibration, uncorrected distortion makes rel-yaw wander as the
+    # target moves off-centre.
     K, dist, src = load_intrinsics(W, H)
     if K is None:
         f = F_PX_AT_1280 * (W / 1280.0)
@@ -265,16 +186,15 @@ def main():
     t_next = 0.0
 
     print(f"{W}x{H}  [{src}]")
-    print("bearing +ve = dock is to the camera's RIGHT.  VERIFY BY SLIDING THE")
-    print("PLATFORM before trusting it (T11).\n")
-    print("platform pose is in the DOCK frame: +X right as you face the wall,")
+    print("bearing +ve = dock is to the camera's right. Check by sliding the")
+    print("platform.\n")
+    print("platform pose is in the dock frame: +X right as you face the wall,")
     print(f"+Y out from it. dock target for the magnet is (0.000, {D_DOCK:.3f}).\n")
     print(f"{'tags':<10}{'range m':>9}{'bearing':>9}{'relyaw':>9}"
           f"{'ratio':>7} | {'plat x':>8}{'plat y':>8}{'psi':>7}"
           f" | {'mag x':>8}{'mag y':>8}{'x|psi=0':>9}")
-    print("  x|psi=0 ignores relyaw entirely: -range*sin(bearing). If THAT")
-    print("  tracks the tape measure while 'plat x' does not, the position")
-    print("  error is coming from noisy yaw, not from bearing or range.")
+    print("  x|psi=0 = -range*sin(bearing), ignoring relyaw. If it tracks the")
+    print("  tape measure and 'plat x' does not, the error is from noisy yaw.")
     print("")
 
     while True:
@@ -284,7 +204,7 @@ def main():
         if not ok:
             continue
         if time.perf_counter() < t_next:
-            continue                      # decimate the PRINT, not the capture
+            continue                      # throttle printing, not capture
         t_next = time.perf_counter() + period
 
         gray = cv2.imdecode(buf, cv2.IMREAD_GRAYSCALE)
@@ -303,7 +223,6 @@ def main():
 
         px, py, psi, mx, my = platform_pose(p["range"], p["bearing"],
                                             p["relyaw"])
-        dock_err = math.hypot(mx - 0.0, my - D_DOCK)
 
         print(f"{str(p['tags']):<10}{p['range']:>9.3f}"
               f"{math.degrees(p['bearing']):>9.2f}"

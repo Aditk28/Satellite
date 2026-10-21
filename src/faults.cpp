@@ -1,19 +1,13 @@
-/* ============================================================================
-   faults.cpp  —  implementation of the one stop path + black box (Step 1.2)
-   ============================================================================ */
+/* Fault stop path, black box and FreeRTOS failure hooks. */
 #include <Arduino.h>
-#include <STM32FreeRTOS.h>     /* TaskHandle_t, taskDISABLE_INTERRUPTS */
+#include <STM32FreeRTOS.h>
 #include "faults.h"
-#include "timebase.h"          /* TIM5 for rtRunTimeCounter */
+#include "timebase.h"
 
-/* ---- the black box -------------------------------------------------------
-   .noinit is not zeroed by the C startup, so this survives a warm reset (but
-   NOT a power cycle — RAM is volatile). The magic guards against reading random
-   RAM as a "fault" on a cold boot. NOTE: the F446RE variant ldscript has no
-   dedicated .noinit section, so this lands as an orphan; the magic makes a
-   stray zeroing benign (reads as clean). The Step 1.3 assert test confirms it
-   actually survives; if not, add the INSERT-AFTER .bss linker fragment. */
-#define FAULT_MAGIC 0x5A1F0B0Bu   /* "SAlF-BOB" — arbitrary, just unlikely */
+/* .noinit is not zeroed at startup, so this survives a warm reset but not a power
+   cycle. The F446RE linker script has no .noinit section, so it lands as an orphan
+   section. The magic makes random RAM on a cold boot read as clean. */
+#define FAULT_MAGIC 0x5A1F0B0Bu
 typedef struct {
   uint32_t magic;
   fault_t  reason;
@@ -22,12 +16,11 @@ typedef struct {
 } fault_record_t;
 __attribute__((section(".noinit"))) static fault_record_t g_fault;
 
-/* ---- safe-stop configuration (set by faults_init) ------------------------ */
 static int  g_enablePin = -1;
 static int  g_ledPin    = -1;
 static void (*g_stopHook)(void) = 0;
-/* Deliberately NOT cleared by faults_init: it is registered in setup() right after
-   fans_init(), which runs before hwSetup() (where faults_init is called). */
+/* Not touched by faults_init: it is registered in setup() before hwSetup() calls
+   faults_init. */
 static void (*g_hwKillHook)(void) = 0;
 
 void faults_init(int hwEnablePin, int ledPin, void (*stopHook)(void)) {
@@ -38,7 +31,6 @@ void faults_init(int hwEnablePin, int ledPin, void (*stopHook)(void)) {
 
 void faults_setHwKillHook(void (*fn)(void)) { g_hwKillHook = fn; }
 
-/* ---- helpers ------------------------------------------------------------- */
 static const char* reasonName(fault_t r) {
   switch (r) {
     case FAULT_ASSERT:             return "ASSERT";
@@ -46,10 +38,7 @@ static const char* reasonName(fault_t r) {
     case FAULT_MALLOC:             return "MALLOC";
     case FAULT_SCHEDULER_RETURNED: return "SCHEDULER_RETURNED";
     case FAULT_WHEEL_SAT:          return "WHEEL_SAT";
-    case FAULT_UNDERVOLT:          return "UNDERVOLT";
-    case FAULT_OVERCURRENT:        return "OVERCURRENT";
     case FAULT_HEARTBEAT:          return "HEARTBEAT";
-    case FAULT_I2C_TIMEOUT:        return "I2C_TIMEOUT";
     default:                       return "NONE";
   }
 }
@@ -58,7 +47,7 @@ static void latch(fault_t reason, const char* file, int line) {
   g_fault.magic  = FAULT_MAGIC;
   g_fault.reason = reason;
   g_fault.line   = line;
-  /* store the basename only, bounded — never the full build path */
+  /* basename only, truncated to fit */
   const char* base = file ? file : "";
   for (const char* p = base; *p; ++p)
     if (*p == '/' || *p == '\\') base = p + 1;
@@ -68,26 +57,19 @@ static void latch(fault_t reason, const char* file, int line) {
   g_fault.file[i] = '\0';
 }
 
-/* Cycle-counting delay. delay()/millis() are dead here (interrupts masked, so
-   SysTick doesn't tick), hence a raw spin. Not calibrated — only needs to make
-   the blink visible. */
+/* Busy-wait. SysTick is stopped with interrupts masked, so delay() cannot be used.
+   Uncalibrated; it only has to make the blink visible. */
 static void spin(volatile uint32_t n) { while (n--) { __asm__ volatile(""); } }
 
-/* Kill the motor and blink the reason code forever. Never returns. */
 static void faults_halt(fault_t reason) __attribute__((noreturn));
 static void faults_halt(fault_t reason) {
   taskDISABLE_INTERRUPTS();
 
-  /* 0) the BIGGEST hazard first. With the props unguarded (B7) the fans outrank the
-        flywheel, so they go before the driver enable. The hook must not use any
-        FreeRTOS API — interrupts are already masked here. */
-  if (g_hwKillHook) g_hwKillHook();
-  /* 1) hardware kill — independent of any SimpleFOC object state */
+  if (g_hwKillHook) g_hwKillHook();   /* fans first */
   if (g_enablePin >= 0) { pinMode(g_enablePin, OUTPUT); digitalWrite(g_enablePin, LOW); }
-  /* 2) graceful stop if the sketch registered one */
   if (g_stopHook) g_stopHook();
 
-  /* 3) blink `reason` pulses, pause, repeat. Encodes the code with no serial. */
+  /* Blink `reason` pulses, pause, repeat. */
   const int pin = g_ledPin;
   if (pin >= 0) pinMode(pin, OUTPUT);
   int pulses = (int)reason; if (pulses < 1) pulses = 1;
@@ -98,11 +80,10 @@ static void faults_halt(fault_t reason) {
       if (pin >= 0) digitalWrite(pin, LOW);
       spin(7000000);
     }
-    spin(35000000);   /* long gap between bursts */
+    spin(35000000);
   }
 }
 
-/* ---- public stop paths --------------------------------------------------- */
 void faults_safeStop(fault_t reason) {
   latch(reason, "", 0);
   faults_halt(reason);
@@ -127,19 +108,16 @@ void faults_reportLastBoot(void) {
       Serial.print(g_fault.line);
     }
     Serial.println();
-    g_fault.magic = 0;   /* consume it so the next clean boot reports clean */
+    g_fault.magic = 0;
   } else {
     Serial.println("[BLACKBOX] clean boot (no prior fault recorded)");
   }
 }
 
-/* ---- run-time-stats clock ------------------------------------------------ */
 uint32_t rtRunTimeCounter(void) { return TIM5->CNT; }
 
-/* ---- FreeRTOS failure hooks ---------------------------------------------
-   The library only defines these when its *_BLINK config macros are 1; we set
-   those to 0 in STM32FreeRTOSConfig.h, so these are ours with no collision.
-   extern "C" because the kernel calls them by unmangled C name. ------------- */
+/* The library only defines these hooks when its *_BLINK options are 1. They are 0
+   in STM32FreeRTOSConfig.h, so these are ours. */
 extern "C" void vApplicationMallocFailedHook(void) {
   faults_safeStop(FAULT_MALLOC);
 }

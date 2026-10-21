@@ -2,114 +2,56 @@
 #include <Arduino.h>
 
 /*
-  Translation Phase 3 -- the Raspberry Pi pose link. USART6, PC6 (TX) / PC7 (RX).
+  Raspberry Pi pose link on USART6 (PC6 TX / PC7 RX). Binary frames, so it is kept
+  apart from the operator command parser (a payload byte could look like a command).
+  pi_poll() runs on commsTask via commands_setAuxPoll(); it is the only code that
+  touches USART6. commsTask polls on a fixed period, so timeouts are evaluated even
+  when no bytes arrive.
 
-  WHY THIS IS NOT A THIRD ARGUMENT TO commands_init().
-  commsTask's contract is line assembly plus "any unrecognised input stops the
-  motor", with an X fast path that fires BEFORE the line is even queued
-  (commands.cpp). This port carries a BINARY stream, so: a payload byte of 0x58
-  is 'X' and would stop the wheel mid-slew, a 0x0A mid-frame is a line
-  terminator, and Pi boot chatter arrives as a scatter of commands. The operator
-  parser and the pose parser must never share a code path. Decision B18.
+  Frame:  [0xA5][0x5A][len][payload, len bytes][crc_lo][crc_hi]
+    len  payload bytes only; must equal PI_PAYLOAD_LEN.
+    crc  CRC-16/CCITT-FALSE (poly 0x1021, init 0xFFFF) over len + payload,
+         sent little-endian.
+  All fields little-endian.
 
-  THE SERIAL INVARIANTS ARE PER PORT, NOT GLOBAL. B15 (sole writer) and the
-  sole-reader rule are stated over Serial and hc05Serial, but what they protect
-  is that HardwareSerial is not reentrant PER PORT. USART6 is touched by nothing
-  else, so pi_link is both its sole reader and its sole writer -- the same
-  requirement met by ownership instead of arbitration.
-
-  WHERE IT RUNS. pi_poll() is called from commsTask through
-  commands_setAuxPoll(), so the link costs no new task and no new stack. Note
-  that commsTask polls every POLL_PERIOD_MS UNCONDITIONALLY -- it does not wait
-  for bytes -- which is why the staleness ladder below can live here and still
-  be evaluated when the Pi is dead. That is the whole point of a timeout.
-
-  ---------------------------------------------------------------------------
-  THE WIRE FORMAT                                       (decisions B19/B20)
-
-      [0xA5][0x5A][len][ ---- payload, len bytes ---- ][crc_lo][crc_hi]
-
-  len       payload bytes ONLY (not magic, not CRC). Must equal
-            PI_PAYLOAD_LEN or the frame is rejected -- a free version check.
-  crc       CRC-16/CCITT-FALSE, poly 0x1021, init 0xFFFF, over len + payload.
-            Magic excluded. Transmitted LITTLE-ENDIAN (low byte first).
-  endian    little-endian throughout. ARM on both ends, so no swapping. This is
-            an ASSUMPTION, stated here because a silent mismatch rejects every
-            frame and looks exactly like a wiring fault.
-
-  Payload, 28 bytes, 4-byte aligned by construction (the 3 pad bytes exist to
-  keep it that way and to leave room to grow without a format bump):
-
-     off  type      field         meaning
-      0   uint16    seq           increments per TX frame; gaps = dropped frames
-      2   uint8     flags         see PI_FLAG_* below
+  Payload (28 bytes):
+     off  type      field
+      0   uint16    seq           increments per frame
+      2   uint8     flags         PI_FLAG_*
       3   uint8     tag_id        primary tag in view
-      4   float32   range_m       camera -> tag centre
+      4   float32   range_m       camera to tag centre
       8   float32   bearing_rad   tag centre off camera boresight
      12   float32   relyaw_rad    tag face normal vs boresight
      16   float32   quality       0..1, from the PnP ambiguity ratio
-     20   uint32    age_us        capture -> transmit, on the PI's clock
+     20   uint32    age_us        capture to transmit, on the Pi clock
      24   uint8     n_tags        tags contributing to this fix
      25   uint8[3]  pad
 
-  WHY POLAR (range/bearing) AND NOT CARTESIAN. Identical information, different
-  NOISE. AprilTag range error grows roughly with distance squared while bearing
-  error is roughly constant in angle; in polar those are axis-aligned, so the
-  estimator's measurement covariance R is DIAGONAL. Converting to Cartesian on
-  the Pi produces the classic banana-shaped correlated uncertainty, which needs
-  a full covariance to represent honestly -- and sending it as diagonal anyway
-  would make the filter quietly overconfident.
-
-  WHY AGE AND NOT A TIMESTAMP (this DEPARTS from the guide's original text).
-  The two clocks are unsynchronised, so an absolute Pi timestamp means nothing
-  here without a sync protocol to build and keep correct. age_us is measured
-  entirely on the Pi's own clock (capture -> transmit), where the difference is
-  valid regardless of offset. The STM32 adds the transit it already measured.
-  Note CAPTURE, not detection-complete: AprilTag on a Pi 3B+ carries 50-150 ms,
-  which at docking speeds is the DOMINANT position error, not a rounding one.
-
-  WHY relyaw HAS A QUALITY FIELD. Relative yaw from a planar target is
-  ill-conditioned at range -- two orientations project near-identically and the
-  solver flips between them. quality + PI_FLAG_AMBIGUOUS is what lets the
-  estimator WIDEN R on yaw instead of believing a flipped solution. See T30.
-  ---------------------------------------------------------------------------
+  Range/bearing is sent instead of x/y because its errors are roughly uncorrelated,
+  so the estimator can use a diagonal measurement covariance. age_us is a duration
+  rather than a timestamp because the two clocks are not synchronised.
 */
 
 #define PI_MAGIC1        0xA5
 #define PI_MAGIC2        0x5A
 #define PI_PAYLOAD_LEN   28
-#define PI_MAX_PAYLOAD   64      /* parser sanity bound, not the format */
+#define PI_MAX_PAYLOAD   64      /* parser buffer bound */
 
-#define PI_FLAG_VALID     0x01   /* a tag was actually detected this frame   */
+#define PI_FLAG_VALID     0x01   /* a tag was detected this frame */
 #define PI_FLAG_AMBIGUOUS 0x02   /* PnP could not separate the two solutions */
-#define PI_FLAG_MULTITAG  0x04   /* fix used >1 tag -- yaw is trustworthy    */
-#define PI_FLAG_OOP       0x08   /* out-of-plane pitch/roll large -> suspect */
+#define PI_FLAG_MULTITAG  0x04   /* fix used more than one tag */
+#define PI_FLAG_OOP       0x08   /* large out-of-plane pitch/roll, suspect */
 
-/* Staleness ladder. Thresholds and their reasoning are in pi_link.cpp.
-   NEVER is distinct from DEAD on purpose: if pose has never been valid, its
-   absence is not a loss, and nothing should fire. Without that, every rotation
-   test would trip a timeout at boot simply because no Pi is attached. */
-/* TWO INDEPENDENT THINGS, and conflating them was a real bug (hardware,
-   2026-08-20): covering the tags reported DEAD while the link was perfectly
-   healthy and frames were arriving with crc=0.
-
-     POSE freshness (last VALID frame)  -> FRESH / STALE / LOST.
-        Losing sight of the tag is NORMAL. During SEARCH the tag is not visible
-        by definition, and B2 says it is routinely lost at close range too.
-     LINK health (last frame of ANY kind) -> DEAD.
-        Silence is a FAULT. The Pi keeps sending frames with PI_FLAG_VALID clear
-        when it cannot see the dock, which is exactly what makes the two
-        distinguishable from this end.
-
-   Keying the terminal action off pose age would have fired it on every search
-   sweep and during every close approach. */
+/* Pose freshness (time since last valid frame) and link health (time since any
+   frame) are tracked separately. Losing sight of the tag is normal during search
+   and close approach; the Pi keeps sending frames with PI_FLAG_VALID clear. Only a
+   silent link is a fault. */
 typedef enum {
-  PI_NEVER = 0,   /* no valid pose since boot -- pose ladder inert           */
-  PI_FRESH,       /* valid pose newer than PI_STALE_MS                       */
-  PI_STALE,       /* pose stale, LINK FINE -- estimator coasts. Not a fault. */
-  PI_LOST,        /* pose older than the dead-reckoning budget; fans zeroed.
-                     Still not a fault -- this is what SEARCH looks like.    */
-  PI_DEAD         /* THE LINK IS SILENT. This one IS a fault.                */
+  PI_NEVER = 0,   /* no valid pose since boot */
+  PI_FRESH,       /* valid pose newer than PI_STALE_MS */
+  PI_STALE,       /* pose stale, link fine; estimator coasts */
+  PI_LOST,        /* pose older than PI_LOST_MS; fans zeroed (soft) */
+  PI_DEAD         /* no frames at all; fans hard-killed */
 } PiState;
 
 typedef struct {
@@ -121,75 +63,43 @@ typedef struct {
   float    bearing_rad;
   float    relyaw_rad;
   float    quality;
-  uint32_t age_us;     /* Pi-side capture -> transmit                        */
-  uint32_t rx_us;      /* us_now() when the frame finished arriving here     */
+  uint32_t age_us;     /* Pi-side capture to transmit */
+  uint32_t rx_us;      /* us_now() when the frame finished arriving */
 } PiPose;
 
-/* Open the port. Call pre-scheduler from setup(), beside commands_init().
-   Does NOT print: it runs before telem_activate(), where telem_print() writes
-   the port directly from the CALLING task -- trap T18. */
+/* Open the port. Call from setup() before the scheduler starts. Does not print. */
 void pi_init(HardwareSerial& port, uint32_t baud);
 
-/* Drain RX, parse frames, evaluate the staleness ladder. Called from commsTask
-   every POLL_PERIOD_MS. Never blocks. */
+/* Drain RX (bounded), parse frames, update the state. Called from commsTask. */
 void pi_poll(void);
 
-/* Copy the most recent pose. Returns false if none has ever arrived. Safe from
-   any task: the copy is taken under a critical section because a PiPose is many
-   words and a preemption mid-copy yields a torn mix of two frames. Cost is
-   ~40 words at 180 MHz, well under 1 us against the 250 us FOC tick -- the same
-   trade fans.cpp accepts for its dshotValue[] snapshot, priced rather than
-   waved away. */
+/* Copy the latest accepted frame (check flags for PI_FLAG_VALID). Returns false
+   until a valid pose has arrived. Safe from any task (copied in a critical section). */
 bool pi_getPose(PiPose* out);
 
 PiState  pi_state(void);
-uint32_t pi_ageUs(void);        /* since last VALID frame; UINT32_MAX if never */
+uint32_t pi_ageUs(void);        /* since last valid frame; UINT32_MAX if never */
 
-/* True while frames of ANY kind are still arriving. This is the LINK health
-   question, and it is the one a fault path should ask -- pi_state() reaching
-   PI_LOST means we cannot see the dock, which is an expected condition, not a
-   reason to stop. */
+/* True while frames of any kind are arriving. This is the check a fault path should
+   use; PI_LOST only means the dock is not in view. */
 bool     pi_linkAlive(void);
-uint32_t pi_linkAgeUs(void);    /* since last frame of any kind               */
+uint32_t pi_linkAgeUs(void);    /* since last frame of any kind */
 
-/* Terminal action for PI_DEAD. NOT wired to stopMotor() in Phase 3, by
-   decision B21: nothing consumes pose until Phase 6, so a lost link endangers
-   nothing today -- while dumping a spinning flywheel DOES spin the platform at
-   ~42 rad/s^2 against a 4.24 breakaway. Phase 6 points this at the real stop
-   once there is something to protect. Contract: called from commsTask (prio 2),
-   must not block, fires ONCE per loss episode. */
+/* Called once per link loss, from commsTask, after the fans are stopped.
+   Must not block. */
 void pi_setDeadHook(void (*fn)(void));
 
-/* Diagnostics for G. crcErrors and resyncs are allowed to be non-zero on a
-   noisy link; frames not climbing while rxBytes does means the format or the
-   CRC disagree between the two ends. Split benign from real -- trap T21. */
+/* Diagnostics. CRC errors and resyncs can be non-zero on a noisy link; rxBytes
+   climbing with frames flat means the two ends disagree on format or CRC. */
 uint32_t pi_rxBytes(void);
-uint32_t pi_frames(void);       /* accepted frames                            */
+uint32_t pi_frames(void);       /* accepted frames */
 uint32_t pi_crcErrors(void);
-uint32_t pi_badLen(void);       /* len field not PI_PAYLOAD_LEN               */
-uint32_t pi_resyncs(void);      /* magic desync -- hunted for a new frame     */
-/* Sequence numbers that never ARRIVED. NOTE THAT THIS INCLUDES CRC-REJECTED
-   FRAMES, and that is deliberate, not a conflation: a rejected frame never had
-   its seq decoded, so at the sequence layer it is indistinguishable from one
-   that was never sent. More importantly it is the right primitive for the
-   Phase 5 estimator, which needs "how many measurements am I missing" in order
-   to widen its covariance -- and the answer to that does not depend on whether
-   the frame was lost or corrupted.
-
-   The two ARE separable when diagnosing, by subtraction:
-       true transport loss  =  pi_seqGaps() - pi_crcErrors()
-   Do not "fix" this into non-overlapping counters. It cannot be done reliably:
-   a CRC failure cannot be attributed to a specific missing seq (its seq was
-   never decoded), so the subtraction would have to ASSUME one gap per CRC
-   error, which stops being true the moment a corrupt length field desyncs the
-   parser and eats the following frame as well. */
+uint32_t pi_badLen(void);       /* len field not PI_PAYLOAD_LEN */
+uint32_t pi_resyncs(void);      /* lost magic sync */
+/* Sequence numbers that never arrived, including CRC-rejected frames.
+   Transport loss is roughly pi_seqGaps() - pi_crcErrors(). */
 uint32_t pi_seqGaps(void);
-
-/* Sequence went BACKWARDS or jumped absurdly far -- the sender restarted (or,
-   far less likely, a garbage frame passed CRC by chance). Counted separately
-   because it is an expected artifact of re-running the Pi-side sender, not
-   packet loss, and folding it into pi_seqGaps() would add ~65000 to that
-   counter in a single frame and destroy its usefulness. Expect this to be
-   non-zero during development and zero in a clean run. */
+/* Sequence went backwards or jumped by PI_SEQ_MAX_GAP or more, usually a restart of
+   the Pi-side sender. Kept out of pi_seqGaps() so a restart does not add ~65000. */
 uint32_t pi_seqRestarts(void);
-uint32_t pi_maxBurst(void);     /* most bytes drained in one poll             */
+uint32_t pi_maxBurst(void);     /* most bytes drained in one poll */

@@ -1,33 +1,17 @@
 #!/usr/bin/env python3
 """
-make_replay.py
+Build a standalone HTML replay of a filtered calibration run.
 
-Builds a standalone HTML replay of a filtered calibration run: a top-down
-view of the platform with the reaction wheel inside it, both turning from
-the recorded data, alongside the telemetry traces and a momentum-exchange
-readout. Run filter_calibration.py first -- this reads the filtered/ folder
-so the gyro is already de-biased and sign-consistent with the wheel.
+Shows a top-down view of the platform (rotated by integrated gyro heading)
+and the reaction wheel inside it (rotated by encoder angle), with telemetry
+readouts, relative momentum bars and time traces. Data is embedded, so the
+file opens in a browser with no server. Run filter_calibration.py first.
 
-The output is one self-contained .html file with the data embedded. No
-server, no dependencies, no network -- open it in a browser, or drop it in
-the repo for anyone reading the project to scrub through.
+The momentum bars are scaled per body, not to a common inertia, because J_w
+and J_p are not measured. Wheel spokes alias at high speed.
 
-WHAT IT SHOWS:
-  - Outer disc: the platform, turning by the integrated (bias-corrected)
-    gyro heading. Its notch marks the docking face.
-  - Inner disc: the reaction wheel, turning by the integrated encoder
-    angle. At high speed the spokes alias, exactly as a real strobed wheel
-    would -- read the numeric velocity, not the spokes.
-  - The two turn in opposition, which is the whole point of the machine:
-    the wheel takes angular momentum, the platform takes the equal and
-    opposite share.
-  - Momentum bar: relative angular momentum in each body, in the units the
-    data actually supports (wheel rad/s and platform dps are NOT scaled to
-    a common inertia -- J_w and J_p aren't measured yet, so this bar shows
-    the exchange qualitatively, not a conserved total).
-
-USAGE:
-    python make_replay.py calibration_run_20260729_112929/filtered
+Usage:
+    python make_replay.py runs/<run_folder>/filtered
     python make_replay.py <filtered_folder> --out replay.html --frames 500
 """
 
@@ -164,8 +148,8 @@ HTML = r"""<!DOCTYPE html>
 <body>
 <div class="wrap">
   <header>
-    <div class="eyebrow">Reaction wheel testbed &middot; recorded telemetry replay</div>
-    <h1 id="title">Test — <span id="subtitle"></span></h1>
+    <div class="eyebrow">Reaction wheel testbed | recorded telemetry replay</div>
+    <h1 id="title">Test: <span id="subtitle"></span></h1>
   </header>
 
   <div class="grid">
@@ -219,20 +203,20 @@ HTML = r"""<!DOCTYPE html>
       <button id="play">Play</button>
       <input type="range" id="scrub" min="0" max="100" value="0" step="1" aria-label="Scrub through time">
       <select id="speed" aria-label="Playback speed">
-        <option value="0.25">0.25&times;</option>
-        <option value="0.5">0.5&times;</option>
-        <option value="1" selected>1&times;</option>
-        <option value="2">2&times;</option>
+        <option value="0.25">0.25x</option>
+        <option value="0.5">0.5x</option>
+        <option value="1" selected>1x</option>
+        <option value="2">2x</option>
       </select>
       <select id="testSel" aria-label="Select test"></select>
     </div>
   </div>
 
   <div class="foot">
-    Wheel and platform turn in opposition &mdash; the wheel takes angular momentum, the platform takes the equal and opposite share.<br>
-    Spokes alias at speed, like a strobed wheel; read the numeric velocity instead. Momentum bars are relative within each body,
-    not a conserved total &mdash; J<sub>w</sub> and J<sub>p</sub> are not measured yet, so the two channels cannot share units.<br>
-    Gyro bias removed and sign aligned to the wheel convention by filter_calibration.py.
+    Wheel and platform turn in opposite directions: the wheel takes angular momentum and the platform takes the opposite share.<br>
+    Spokes alias at speed, so read the numeric velocity instead. Momentum bars are scaled within each body and are not a
+    conserved total, because J<sub>w</sub> and J<sub>p</sub> are not measured.<br>
+    Gyro bias removed and sign aligned to the wheel by filter_calibration.py.
   </div>
 </div>
 
@@ -264,7 +248,7 @@ $('grid').innerHTML = g;
 const sel = $('testSel');
 DATA.forEach((d, i) => {
   const o = document.createElement('option');
-  o.value = i; o.textContent = `${String(d.num).padStart(2,'0')} — ${d.label}`;
+  o.value = i; o.textContent = `${String(d.num).padStart(2,'0')}: ${d.label}`;
   sel.appendChild(o);
 });
 
@@ -285,7 +269,7 @@ function drawTrace(){
   // step marker
   const xs = X(d.t[d.stepIdx]);
   h+=`<line x1="${xs}" y1="${T}" x2="${xs}" y2="${T+ih}" stroke="#D2603F" stroke-width="1.3" opacity="0.85"/>`;
-  h+=`<text x="${xs+5}" y="${T+12}" fill="#D2603F" font-family="IBM Plex Mono, monospace" font-size="10">STEP &#8594; ${d.toV}V</text>`;
+  h+=`<text x="${xs+5}" y="${T+12}" fill="#D2603F" font-family="IBM Plex Mono, monospace" font-size="10">STEP -&gt; ${d.toV}V</text>`;
 
   let pw='', pp='';
   for(let i=0;i<d.t.length;i++){
@@ -297,16 +281,15 @@ function drawTrace(){
   h+=`<line id="ph" x1="${L}" y1="${T}" x2="${L}" y2="${T+ih}" stroke="#CBD8E2" stroke-width="1.2" opacity="0.8"/>`;
   h+=`<text x="${L}" y="${H-9}" fill="#74899A" font-family="IBM Plex Mono, monospace" font-size="10">${t0.toFixed(2)}s</text>`;
   h+=`<text x="${W-R}" y="${H-9}" text-anchor="end" fill="#74899A" font-family="IBM Plex Mono, monospace" font-size="10">${t1.toFixed(2)}s</text>`;
-  h+=`<text x="${L}" y="${H-9}" dx="70" fill="#E0932F" font-family="IBM Plex Mono, monospace" font-size="10">&#9473; wheel &omega; (rad/s)</text>`;
-  h+=`<text x="${L}" y="${H-9}" dx="215" fill="#4FB8D9" font-family="IBM Plex Mono, monospace" font-size="10">&#9473; platform rate (dps)</text>`;
+  h+=`<text x="${L}" y="${H-9}" dx="70" fill="#E0932F" font-family="IBM Plex Mono, monospace" font-size="10">- wheel &omega; (rad/s)</text>`;
+  h+=`<text x="${L}" y="${H-9}" dx="215" fill="#4FB8D9" font-family="IBM Plex Mono, monospace" font-size="10">- platform rate (dps)</text>`;
   $('trace').innerHTML = h;
-  window._X = X; window._T = T; window._ih = ih;
+  window._X = X;
 }
 
 function render(){
   const d = DATA[cur];
-  // idx advances fractionally during playback and scrubbing -- round it
-  // before indexing, or array lookups land on undefined.
+  // idx is fractional during playback and scrubbing.
   const i = Math.max(0, Math.min(Math.round(idx), d.t.length-1));
   platformG.setAttribute('transform', `rotate(${d.pd[i]} 230 180)`);
   wheelG.setAttribute('transform', `rotate(${(d.wa[i]*180/Math.PI)%360} 230 180)`);
@@ -332,7 +315,7 @@ function render(){
 function loadTest(k){
   cur = k; idx = 0; playing = false; $('play').textContent='Play';
   const d = DATA[cur];
-  $('title').innerHTML = `Test ${String(d.num).padStart(2,'0')} — <span>${d.label}</span>`;
+  $('title').innerHTML = `Test ${String(d.num).padStart(2,'0')}: <span>${d.label}</span>`;
   drawTrace(); render();
 }
 
@@ -388,7 +371,7 @@ def main():
 
     kb = os.path.getsize(out) / 1024
     print(f"  wrote {out}  ({len(payload)} tests, {kb:.0f} KB)")
-    print("  open it in any browser -- no server needed")
+    print("  open it in any browser, no server needed")
 
 
 if __name__ == "__main__":

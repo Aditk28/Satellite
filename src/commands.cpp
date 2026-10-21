@@ -5,8 +5,7 @@
 
 #define CMD_MAX_LEN     40
 #define CMD_QUEUE_DEPTH  8
-#define POLL_PERIOD_MS   2   /* 500 Hz. At 115200 that is ~23 bytes per poll,
-                                comfortably inside the core's 64-byte RX buffer. */
+#define POLL_PERIOD_MS   2   /* ~23 bytes per poll at 115200, inside the 64-byte RX buffer */
 
 struct CmdMsg { char line[CMD_MAX_LEN]; };
 
@@ -23,10 +22,8 @@ static void dispatch(String& line) {
   line.trim();
   if (!line.length()) return;
 
-  /* X FAST PATH: kill the motor here, now, before queueing. Waiting for the
-     control task to drain the queue would add up to one control period; this
-     store reaches focTask within a tick. The line is still queued so that
-     handleCommand runs the full stop (flags, operator message) as usual. */
+  /* X stops the motor here instead of waiting up to a control period for the
+     queue to drain. The line is still queued so handleCommand does the full stop. */
   char c = line.charAt(0);
   if ((c == 'X' || c == 'x') && s_emergency) s_emergency();
 
@@ -46,20 +43,18 @@ static void pump(Stream* s, String& buf) {
     } else if (buf.length() < CMD_MAX_LEN - 1) {
       buf += ch;
     }
-    /* else: overlong line, drop the excess rather than grow unboundedly */
+    /* overlong lines are truncated */
   }
 }
 
 static void commsTask(void*) {
   String bufU, bufB;
   for (;;) {
-    /* vTaskDelay (blocking), NOT delay(): delay() busy-spins on yield() and would
-       starve telemTask (1) -- Trap 19, learned in Step 5.1. */
+    /* vTaskDelay, not delay(): delay() busy-spins and would starve telemTask. */
     vTaskDelay(pdMS_TO_TICKS(POLL_PERIOD_MS));
     pump(s_usb, bufU);
     pump(s_bt,  bufB);
-    /* Phase 3: the Pi pose link. Deliberately NOT pump()ed -- it is a binary
-       stream and must never reach line assembly or the X fast path. */
+    /* Pi pose link. Binary, so it is not passed through pump(). */
     if (s_auxPoll) s_auxPoll();
   }
 }

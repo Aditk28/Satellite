@@ -1,38 +1,19 @@
 #!/usr/bin/env python3
 """
-Translation Phase 4, Step 4.1 -- camera intrinsic calibration. Runs ON THE PI.
+Camera intrinsic calibration. Runs on the Pi.
 
-ONE TIME, EVER -- not per session. Produces camera_intrinsics.json (focal length,
-principal point, distortion), which every later pose computation reads. You only
-redo it if the lens, the focus, or the CAPTURE RESOLUTION changes.
+Writes camera_intrinsics.json (focal length, principal point, distortion),
+which the pose scripts load. Redo it only if the lens, focus or capture
+resolution changes. Calibrate at the production resolution (1280x720) with
+exposure locked; this script locks exposure itself via pi_camcfg.
 
-WHY IT IS NOT OPTIONAL HERE. PnP turns pixel positions into angles and distances
-using the intrinsics. Uncalibrated, you would be using the spec-sheet focal
-length (424 px from the 120 deg DFOV), which is a guess -- a 10-20% error there
-is a 10-20% systematic RANGE error at every distance. And a 120 deg lens has
-severe barrel distortion whose worst effects are at the FRAME EDGES, which is
-exactly where the flanking tags sit during close approach.
-
-TWO THINGS THAT MUST BE TRUE BEFORE YOU RUN THIS (T14, T35):
-
-  1. SAME RESOLUTION as production -- 1280x720. Intrinsics do not scale between
-     this camera's modes because the 4:3 modes are a different aspect ratio, not
-     a downscale, so a calibration at one does not transfer to another.
-  2. EXPOSURE AND FOCUS LOCKED, at the values you will actually run:
-         v4l2-ctl -d /dev/video0 -c auto_exposure=1 -c exposure_time_absolute=100
-     Auto-exposure changes effective focal length. Calibrating with it enabled
-     produces intrinsics that are wrong as soon as the lighting changes.
-
-AUTO-CAPTURE, and why. Driving a live preview over SSH is painful, so this
-watches for the board and saves a frame by itself when it sees one in a part of
-the image it still needs. It divides the frame into a 3x3 grid and requires
-several views per cell, which is what forces coverage out to the corners -- and
-for a lens this wide, the corners are where the distortion information lives. A
-calibration built only from centred views fits the middle of the frame well and
-extrapolates badly exactly where you need it.
+Frames are captured automatically. The image is split into a 3x3 grid and each
+cell needs --per-cell views, which forces coverage into the corners where the
+120 deg lens distortion is strongest. A view is only kept when the board is
+tilted and held still. Use --view to watch progress in a browser.
 
     ~/vision/bin/python pi_calibrate.py
-    ~/vision/bin/python pi_calibrate.py --cols 9 --rows 6 --square-mm 25
+    ~/vision/bin/python pi_calibrate.py --cols 9 --rows 6 --square-mm 25 --view
     ~/vision/bin/python pi_calibrate.py --rational     # if error is high
 """
 
@@ -57,18 +38,15 @@ HAVE_SB = hasattr(cv2, "findChessboardCornersSB")
 def find_board(gray, pattern, force_classic=False):
     """Locate the board. Returns (found, corners).
 
-    findChessboardCornersSB ("sector based", OpenCV 4.x) is both faster and
-    markedly more accurate than the classic detector, and it does its own
-    subpixel refinement -- so no cornerSubPix afterwards. Corner precision feeds
-    straight into reprojection error, which is the number we are trying to get
-    under 0.5 px, so this is not a micro-optimisation."""
+    Prefers findChessboardCornersSB, which is more accurate and does its own
+    subpixel refinement. Falls back to the classic detector plus cornerSubPix.
+    """
     if HAVE_SB and not force_classic:
         ok, c = cv2.findChessboardCornersSB(
             gray, pattern,
             cv2.CALIB_CB_NORMALIZE_IMAGE | cv2.CALIB_CB_ACCURACY)
         if ok:
             return True, c
-        # fall through -- SB missing the board does NOT mean it is not there
     ok, c = cv2.findChessboardCorners(
         gray, pattern,
         cv2.CALIB_CB_ADAPTIVE_THRESH + cv2.CALIB_CB_NORMALIZE_IMAGE +
@@ -84,21 +62,15 @@ def grid_cell(pt, w, h, n=3):
     return (min(n - 1, int(pt[0] / (w / n))), min(n - 1, int(pt[1] / (h / n))))
 
 
-TILT_MIN = 1.15        # >=15% foreshortening counts as a genuinely tilted view
+TILT_MIN = 1.15        # >=15% foreshortening counts as a tilted view
 
 
 def tilt_ratio(corners, cols, rows):
-    """Perspective foreshortening as a cheap stand-in for board tilt.
+    """Worst ratio between opposite edges of the detected grid. 1.0 is flat-on.
 
-    WHY THIS MATTERS AS MUCH AS FRAME COVERAGE. The 3x3 grid samples DISTORTION,
-    which varies across the image. Tilt does something different and equally
-    necessary: it separates FOCAL LENGTH from DISTANCE. A perfectly fronto-
-    parallel board is mathematically ambiguous between 'small and close' and
-    'large and far' -- only perspective breaks that. So a set of 27 flat-on views
-    fills every cell and still leaves the solve poorly conditioned.
-
-    Measured as the worst ratio between opposite edges of the detected grid:
-    1.0 = dead flat-on, larger = more tilted."""
+    Tilted views are needed to separate focal length from distance; a set of
+    only flat-on views leaves the solve poorly conditioned.
+    """
     c = corners.reshape(-1, 2)
     tl, tr, bl, br = c[0], c[cols - 1], c[-cols], c[-1]
     top, bot = np.linalg.norm(tr - tl), np.linalg.norm(br - bl)
@@ -108,20 +80,15 @@ def tilt_ratio(corners, cols, rows):
     return max(r1, r2)
 
 
-# --- optional live preview ---------------------------------------------------
-# The calibrator and the standalone viewer cannot both hold /dev/video0, so the
-# preview lives HERE. It is not a luxury: the whole job is getting board views
-# into specific parts of the frame, and doing that blind -- over SSH, from a
-# scrolling list of cell coordinates -- is needlessly hard. The overlay shows
-# which cells are still outstanding and whether the board is being detected at
-# all, which are the only two questions you have while waving it around.
+# Optional MJPEG preview (--view). Lives here because only one process can hold
+# /dev/video0, so pi_cam_view.py cannot run alongside.
 _frame = {"jpg": None}
 _flock = threading.Lock()
 
 
 class _Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
-        pass                       # keep the console readable for the capture log
+        pass
 
     def do_GET(self):
         if self.path != "/stream":
@@ -153,14 +120,13 @@ class _Handler(BaseHTTPRequestHandler):
 
 def _publish(gray, corners, found, need, W, H, n_saved, total, tilt=None,
              reason="", pattern=None, scale=1.0):
-    """Annotate and hand to the server. Cheap enough at ~10 Hz."""
+    """Draw the coverage grid and status onto the frame for the preview."""
     vis = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
-    for i in (1, 2):               # the 3x3 coverage grid
+    for i in (1, 2):
         cv2.line(vis, (W * i // 3, 0), (W * i // 3, H), (60, 60, 60), 1)
         cv2.line(vis, (0, H * i // 3), (W, H * i // 3), (60, 60, 60), 1)
     for (cx, cy), n in need.items():
-        # green cell = satisfied, red = still wants views
-        col = (0, 200, 0) if n <= 0 else (0, 0, 220)
+        col = (0, 200, 0) if n <= 0 else (0, 0, 220)   # green = cell done
         cv2.putText(vis, str(max(0, n)),
                     (cx * W // 3 + W // 6 - 8, cy * H // 3 + H // 6 + 10),
                     cv2.FONT_HERSHEY_SIMPLEX, 1.0, col, 2, cv2.LINE_AA)
@@ -187,14 +153,14 @@ def main():
     ap.add_argument("--device", default="/dev/video0")
     ap.add_argument("--width",  type=int, default=1280)
     ap.add_argument("--height", type=int, default=720)
-    ap.add_argument("--cols",   type=int, default=9, help="INNER corners across")
-    ap.add_argument("--rows",   type=int, default=6, help="INNER corners down")
+    ap.add_argument("--cols",   type=int, default=9, help="inner corners across")
+    ap.add_argument("--rows",   type=int, default=6, help="inner corners down")
     ap.add_argument("--square-mm", type=float, default=25.0)
     ap.add_argument("--per-cell",  type=int, default=3)
     ap.add_argument("--outdir", default="calib_images")
     ap.add_argument("--rational", action="store_true",
-                    help="rational distortion model (k4..k6) -- for wide lenses "
-                         "where the plain radial model leaves error > ~1 px")
+                    help="rational distortion model (k4..k6), for when the "
+                         "plain radial model leaves error above ~1 px")
     ap.add_argument("--view", action="store_true",
                     help="serve a live preview with the coverage grid overlaid")
     ap.add_argument("--port", type=int, default=8080)
@@ -212,14 +178,12 @@ def main():
 
     os.makedirs(args.outdir, exist_ok=True)
 
-    # BEFORE opening the camera. The calibration is only valid at the exposure
-    # it was captured with, and v4l2 controls do not persist across re-opens
-    # (T35). Refuse to proceed rather than silently produce bad intrinsics.
+    # Lock exposure before opening the camera; intrinsics are only valid at
+    # the exposure they were captured with.
     print("locking exposure:")
     if not lock_exposure(args.device):
-        sys.exit("\nrefusing to calibrate with automatic exposure -- it changes "
-                 "effective focal length, so the result would be wrong as soon "
-                 "as the lighting did.")
+        sys.exit("\nrefusing to calibrate with automatic exposure: it changes "
+                 "the effective focal length.")
 
     cap = cv2.VideoCapture(args.device, cv2.CAP_V4L2)
     if not cap.isOpened():
@@ -232,13 +196,13 @@ def main():
     H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
     pattern = (args.cols, args.rows)
-    # Object points in the board's own frame: z=0, spacing = one square.
+    # Board-frame object points: z=0, spacing one square.
     objp = np.zeros((args.cols * args.rows, 3), np.float32)
     objp[:, :2] = np.mgrid[0:args.cols, 0:args.rows].T.reshape(-1, 2)
     objp *= args.square_mm
 
     need = {(cx, cy): args.per_cell for cx in range(3) for cy in range(3)}
-    objpoints, imgpoints, tilts = [], [], []
+    objpoints, imgpoints = [], []
     prev_corners = None
     n_saved = 0
     last_save = 0.0
@@ -246,9 +210,8 @@ def main():
     print(f"{W}x{H}   board {args.cols}x{args.rows} inner corners, "
           f"{args.square_mm} mm squares")
     print(f"need {args.per_cell} views per 3x3 cell = {9*args.per_cell} total\n")
-    print("Move the board slowly around the frame. TILT it -- views at an angle")
-    print("carry the information a flat-on view cannot. Work it into the CORNERS;")
-    print("that is where a 120 deg lens hides its distortion.  Ctrl-C to stop early.\n")
+    print("Move the board slowly around the frame, tilted, and work it into")
+    print("the corners. Ctrl-C to stop early.\n")
 
     try:
         while sum(need.values()) > 0:
@@ -261,16 +224,9 @@ def main():
             if gray is None:
                 continue
 
-            # FAST_CHECK bails early on frames with no board at all, which is
-            # most of them -- full detection at 720p is far too slow to run on
-            # every frame.
             found, corners = find_board(gray, pattern, args.classic)
 
-            # --- decide whether this frame is worth keeping, and SAY WHY NOT.
-            # Previously it grabbed whatever appeared, which meant it fired
-            # before you could angle the board and filled cells with flat,
-            # sometimes-blurred views. Now it waits for a view that is actually
-            # useful, and the preview shows what it is waiting for.
+            # Decide whether to keep this frame; reason is shown in the preview.
             tr, reason = None, "no board"
             cell = None
             if found:
@@ -278,10 +234,7 @@ def main():
                 centre = corners.reshape(-1, 2).mean(axis=0)
                 cell = grid_cell(centre, W, H)
 
-                # STABILITY. Corner motion between consecutive frames is a
-                # direct proxy for motion blur, which displaces corners and is
-                # a prime suspect for high reprojection error. It also gives
-                # you time to pose the board instead of racing the shutter.
+                # Mean corner motion since the last frame, as a motion-blur proxy.
                 moved = 99.0
                 if prev_corners is not None and prev_corners.shape == corners.shape:
                     moved = float(np.mean(np.linalg.norm(
@@ -304,7 +257,6 @@ def main():
                 continue
             objpoints.append(objp.copy())
             imgpoints.append(corners)
-            tilts.append(tr)
             need[cell] -= 1
             n_saved += 1
             last_save = time.time()
@@ -321,22 +273,18 @@ def main():
     cap.release()
 
     if len(objpoints) < 8:
-        sys.exit(f"\nonly {len(objpoints)} views -- need at least ~8, "
-                 f"ideally 20+. Re-run.")
+        sys.exit(f"\nonly {len(objpoints)} views, need at least ~8 "
+                 f"(ideally 20+). Re-run.")
 
     print(f"\nsolving with {len(objpoints)} views ...")
     flags = cv2.CALIB_RATIONAL_MODEL if args.rational else 0
     rms, K, dist, rvecs, tvecs = cv2.calibrateCamera(
         objpoints, imgpoints, (W, H), None, None, flags=flags)
 
-    # Per-view reprojection error: a single bad view (motion blur, a board that
-    # flexed) can drag the whole fit, and the mean hides it. Print the worst.
+    # Per-view RMS reprojection error (L2 norm / sqrt(N)), to spot one bad view.
     errs = []
     for i in range(len(objpoints)):
         proj, _ = cv2.projectPoints(objpoints[i], rvecs[i], tvecs[i], K, dist)
-        # RMS per point = L2norm / sqrt(N). Dividing by N (the original
-        # bug) understates by sqrt(N) ~ 7x and made 'worst view' read
-        # LOWER than the overall RMS, which is impossible.
         errs.append(cv2.norm(imgpoints[i], proj, cv2.NORM_L2)
                     / np.sqrt(len(proj)))
 
@@ -363,27 +311,25 @@ def main():
         "rational_model": bool(args.rational),
         "board": {"cols": args.cols, "rows": args.rows,
                   "square_mm": args.square_mm},
-        "note": "Valid ONLY at this resolution with focus and exposure locked "
-                "as they were during capture (T14, T35).",
+        "note": "Valid only at this resolution with focus and exposure locked "
+                "as they were during capture.",
     }
     with open("camera_intrinsics.json", "w") as f:
         json.dump(out, f, indent=2)
     print("\n  written: camera_intrinsics.json")
 
     if rms > 1.0:
-        print("\n  *** RMS > 1 px. Likely causes, in order: board not FLAT "
-              "(mount it rigid),")
-        print("      too few tilted views, motion blur, or the plain radial "
-              "model not fitting")
-        print("      a 120 deg lens -- try  --rational")
+        print("\n  RMS > 1 px. Likely causes: board not flat, too few tilted")
+        print("  views, motion blur, or the radial model not fitting a")
+        print("  120 deg lens (try --rational).")
     elif rms < 0.5:
-        print("\n  RMS < 0.5 px -- good fit.")
+        print("\n  RMS < 0.5 px, good fit.")
 
-    print(f"\n  Sanity-check it: the implied FOV ({hfov:.0f} deg H) should be "
+    print(f"\n  Sanity check: the implied FOV ({hfov:.0f} deg H) should be "
           f"close to the")
-    print(f"  spec sheet's 120 deg DIAGONAL. Wildly different means the board "
-          f"geometry")
-    print(f"  (--cols/--rows/--square-mm) does not match what you printed.")
+    print(f"  spec sheet's 120 deg diagonal. If it is far off, --cols/--rows/"
+          f"--square-mm")
+    print(f"  do not match the printed board.")
 
 
 if __name__ == "__main__":

@@ -1,6 +1,7 @@
 #include "timebase.h"
 
-uint32_t timerClkFreq(TIM_TypeDef* t) {
+/* Timer input clock: PCLK, doubled when the APB prescaler is not 1. */
+static uint32_t timerClkFreq(TIM_TypeDef* t) {
   bool onAPB2 = (t == TIM1  || t == TIM8  || t == TIM9 ||
                  t == TIM10 || t == TIM11);
 

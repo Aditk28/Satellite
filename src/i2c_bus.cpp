@@ -7,8 +7,7 @@ static SemaphoreHandle_t s_mtx      = nullptr;
 static volatile uint32_t s_timeouts = 0;
 
 void i2c_init(void) {
-  // xSemaphoreCreateMutex, NOT xSemaphoreCreateBinary -- see the header. The
-  // ownership this creates is what gives us priority inheritance.
+  // A mutex, not a binary semaphore, for priority inheritance.
   s_mtx = xSemaphoreCreateMutex();
   configASSERT(s_mtx != nullptr);
 }

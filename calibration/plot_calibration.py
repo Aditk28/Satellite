@@ -1,34 +1,16 @@
 #!/usr/bin/env python3
 """
-plot_calibration.py
+Static plots of a filtered calibration run (run filter_calibration.py first).
 
-Static plots from a filtered calibration run. Run filter_calibration.py
-first -- this reads the filtered/ folder, not the raw one, so every plot is
-already bias-corrected and sign-consistent.
+Writes PNGs into <filtered_folder>/plots/:
+  test<NN>_*.png        per test: command, wheel velocity, platform rate and
+                        heading on a shared time axis, step marked
+  overview_steps.png    from-rest step tests overlaid, aligned at the step
+  overview_scaling.png  steady-state wheel velocity and peak platform rate vs
+                        command, with a line through the origin for reference
 
-Produces, into <filtered_folder>/plots/:
-
-  test<NN>_*.png     One figure per test, three stacked panels sharing a
-                     time axis: commanded voltage, wheel velocity, and
-                     platform rate + heading. The phase A/B boundary is
-                     marked on all three, since almost every question about
-                     this data ("did it settle before the step?", "how long
-                     was the transient?") is really a question about where
-                     that line falls.
-
-  overview_steps.png  All from-rest step tests overlaid, time-shifted so
-                      t=0 is the step itself rather than the start of the
-                      recording -- makes the voltage-to-response scaling
-                      directly comparable across tests.
-
-  overview_scaling.png  Steady-state wheel velocity and peak platform rate
-                        vs commanded voltage. This is the plot that tells
-                        you whether a linear model is defensible before you
-                        go fit one: points near a straight line through the
-                        origin means yes.
-
-USAGE:
-    python plot_calibration.py calibration_run_20260729_112929/filtered
+Usage:
+    python plot_calibration.py runs/<run_folder>/filtered
     python plot_calibration.py <filtered_folder> --outdir figures
 """
 
@@ -52,8 +34,7 @@ except ImportError:
 RE_TITLE = re.compile(r"^#\s*test\s+(\d+)/(\d+):\s*(.*)$")
 RE_META = re.compile(r"^#\s*from=([-\d.]+)V\s+to=([-\d.]+)V")
 
-# Palette: the wheel is the warm channel, the platform the cool one, kept
-# consistent across every figure so the two are never confused at a glance.
+# Wheel is orange, platform is blue in every figure.
 C_WHEEL = "#D98A2B"
 C_PLATFORM = "#3C8DBC"
 C_ANGLE = "#7B5EA7"
@@ -90,7 +71,7 @@ def plot_one(df, meta, outpath):
     fig, axes = plt.subplots(3, 1, figsize=(11, 8.5), sharex=True,
                              gridspec_kw={"height_ratios": [0.6, 1, 1], "hspace": 0.12})
 
-    fig.suptitle(f"Test {meta.get('test_num','?')} — {meta.get('label','')}",
+    fig.suptitle(f"Test {meta.get('test_num','?')}: {meta.get('label','')}",
                  fontsize=13, fontweight="bold", y=0.965)
 
     ax = axes[0]
@@ -188,8 +169,7 @@ def plot_overview_scaling(tests, outpath):
 
     ax = axes[0]
     ax.plot(v, w, "o-", color=C_WHEEL, lw=1.6, ms=7)
-    # Reference line through the origin fitted on magnitude -- if the points
-    # track it, a linear model is defensible.
+    # Least-squares line through the origin, as a linearity reference.
     k = np.sum(v * w) / np.sum(v * v) if np.sum(v * v) else 0.0
     xs = np.linspace(min(0, v.min()) * 1.05, max(0, v.max()) * 1.05, 50)
     ax.plot(xs, k * xs, ls="--", color="#999", lw=1.1,

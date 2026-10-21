@@ -1,32 +1,21 @@
 #!/usr/bin/env python3
 """
-live_monitor.py -- self-contained live monitor for the reaction wheel.
+Live browser monitor for the reaction wheel platform.
 
-The web page is embedded in this file, so this is the only file you need.
+Opens the serial port (USB or HC-05), parses the HOLD-mode telemetry stream
+and serves a web page (embedded below) with a small JSON API for polling
+samples and sending commands.
 
-Owns the serial port (USB or HC-05), parses the 10 Hz HOLD telemetry stream,
-and serves live_monitor.html plus a small JSON API to the browser.
-
-This is capture_calibration.py stripped to what a live view needs: port
-handling and line parsing. No CSV state machine, no capture blocks, no
-metadata parsing -- those stay in capture_calibration.py for logged runs.
-
+Usage:
     py -m pip install pyserial
-    py live_monitor.py                 # lists ports, picks the only one
-    py live_monitor.py --port COM7
+    py live_monitor.py                 # uses the only port, if there is one
     py live_monitor.py --port COM7 --baud 115200 --http 8000
 
-Then open http://localhost:8000
+Then open http://localhost:8000.
 
-TELEMETRY NOTE: the firmware only streams while in HOLD mode (CTRL_HOLD, not
-capturing), at TELEM_PERIOD_MS = 100 -> 10 Hz. That is enough for the numbers
-but choppy for video. For recording, set TELEM_PERIOD_MS to 50 (20 Hz) or 33
-(30 Hz) in heading_control.cpp. The browser animates between samples either
-way, so the instrument stays smooth; the strip charts get denser.
-
-A T<deg> step capture SUSPENDS the stream and dumps a 200 Hz CSV block at the
-end. Those rows have 7 fields and are ignored here by field count. Use H<deg>
-for anything you want to watch live.
+The firmware streams only in HOLD mode, at TELEM_PERIOD_MS (100 ms, 10 Hz)
+in rtos_main.cpp. A T<deg> capture pauses the stream; use H<deg> to watch
+live.
 """
 
 import argparse
@@ -55,7 +44,7 @@ PAGE = """<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Reaction wheel — attitude monitor</title>
+<title>Reaction wheel attitude monitor</title>
 <style>
   :root{
     --ink:#0B1013;
@@ -98,7 +87,6 @@ PAGE = """<!DOCTYPE html>
   section{background:var(--ink); padding:20px 22px}
   @media (max-width:860px){ main{grid-template-columns:1fr} }
 
-  /* ---- instrument ---- */
   #adi{width:100%; max-width:420px; display:block; margin:0 auto}
 
   .readout{
@@ -112,13 +100,11 @@ PAGE = """<!DOCTYPE html>
   .cell.emb .v{color:var(--ember)}
   .cell.warn .v{color:var(--alert)}
 
-  /* ---- charts ---- */
   .chart-wrap{margin-top:20px}
   canvas.strip{width:100%; height:96px; display:block;
     background:var(--panel-2); border:1px solid var(--line)}
   .chart-head{display:flex; justify-content:space-between; align-items:baseline; margin-bottom:5px}
 
-  /* ---- controls ---- */
   .group{margin-bottom:22px}
   .group > .eyebrow{display:block; margin-bottom:8px}
   .grid{display:grid; grid-template-columns:repeat(4,1fr); gap:5px}
@@ -171,24 +157,24 @@ PAGE = """<!DOCTYPE html>
 
     <div class="readout">
       <div class="cell sig"><span class="eyebrow">Heading</span>
-        <div><span class="v" id="rHeading">—</span><span class="u">deg</span></div></div>
+        <div><span class="v" id="rHeading">-</span><span class="u">deg</span></div></div>
       <div class="cell"><span class="eyebrow">Target</span>
-        <div><span class="v" id="rTarget">—</span><span class="u">deg</span></div></div>
+        <div><span class="v" id="rTarget">-</span><span class="u">deg</span></div></div>
       <div class="cell" id="cErr"><span class="eyebrow">Error</span>
-        <div><span class="v" id="rErr">—</span><span class="u">deg</span></div></div>
+        <div><span class="v" id="rErr">-</span><span class="u">deg</span></div></div>
 
       <div class="cell emb"><span class="eyebrow">Wheel</span>
-        <div><span class="v" id="rWw">—</span><span class="u">rad/s</span></div></div>
+        <div><span class="v" id="rWw">-</span><span class="u">rad/s</span></div></div>
       <div class="cell"><span class="eyebrow">Platform rate</span>
-        <div><span class="v" id="rWp">—</span><span class="u">rad/s</span></div></div>
+        <div><span class="v" id="rWp">-</span><span class="u">rad/s</span></div></div>
       <div class="cell"><span class="eyebrow">Command</span>
-        <div><span class="v" id="rU">—</span><span class="u">V</span></div></div>
+        <div><span class="v" id="rU">-</span><span class="u">V</span></div></div>
     </div>
 
     <div class="chart-wrap">
       <div class="chart-head">
         <span class="eyebrow">Heading vs target</span>
-        <span class="eyebrow num" id="axHead">±180°</span>
+        <span class="eyebrow num" id="axHead">+/-180 deg</span>
       </div>
       <canvas class="strip" id="chHeading" width="1200" height="192"></canvas>
     </div>
@@ -196,7 +182,7 @@ PAGE = """<!DOCTYPE html>
     <div class="chart-wrap">
       <div class="chart-head">
         <span class="eyebrow">Wheel speed &middot; saturation at 45</span>
-        <span class="eyebrow num" id="axWheel">±50 rad/s</span>
+        <span class="eyebrow num" id="axWheel">+/-50 rad/s</span>
       </div>
       <canvas class="strip" id="chWheel" width="1200" height="192"></canvas>
     </div>
@@ -213,17 +199,16 @@ PAGE = """<!DOCTYPE html>
         <button class="half" id="btnHoldZero">Hold at 0</button>
         <button class="half" id="btnHoldHere">Hold here</button>
       </div>
-      <p class="hint"><span class="num">H</span> holds a heading and keeps
-        telemetry streaming. Everything above sends it too — the board only
-        streams while holding, so send one to start the live view.</p>
+      <p class="hint"><span class="num">H</span> holds a heading and starts
+        the telemetry stream. The board only streams while holding.</p>
     </div>
 
     <div class="group">
       <span class="eyebrow">Slew to heading</span>
       <div class="grid">
-        <button data-h="-180">−180</button>
-        <button data-h="-90">−90</button>
-        <button data-h="-45">−45</button>
+        <button data-h="-180">-180</button>
+        <button data-h="-90">-90</button>
+        <button data-h="-45">-45</button>
         <button data-h="0">0</button>
         <button data-h="45">+45</button>
         <button data-h="90">+90</button>
@@ -281,21 +266,19 @@ PAGE = """<!DOCTYPE html>
 </main>
 
 <script>
-// ---------------------------------------------------------------- state
-const WHEEL_SAT = 45;          // rad/s, matches WHEEL_SAT_LIMIT in firmware
+const WHEEL_SAT = 45;          // rad/s, saturation marker on the wheel chart
 const HIST_SEC  = 30;          // strip chart window
 
 let since = 0, logSince = 0;
 let hist = [];                 // {t, theta, target, ww, u}
-let live = {theta:0, target:0, wp:0, ww:0, alpha:0, u:0, stamp:0};
+let live = {theta:0, target:0, wp:0, ww:0, alpha:0, u:0};
 let shown = {theta:0, target:0};   // interpolated for display
 let wheelPhase = 0;                // integrated client-side for smooth spin
 let lastFrame = performance.now();
 let lastSampleAt = 0;
 let everSeen = false;
-let stale = false;             // firmware stopped streaming: X, or a T capture
+let stale = false;             // no samples recently (X or a T capture)
 
-// ---------------------------------------------------------------- comms
 async function send(cmd){
   try{
     await fetch('/cmd', {method:'POST', headers:{'Content-Type':'application/json'},
@@ -305,20 +288,20 @@ async function send(cmd){
 
 let polling = false;
 async function poll(){
-  if(polling) return;          // never let two requests race: overlapping polls
-  polling = true;              // read the same cursor and duplicate every line
+  if(polling) return;          // overlapping polls would duplicate samples
+  polling = true;
   try{
     const r = await fetch(`/stream?since=${since}&logs=${logSince}`);
     const d = await r.json();
 
     document.getElementById('dot').classList.toggle('on', d.connected);
     document.getElementById('linkText').textContent =
-      !d.connected ? 'no link' : (stale ? d.port + ' · idle' : d.port);
+      !d.connected ? 'no link' : (stale ? d.port + ' (idle)' : d.port);
 
     for(const s of d.samples){
       since = s.n; everSeen = true;
       live = {theta:s.theta, target:s.target, wp:s.wp, ww:s.ww,
-              alpha:s.alpha, u:s.u, stamp:performance.now()};
+              alpha:s.alpha, u:s.u};
       lastSampleAt = performance.now();
       hist.push({t:s.t, theta:s.theta, target:s.target, ww:s.ww, u:s.u});
     }
@@ -334,7 +317,6 @@ async function poll(){
 }
 setInterval(poll, 80);
 
-// ---------------------------------------------------------------- console
 const box = document.getElementById('console');
 function pushLog(text, forced){
   let cls = forced || 'out';
@@ -352,12 +334,10 @@ function pushLog(text, forced){
   box.scrollTop = box.scrollHeight;
 }
 
-// ---------------------------------------------------------------- helpers
 const wrap = d => ((d + 180) % 360 + 360) % 360 - 180;
 const rad  = d => d * Math.PI / 180;
 function lerpAngle(a, b, k){ return a + wrap(b - a) * k; }
 
-// ---------------------------------------------------------------- instrument
 const adi = document.getElementById('adi');
 const ax  = adi.getContext('2d');
 
@@ -368,7 +348,7 @@ function drawADI(){
 
   const rOuter = C*0.90, rTick = C*0.80, rWheel = C*0.50;
 
-  // --- momentum arc: how much of the saturation budget is spent -----------
+  // Momentum arc: fraction of wheel saturation used.
   const frac = Math.min(Math.abs(live.ww)/WHEEL_SAT, 1);
   ax.lineWidth = 14; ax.lineCap = 'butt';
   ax.strokeStyle = '#1A262C';
@@ -381,7 +361,7 @@ function drawADI(){
     ax.stroke();
   }
 
-  // --- outer bezel and degree ticks ---------------------------------------
+  // Bezel and degree ticks.
   ax.strokeStyle = '#24343B'; ax.lineWidth = 1.5;
   ax.beginPath(); ax.arc(0,0,rOuter,0,Math.PI*2); ax.stroke();
 
@@ -409,7 +389,7 @@ function drawADI(){
   }
   ax.restore();
 
-  // --- target bug ---------------------------------------------------------
+  // Target marker.
   const ta = rad(wrap(shown.target - shown.theta) - 90);
   ax.fillStyle = '#5FD3E0';
   ax.beginPath();
@@ -418,7 +398,7 @@ function drawADI(){
   ax.lineTo(Math.cos(ta+0.030)*(rOuter-30), Math.sin(ta+0.030)*(rOuter-30));
   ax.closePath(); ax.fill();
 
-  // --- flywheel: spokes make the spin legible -----------------------------
+  // Flywheel.
   ax.save(); ax.rotate(wheelPhase);
   const g = ax.createRadialGradient(0,0,rWheel*0.15, 0,0,rWheel);
   g.addColorStop(0, '#182228'); g.addColorStop(1, '#101A1F');
@@ -443,38 +423,37 @@ function drawADI(){
   ax.strokeStyle = '#3A5058'; ax.lineWidth = 2; ax.stroke();
   ax.restore();
 
-  // --- fixed nose marker: the platform's own forward direction -------------
+  // Fixed nose marker (platform forward direction).
   ax.strokeStyle = stale ? '#2F5A62' : '#5FD3E0';
   ax.lineWidth = 3; ax.lineCap = 'round';
   ax.beginPath();
   ax.moveTo(0, -rWheel - 10); ax.lineTo(0, -rOuter + 30);
   ax.stroke();
 
-  // --- centre numerals -----------------------------------------------------
+  // Centre readout.
   ax.fillStyle = !everSeen ? '#41585F' : (stale ? '#5E7078' : '#DCE8ED');
   ax.font = '500 62px ui-monospace, Menlo, Consolas, monospace';
   ax.textAlign = 'center'; ax.textBaseline = 'alphabetic';
-  ax.fillText(everSeen ? wrap(live.theta).toFixed(1)+'\u00B0' : '——', 0, 14);
+  ax.fillText(everSeen ? wrap(live.theta).toFixed(1)+'\u00B0' : '--', 0, 14);
   ax.fillStyle = stale ? '#E8964A' : '#7E939C';
   ax.font = '500 17px ui-monospace, Menlo, Consolas, monospace';
   ax.fillText(!everSeen ? 'awaiting telemetry'
-              : stale   ? 'stream idle — last known'
+              : stale   ? 'stream idle, last known'
               :           `${live.ww.toFixed(1)} rad/s`, 0, 44);
 
-  // dim the whole face while nothing is arriving
+  // Dim the face while the stream is idle.
   if(stale && everSeen){
     ax.globalCompositeOperation = 'source-over';
     ax.fillStyle = 'rgba(11,16,19,0.45)';
     ax.beginPath(); ax.arc(0,0,C,0,Math.PI*2); ax.fill();
     ax.fillStyle = '#E8964A';
     ax.font = '500 15px ui-monospace, Menlo, Consolas, monospace';
-    ax.fillText('STOPPED  ·  send Hold to resume', 0, C*0.72);
+    ax.fillText('Stopped. Send Hold to resume.', 0, C*0.72);
   }
 
   ax.restore();
 }
 
-// ---------------------------------------------------------------- strips
 function drawStrip(canvas, series, opts){
   const c = canvas.getContext('2d');
   const W = canvas.width, H = canvas.height, pad = 8;
@@ -486,7 +465,6 @@ function drawStrip(canvas, series, opts){
   const X = t => pad + (t - t0)/HIST_SEC * (W - pad*2);
   const Y = v => H/2 - (v/span) * (H/2 - pad);
 
-  // zero rule and limit rules
   c.strokeStyle = '#24343B'; c.lineWidth = 1;
   c.beginPath(); c.moveTo(pad, Y(0)); c.lineTo(W-pad, Y(0)); c.stroke();
   for(const lim of (opts.limits || [])){
@@ -511,18 +489,16 @@ function drawStrip(canvas, series, opts){
   }
 }
 
-// ---------------------------------------------------------------- loop
 function frame(now){
   const dt = Math.min((now - lastFrame)/1000, 0.1);
   lastFrame = now;
 
-  // ease displayed heading toward the last sample so 10 Hz reads as smooth
+  // Ease the displayed heading toward the latest sample.
   const k = 1 - Math.exp(-dt * 12);
   shown.theta  = lerpAngle(shown.theta,  live.theta,  k);
   shown.target = lerpAngle(shown.target, live.target, k);
 
-  // Stream only runs in HOLD mode, so X or a T capture stops it. Freeze the
-  // spin rather than animating stale data as though it were live.
+  // Freeze the wheel spin when no samples are arriving.
   stale = everSeen && (now - lastSampleAt > 1200);
   if(!stale) wheelPhase = (wheelPhase + live.ww * dt) % (Math.PI*2);
 
@@ -544,7 +520,7 @@ function frame(now){
 
   const headSpan = Math.max(30, Math.min(180,
     hist.reduce((m,p)=>Math.max(m, Math.abs(wrap(p.theta)), Math.abs(wrap(p.target))), 0) * 1.25));
-  document.getElementById('axHead').textContent = `±${headSpan.toFixed(0)}°`;
+  document.getElementById('axHead').textContent = `+/-${headSpan.toFixed(0)} deg`;
   drawStrip(document.getElementById('chHeading'), [
     {pick:p=>wrap(p.target), color:'#3A5A60', width:2, dash:[6,4]},
     {pick:p=>wrap(p.theta),  color:'#5FD3E0', width:2.5},
@@ -558,7 +534,6 @@ function frame(now){
 }
 requestAnimationFrame(frame);
 
-// ---------------------------------------------------------------- controls
 document.querySelectorAll('[data-h]').forEach(b =>
   b.addEventListener('click', () => send('H' + b.dataset.h)));
 
@@ -633,8 +608,6 @@ class Link:
         self.connected = False
         self.t0 = time.time()
 
-    # ---------- connection ----------
-
     def open(self):
         try:
             self.ser = serial.Serial(self.port_name, self.baud, timeout=0.2)
@@ -651,8 +624,6 @@ class Link:
             self.logs.append({"n": self.log_seq,
                               "t": round(time.time() - self.t0, 2),
                               "text": text})
-
-    # ---------- reader thread ----------
 
     def reader(self):
         buf = b""
@@ -686,8 +657,7 @@ class Link:
             return
         parts = line.split(",")
 
-        # HOLD telemetry: exactly six numeric fields.
-        # theta_deg, target_deg, omega_p, omega_w, alpha, u
+        # HOLD telemetry: theta_deg, target_deg, omega_p, omega_w, alpha, u
         if len(parts) == 6:
             try:
                 v = [float(p) for p in parts]
@@ -705,14 +675,12 @@ class Link:
                 })
             return
 
-        # 7 fields = a T-capture CSV row or its header. Not live data.
+        # 7 fields: a T-capture CSV row or header, not live data.
         if len(parts) == 7:
             return
 
-        # Everything else is firmware text: banners, STALL notices, G output.
+        # Anything else is firmware text.
         self._log(line)
-
-    # ---------- writer ----------
 
     def send(self, cmd):
         if not self.connected or self.ser is None:
@@ -726,8 +694,6 @@ class Link:
             self._log(f"write error: {exc}")
             self.connected = False
             return False
-
-    # ---------- snapshot for the browser ----------
 
     def snapshot(self, since, log_since):
         with self.lock:
@@ -759,7 +725,7 @@ def pick_port(requested):
 def make_handler(link):
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *args):
-            pass                                  # keep the console clean
+            pass
 
         def _send(self, code, body, ctype):
             data = body if isinstance(body, bytes) else body.encode("utf-8")
@@ -784,10 +750,8 @@ def make_handler(link):
                            "application/json")
                 return
 
-            # Prefer an external live_monitor.html if one sits next to this
-            # script AND has content -- that is the file to edit. A zero-byte or
-            # missing file falls back to the copy embedded below, so the monitor
-            # always renders something rather than a blank page.
+            # Serve live_monitor.html from this folder if present and
+            # non-trivial, otherwise the embedded page.
             page = HERE / "live_monitor.html"
             body = PAGE
             if page.exists() and page.stat().st_size > 2000:
@@ -830,7 +794,7 @@ def main():
         print(f"  Page:          {ext.name} ({ext.stat().st_size} bytes)")
     elif ext.exists():
         print(f"  Page:          embedded  (ignoring {ext.name}, only "
-              f"{ext.stat().st_size} bytes -- looks truncated)")
+              f"{ext.stat().st_size} bytes, looks truncated)")
     else:
         print("  Page:          embedded")
     print("  Ctrl-C to stop.\n")

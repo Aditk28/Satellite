@@ -5,6 +5,7 @@
 #include "SPI.h"
 #include "common/base_classes/Sensor.h"
 
+// SimpleFOC sensor for the MT6701 magnetic encoder, read over SSI with the SPI peripheral.
 
 #define MT6701_CPR 16384.0f
 
@@ -12,10 +13,9 @@
 
 #define MT6701_DATA_POS 1
 
-// Use SPI mode 2, capture on falling edge. First bit is not valid data, so have to read 25 bits to get a full SSI frame.
-// SSI frame is 1 bit ignore, 14 bits angle, 4 bit status and 6 bit CRC.
+// SPI mode 2 (capture on the falling edge). The SSI frame is 1 dummy bit, 14 bits
+// angle, 4 bits status and 6 bits CRC; only the first 16 bits are read.
 static SPISettings MT6701SSISettings(1000000, MT6701_BITORDER, SPI_MODE2); // @suppress("Invalid arguments")
-
 
 
 class MagneticSensorMT6701SSI : public Sensor {

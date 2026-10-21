@@ -1,3 +1,4 @@
+/* Translation capture recorder. See trans_capture.h. */
 #include "trans_capture.h"
 #include "translation.h"
 #include <math.h>
@@ -60,15 +61,14 @@ static void tcap_store(const EstState* st, uint32_t poseAgeUs,
   s_p2[s_n]  = (uint8_t)(p2 + 0.5f);
   s_p3[s_n]  = (uint8_t)(p3 + 0.5f);
   s_p4[s_n]  = (uint8_t)(p4 + 0.5f);
-  /* UINT32_MAX means "never had a fix"; clamp so the column stays numeric. */
+  /* UINT32_MAX means "never had a fix"; clamp to keep the column numeric. */
   uint32_t ms = (poseAgeUs == UINT32_MAX) ? 65535u : (poseAgeUs / 1000u);
   s_age[s_n] = (ms > 65535u) ? 65535u : (uint16_t)ms;
   s_n++;
 }
 
-/* Shared front end: decimate, and stop cleanly when the buffer fills rather
-   than wrapping -- a wrapped buffer of a run still in progress is a trajectory
-   with no beginning, which is the half that matters. */
+/* Decimate, and stop when the buffer fills rather than wrapping, so the start
+   of the run is kept. */
 static bool tcap_tick(void) {
   if (!s_active) return false;
   if (++s_div < TCAP_DECIM) return false;
@@ -88,8 +88,7 @@ void tcap_sample(const EstState* st, uint32_t poseAgeUs,
 void tcap_sampleProbe(const EstState* st, uint32_t poseAgeUs, const float pct[4],
                       float imu_ax, float imu_ay, float omega_p) {
   if (!st || !pct || !tcap_tick()) return;
-  /* No commanded acceleration exists during a probe -- the fans are being
-     driven open loop -- so those columns are honestly zero rather than stale. */
+  /* Fans are open loop during a probe, so commanded accel is logged as zero. */
   tcap_store(st, poseAgeUs, 0.0f, 0.0f, pct[0], pct[1], pct[2], pct[3],
              imu_ax, imu_ay, omega_p);
 }
@@ -115,9 +114,8 @@ void tcap_dumpTo(Print& out) {
   float kp, kd, ff;
   trans_getGains(&kp, &kd, &ff);
 
-  /* Same marker protocol as dumpCaptureTo -- capture_calibration.py keys on
-     this line and on the "t_us," header, never on the metadata (a regex over
-     metadata silently lost a full sweep once, CONTROL_README section 16). */
+  /* Same marker protocol as dumpCaptureTo. capture_calibration.py keys on this
+     line and on the "t_us," header, not on the metadata. */
   out.print("--- capture start (test ");
   out.print(s_test);
   out.print("/");
@@ -157,9 +155,7 @@ void tcap_dumpTo(Print& out) {
               "ax_imu,ay_imu,omega_p,pct1,pct2,pct3,pct4,poseage_ms");
 
   for (int i = 0; i < s_n; i++) {
-    /* Recomputed here rather than stored -- see the header. The magnet arm
-       rotates with heading, which is the whole reason it cannot be a constant
-       offset applied in analysis. */
+    /* Magnet position recomputed from the stored pose. */
     float mx = s_x[i] - EST_L_MAG * sinf(s_psi[i]);
     float my = s_y[i] - EST_L_MAG * cosf(s_psi[i]);
     float ex = s_tx - mx, ey = s_ty - my;

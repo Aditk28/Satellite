@@ -1,31 +1,16 @@
 #!/usr/bin/env python3
 """
-Translation Phase 4 -> Phase 3 join: the real pose sender. Runs ON THE PI.
+Pose sender: camera -> AprilTag detection -> PnP -> UART frames to the STM32.
+Runs on the Pi.
 
-Closes the chain. Camera -> detect -> bundle solvePnP -> Phase 3 frame -> USART6
--> the STM32's pi_link parser. Everything here already exists and is tested
-separately; this wires the pieces together and adds nothing new to the protocol.
+Uses solve() from pi_pose.py and the same frame format as pi_pose_sim.py,
+parsed by src/pi_link.cpp. age_us is the time from the moment grab() returned
+to the moment the frame is written. It excludes sensor exposure and USB
+transit, so it is a lower bound on the true latency.
 
-    pi_vision_threaded.py  ->  threaded capture + the capture TIMESTAMP
-    pi_pose.py             ->  bundle solve, sign conventions, ambiguity ratio
-    pi_pose_sim.py         ->  the frame format and CRC (byte-identical)
-    pi_link.{h,cpp}        ->  the STM32 parser and staleness ladder
-
-WHAT MAKES age_us REAL NOW. The synthetic sender guessed a detection latency;
-this measures it. The capture thread stamps `perf_counter()` the instant grab()
-returns, and age_us is the interval from there to the moment the frame is handed
-to the UART. That is the number the estimator needs in order to propagate the
-state forward from when the measurement was actually taken. It still EXCLUDES
-sensor exposure and USB transit, which are invisible from userspace -- so it
-remains a lower bound, under-reporting by a roughly constant offset (see the
-Step 4.2 note). Do not treat it as the whole latency.
-
-FRAMES ARE SENT EVEN WITH NO TAG IN VIEW, with PI_FLAG_VALID clear. That is
-deliberate: it lets the STM32 distinguish "the link is alive but I cannot see the
-dock" from "the link is dead", which are completely different failures needing
-completely different responses. pi_link.cpp only refreshes its freshness clock on
-VALID frames, so the staleness ladder still fires correctly while invalid frames
-keep arriving -- conflating the two is trap T9.
+A frame is sent for every processed image, with PI_FLAG_VALID clear when no
+tag is visible. That lets the STM32 tell "link alive, no tag" apart from
+"link dead".
 
     ~/vision/bin/python pi_pose_send.py
     ~/vision/bin/python pi_pose_send.py --port /dev/serial0 --quiet
@@ -55,7 +40,6 @@ PAYLOAD_LEN = 28
 FLAG_VALID     = 0x01
 FLAG_AMBIGUOUS = 0x02
 FLAG_MULTITAG  = 0x04
-FLAG_OOP       = 0x08
 
 
 def crc16_ccitt_false(data: bytes) -> int:
@@ -76,9 +60,7 @@ def build(seq, flags, tag_id, rng, bearing, relyaw, quality, age_us, n_tags):
 
 
 class Camera(threading.Thread):
-    """Newest-frame-wins capture. See B23 -- a queue would preserve every frame
-    at the cost of letting them age, which is backwards for a measurement
-    feeding a control loop."""
+    """Capture thread that keeps only the newest decoded frame."""
 
     def __init__(self, device, width, height, bufsize):
         super().__init__(daemon=True)
@@ -89,18 +71,9 @@ class Camera(threading.Thread):
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH,  width)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
         self.cap.set(cv2.CAP_PROP_CONVERT_RGB, 0)
-        # BUFFER DEPTH DEPENDS ON WHETHER YOU OUTRUN THE CAMERA.
-        #
-        #   CPU faster than the camera (1400 MHz): depth 4. A single buffer
-        #   leaves the driver nowhere to capture while userspace holds a frame,
-        #   so it misses every other one -- measured 15.9 fps against 30.
-        #
-        #   CPU slower than the camera (600 MHz, undervolt-throttled): depth 1.
-        #   Processing takes ~140 ms against a 33 ms frame interval, so a deep
-        #   queue BACKS UP and grab() starts returning frames up to 130 ms old.
-        #   Deep buffering silently turns a rate problem into a LATENCY problem,
-        #   and latency is the thing the estimator cannot tolerate. Depth 1 makes
-        #   the driver DROP stale frames instead of queueing them.
+        # Use 4 when processing keeps up with the camera, so the driver always
+        # has a free buffer. Use 1 when it cannot, so old frames are dropped
+        # instead of queued and grab() does not return stale frames.
         self.cap.set(cv2.CAP_PROP_BUFFERSIZE, bufsize)
         self.lock, self.latest, self.seq, self.stop = threading.Lock(), None, 0, False
 
@@ -109,7 +82,7 @@ class Camera(threading.Thread):
             if not self.cap.grab():
                 time.sleep(0.005)
                 continue
-            t_cap = time.perf_counter()     # as close to capture as we can see
+            t_cap = time.perf_counter()
             ok, buf = self.cap.retrieve()
             if not ok:
                 continue
@@ -136,21 +109,17 @@ def main():
     ap.add_argument("--width",  type=int, default=1280)
     ap.add_argument("--height", type=int, default=720)
     ap.add_argument("--decimate", type=float, default=3.0,
-                    help="quad-detection decimation. 2.0 at full clock; 3.0 is "
-                         "the 600 MHz compromise -- roughly halves detect cost. "
-                         "CHECK the tag count still holds at 3: 4.0 was measured "
-                         "to drop the 4 cm flanking tags, and those are what "
-                         "resolve the yaw ambiguity (T30).")
+                    help="quad detection decimation. 2.0 at full clock, 3.0 "
+                         "for a throttled 600 MHz CPU. 4.0 loses the 4 cm "
+                         "flanking tags.")
     ap.add_argument("--threads",  type=int, default=3)
     ap.add_argument("--buffersize", type=int, default=1,
-                    help="V4L2 queue depth. 1 when the CPU is SLOWER than the "
-                         "camera (600 MHz throttled) so stale frames are "
-                         "dropped; 4 when it is FASTER (1400 MHz) so the driver "
-                         "always has somewhere to capture. See Camera.__init__.")
+                    help="V4L2 queue depth: 1 if the CPU is slower than the "
+                         "camera, 4 if faster")
     ap.add_argument("--quiet", action="store_true")
     args = ap.parse_args()
 
-    lock_exposure(args.device)   # must match the calibration (T35)
+    lock_exposure(args.device)   # must match the calibration exposure
 
     ser = serial.Serial(args.port, args.baud, timeout=0)
     cam = Camera(args.device, args.width, args.height, args.buffersize)
@@ -159,11 +128,6 @@ def main():
 
     W = int(cam.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     H = int(cam.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    # Real intrinsics if we have them. The fallback is a MEASURED focal length
-    # with the principal point assumed centred and no distortion model -- that
-    # assumption is what made rel-yaw wander under pure translation, because
-    # uncorrected barrel distortion shears an off-centre target and solvePnP
-    # fits the shear as a rotation.
     K, dist, src = load_intrinsics(W, H)
     if K is None:
         f = F_PX_AT_1280 * (W / 1280.0)
@@ -172,7 +136,7 @@ def main():
     det = make_detector(args.decimate, args.threads)
 
     print(f"{W}x{H} [{src}]  ->  {args.port} @ {args.baud}")
-    print("sending Phase 3 frames. invalid frames ARE sent (flags bit0 clear) so")
+    print("sending pose frames, including invalid ones (flags bit0 clear) so")
     print("the STM32 can tell 'no tag' from 'link dead'.  Ctrl-C to stop.\n")
 
     seq, last, n_sent, n_valid = 0, 0, 0, 0
@@ -195,17 +159,13 @@ def main():
                 n_tags = len(p["tags"])
                 tag_id = 0 if 0 in p["tags"] else p["tags"][0]
                 rng, bearing, relyaw = p["range"], p["bearing"], p["relyaw"]
-                # ratio 1 -> the two candidate poses are indistinguishable;
-                # large -> one clearly wins. Map to 0..1 monotonically.
+                # Map the ambiguity ratio (1 = ambiguous) monotonically to 0..1.
                 quality = 1.0 - 1.0 / max(p["ratio"], 1.0)
                 flags = FLAG_VALID
                 if n_tags > 1:
                     flags |= FLAG_MULTITAG
-                # AMBIGUOUS requires BOTH a low ratio AND a large |relyaw|.
-                # Near square-on the two solutions sit close to each other AND
-                # close to zero, so a low ratio there is benign -- flagging on
-                # ratio alone would cry wolf during docking, which is exactly
-                # when the pose is most trustworthy. See the Step 4.3 note.
+                # A low ratio near square-on is harmless (both solutions are
+                # near zero yaw), so only flag it when |relyaw| is large too.
                 if p["ratio"] < 3.0 and abs(relyaw) > math.radians(10.0):
                     flags |= FLAG_AMBIGUOUS
                 n_valid += 1
@@ -219,7 +179,7 @@ def main():
 
             if not args.quiet and time.time() > t_report:
                 t_report = time.time() + 2.0
-                v = "  --  no tag" if p is None else (
+                v = "  no tag" if p is None else (
                     f"  rng {p['range']:.3f} m  brg {math.degrees(p['bearing']):+6.2f}"
                     f"  yaw {math.degrees(p['relyaw']):+6.2f}"
                     f"  q {quality:.2f}  tags {p['tags']}")

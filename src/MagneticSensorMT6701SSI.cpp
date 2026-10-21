@@ -21,11 +21,10 @@ void MagneticSensorMT6701SSI::init(SPIClass* _spi) {
     this->Sensor::init();
 }
 
-// check 40us delay between each read?
+// TODO: check whether the sensor needs a 40 us gap between reads.
 float MagneticSensorMT6701SSI::getSensorAngle() {
     float angle_data = readRawAngleSSI();
     angle_data = ( angle_data / (float)MT6701_CPR ) * _2PI;
-    // return the shaft angle
     return angle_data;
 }
 

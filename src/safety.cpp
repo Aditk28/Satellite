@@ -5,12 +5,9 @@
 #include <task.h>
 
 #define SAFETY_PERIOD_MS      50    /* 20 Hz */
-#define HEARTBEAT_TIMEOUT_MS  300   /* no progress for this long = control is dead */
-/* fanTask runs at 500 Hz, so ~100 frames should land between two of these checks.
-   200 ms of no movement is ~100 missed frames -- unambiguous, not a near miss. */
-#define FAN_STALL_TIMEOUT_MS  200
-#define SUPPLY_ABSENT_V       1.0f  /* below this the motor supply is simply OFF,
-                                       not sagging -- do not trip undervoltage */
+#define HEARTBEAT_TIMEOUT_MS  300   /* no kick for this long = control task is dead */
+#define FAN_STALL_TIMEOUT_MS  200   /* ~100 missed frames at 500 Hz */
+#define SUPPLY_ABSENT_V       1.0f  /* below this the motor supply is off, not sagging */
 
 static float (*s_wheelVel)(void)          = nullptr;
 static void  (*s_safeStop)(const char*)   = nullptr;
@@ -20,7 +17,6 @@ static volatile bool  s_armed             = false;
 static volatile uint32_t s_kicks          = 0;
 static volatile uint32_t s_checks         = 0;
 
-/* Phase 5.2 power monitoring (monitor only -- no trip yet, see safety.h). */
 static bool (*s_readPower)(float*, float*) = nullptr;
 static volatile float    s_minV     = 1e9f;
 static volatile float    s_maxV     = 0.0f;
@@ -33,7 +29,6 @@ void safety_arm(void)  { s_armed = true; }
 static float s_minBusV = 0.0f;      /* 0 = trip disabled */
 static float s_maxMilliAmps = 0.0f; /* 0 = trip disabled */
 
-/* Phase 1.3 fanTask liveness (see safety.h). */
 static uint32_t (*s_fanFrames)(void)  = nullptr;
 static bool     (*s_fanRunning)(void) = nullptr;
 
@@ -63,17 +58,12 @@ static void safetyTask(void*) {
   bool       fanLatched   = false;
 
   for (;;) {
-    /* If we were starved long enough to fall behind, RESYNC instead of letting
-       vTaskDelayUntil return immediately once per missed period. Without this the
-       checks below fire back-to-back in microseconds after any long starvation --
-       which is exactly how the first version false-tripped the heartbeat after B
-       and E (Arduino delay() busy-spins at prio 3 and starves this task). */
+    /* After a long starvation, resync instead of letting vTaskDelayUntil return
+       immediately once per missed period and run the checks back-to-back. */
     TickType_t nowT = xTaskGetTickCount();
     if ((int32_t)(nowT - last) > (int32_t)pdMS_TO_TICKS(2 * SAFETY_PERIOD_MS))
       last = nowT;
 
-    /* Absolute-time wake: execution time does NOT accumulate as period drift,
-       which vTaskDelay would cause. */
     vTaskDelayUntil(&last, pdMS_TO_TICKS(SAFETY_PERIOD_MS));
 
     if (!s_armed) {                                   /* hwSetup still running */
@@ -83,9 +73,7 @@ static void safetyTask(void*) {
     }
     s_checks++;
 
-    /* ---- 1. wheel overspeed, independent of the control task ---------------
-       Normally the inline 200 Hz check in controlUpdate fires first; this is the
-       backstop for when the control task is not checking at all. */
+    /* Wheel overspeed. Backstop for when the control task is not checking. */
     if (s_wheelVel) {
       float w = s_wheelVel();
       if (fabsf(w) > s_satLimit) {
@@ -94,10 +82,9 @@ static void safetyTask(void*) {
       }
     }
 
-    /* ---- 1b. power rail (INA219, the second I2C user) ---------------------
-       MONITOR ONLY: record extremes so real thresholds can be chosen from data.
-       The read itself takes the I2C mutex inside the sketch-provided callback --
-       this task must NOT hold the bus across anything else. */
+    /* Power rail. Each trip is debounced over 2 checks and latched so it fires
+       once per excursion. Readings below SUPPLY_ABSENT_V mean the board is on USB
+       with no motor supply, so they never trip undervoltage. */
     if (s_readPower) {
       float busV = 0.0f, mA = 0.0f;
       if (s_readPower(&busV, &mA)) {
@@ -106,17 +93,6 @@ static void safetyTask(void*) {
         if (busV > s_maxV) s_maxV = busV;
         if (fabsf(mA) > s_maxA) s_maxA = fabsf(mA);
 
-        /* DEBOUNCED: a threshold must hold for 2 consecutive checks (100 ms).
-           A single noisy INA219 sample must never kill a run.
-
-           LATCHED: fire ONCE per excursion, then stay quiet until the condition
-           clears. Without this, every 50 ms check re-fired the stop and the
-           operator got 20 identical messages per second, burying everything else.
-
-           SUPPLY-ABSENT GUARD: a reading below SUPPLY_ABSENT_V means the motor
-           supply simply is not connected (bench-testing on USB), not a collapsing
-           battery. Tripping there is pointless -- there is no power reaching the
-           driver to cut -- and it made the board unusable without the battery. */
         static int  uvStrikes = 0,     ocStrikes = 0;
         static bool uvLatched = false, ocLatched = false;
 
@@ -138,10 +114,8 @@ static void safetyTask(void*) {
       }
     }
 
-    /* ---- 1c. fanTask liveness (Phase 1.3) ---------------------------------
-       Only meaningful while the fans SHOULD be sending: during the ~1 s arming
-       ramp fanRunning() is false, and after a hard kill it is false forever, so
-       neither reads as a stall. Wall-clock, latched -- see safety.h. */
+    /* fanTask liveness. Only checked while fanRunning() is true (not during the
+       arming ramp or after a hard kill). Wall-clock based and latched. */
     if (s_fanFrames && s_fanRunning) {
       uint32_t fr = s_fanFrames();
       TickType_t tf = xTaskGetTickCount();
@@ -156,17 +130,9 @@ static void safetyTask(void*) {
       }
     }
 
-    /* ---- 2. control-task heartbeat ----------------------------------------
-       Measured in TIME, not in iterations. An iteration counter assumes this task
-       runs on schedule -- but it can be starved (see the resync above), and then N
-       consecutive checks span microseconds rather than N periods, so a perfectly
-       healthy control task looks dead. Wall-clock elapsed since the counter last
-       moved is immune to how often we get to look.
-
-       No progress for HEARTBEAT_TIMEOUT_MS means the control task is wedged (hung
-       peripheral, deadlock, crash). It cannot be recovered by clearing flags it
-       will never read, so this is terminal: hardware kill, latch the reason to the
-       .noinit black box, blink it forever. */
+    /* Control-task heartbeat, measured in wall-clock time since the counter last
+       moved (an iteration count would false-trip if this task were starved).
+       A wedged control task cannot be recovered, so this is a terminal fault. */
     uint32_t k = s_kicks;
     nowT = xTaskGetTickCount();
     if (k != lastKick) {

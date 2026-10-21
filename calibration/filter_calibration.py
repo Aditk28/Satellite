@@ -1,63 +1,32 @@
 #!/usr/bin/env python3
 """
-filter_calibration.py
+Apply sensor corrections to a raw calibration run and add derived columns.
 
-Turns a raw calibration_run_* folder (written by capture_calibration.py) into
-a filtered/ copy with sensor corrections applied and derived columns added.
-Raw files are never modified, so reruns are safe.
+Reads the test*.csv files written by capture_calibration.py and writes
+corrected copies plus summary.csv into <run>/filtered/. Raw files are not
+modified.
 
-Handles the current firmware format (repeats, measured wheel angle, INA219
-current, staircase mode) and still reads the older pre-repeats format.
+Corrections:
+  gyro bias   Mean gyro rate over phase A of the from-rest tests (from=0.00V),
+              the only windows where the platform is known to be still.
+              Cross-checked against the firmware's gyro_bias_dps.
+  gyro sign   The encoder and gyro-Z are mounted with opposite positive
+              directions, so the gyro is negated (--no-flip-gyro to disable).
+  wheel angle The encoder angle does not reset between tests; it is zeroed to
+              each test's first sample.
 
-WHAT IT CORRECTS:
+Added columns: t_s, phase (A before the step, B after), wheel_angle_rad,
+wheel_accel, gyro_dps, platform_deg (integrated gyro_dps), power_mW, iq_est_A.
 
-  GYRO BIAS. The MPU6050 reads a small nonzero rate at rest (~0.42 dps in
-  this rig). Left in, it integrates into rotation that never happened. The
-  bias is measured from the phase-A windows of tests that start from rest
-  (from=0.00V) -- the only windows where the platform is provably
-  undisturbed. Tests that spin up first are excluded; their phase A holds
-  real motion. The firmware now also reports its own startup measurement as
-  gyro_bias_dps in each file's metadata, and this script cross-checks the
-  two and warns if they disagree meaningfully (which would suggest thermal
-  drift over the sweep, or that the rig wasn't actually still at startup).
+iq_est_A is estimated from power balance (Iq ~ V_bus*I_bus/Uq), since the
+INA219 measures bus current, not phase current. It ignores losses and is NaN
+where |targetV| < --iq-min-v.
 
-  WHEEL/PLATFORM SIGN CONVENTION. Wheel velocity and gyro rate come out
-  positively correlated in raw data, which would mean both bodies turning
-  the same way. They aren't -- the encoder's positive direction and the
-  IMU's positive gyro-Z are defined oppositely by how they're mounted.
-  --flip-gyro (default on) negates the gyro so both share a convention.
+Staircase files (mode=staircase) get no phase split; breakaway_summary.csv
+reports where motion starts going up and stops coming down.
 
-  WHEEL ANGLE ZEROING. The encoder reports absolute accumulated angle that
-  does not reset between tests, so each test starts from whatever the last
-  one left behind. Each test's angle is re-zeroed to its own first sample.
-
-WHAT IT ADDS:
-  t_s              seconds since the start of that test
-  phase            'A' (pre-step hold) or 'B' (post-step transient)
-  wheel_angle_rad  measured encoder angle, zeroed per test
-  wheel_accel      d(wheel_vel)/dt -- sets reaction torque on the platform
-  gyro_dps         bias-corrected (and optionally sign-flipped) rate
-  platform_deg     integrated gyro_dps -- platform heading, degrees
-  power_mW         busV * current_mA
-  iq_est_A         estimated q-axis current, see below
-
-IQ ESTIMATE -- READ BEFORE TRUSTING IT. The INA219 is on the DC bus, not
-the phase wires, so Iq is not measured directly. In voltage mode SimpleFOC
-drives Ud ~= 0, so essentially all electrical power is Uq*Iq and must come
-from the bus:  V_bus*I_bus ~= Uq*Iq  ->  Iq ~= V_bus*I_bus/Uq.
-This neglects switching and conduction losses (a few percent) and blows up
-as Uq approaches zero. Samples where |targetV| < --iq-min-v (default 0.15 V)
-are left as NaN rather than reporting a huge meaningless number -- that
-includes every release-to-zero test's phase B, by design.
-
-STAIRCASE FILES are detected by mode=staircase in the metadata and passed
-through with bias correction and derived columns, but no phase split (there
-is no single step). breakaway_summary.csv reports, per staircase file, the
-first tread where platform motion leaves the noise floor going up and where
-it re-sticks coming down.
-
-USAGE:
-    python filter_calibration.py calibration_run_20260730_101500
+Usage:
+    python filter_calibration.py runs/<run_folder>
     python filter_calibration.py <run_folder> --no-flip-gyro
     python filter_calibration.py <run_folder> --bias 0.42 --iq-min-v 0.2
 """
@@ -79,13 +48,7 @@ RE_TITLE = re.compile(r"^#\s*test\s+(\d+)/(\d+):\s*(.*)$")
 
 
 def parse_meta_line(line):
-    """Pull key=value pairs out of the metadata comment line.
-
-    Deliberately generic: the firmware's metadata fields change as the sweep
-    evolves, and an exact-match regex on that line is what silently broke
-    capture once already. Anything of the form key=value is picked up;
-    unknown keys are simply ignored.
-    """
+    """Return all key=value pairs in a metadata line. Unknown keys are kept."""
     out = {}
     for m in re.finditer(r"(\w+)=([^\s]+)", line):
         out[m.group(1)] = m.group(2)
@@ -106,9 +69,8 @@ def read_test(path):
             meta.update(parse_meta_line(line[1:]))
     df = pd.read_csv(path, comment="#")
 
-    # Normalise column names across firmware revisions. The older sweep
-    # logged vel_filtered (plus an unused vel_raw); the current one logs
-    # wheel_vel. Everything downstream uses wheel_vel.
+    # Older firmware logged vel_filtered (motor.shaft_velocity, which has the
+    # initFOC direction correction applied) and vel_raw; use the former.
     if "wheel_vel" not in df.columns and "vel_filtered" in df.columns:
         df = df.rename(columns={"vel_filtered": "wheel_vel"})
     return df, meta
@@ -126,15 +88,14 @@ def is_staircase(meta):
 
 
 def is_breakaway(meta):
-    """Breakaway trials are structurally from-rest step tests (they have the
-    same phase A/B split), so they flow through the normal path -- this is
-    only used to build the extra breakaway summary at the end."""
+    """Breakaway trials are processed as normal step tests; this only selects
+    them for the breakaway summary."""
     return str(meta.get("mode", "")).lower() == "breakaway"
 
 
 def transition_index(df, meta):
-    """First phase-B sample. Prefer the firmware's own index; fall back to
-    detecting where targetV changes (needed for older files)."""
+    """Index of the first phase-B sample. Uses phaseB_start_sample if present,
+    else the first change in targetV."""
     if "phaseB_start_sample" in meta:
         try:
             return int(meta["phaseB_start_sample"])
@@ -175,9 +136,8 @@ def integrate(y, t):
     return out
 
 
-def find_breakaway(df, bias, settle_dps):
-    """First tread where platform motion leaves the noise floor (climbing)
-    and where it settles back (descending)."""
+def find_breakaway(df, settle_dps):
+    """Lowest voltage with platform motion on the way up and on the way down."""
     v = df["targetV"].to_numpy()
     g = np.abs(df["gyro_dps"].to_numpy())
     peak_v = v.max()
@@ -239,16 +199,15 @@ def main():
         fwb = float(np.mean(fw))
         print(f"Firmware-reported bias: {fwb:+.4f} dps  (difference {abs(fwb-bias):.4f})")
         if abs(fwb - bias) > 0.15:
-            print("  ! These disagree more than expected. Possible causes: the rig wasn't")
-            print("    still during the firmware's startup measurement, or the gyro drifted")
-            print("    over the sweep. The value measured here (from at-rest windows) is used.")
+            print("  ! These disagree. The rig may have moved during the firmware's startup")
+            print("    measurement, or the gyro drifted. Using the value measured here.")
 
     print(f"Gyro sign flip: {'ON' if args.flip else 'OFF'}")
     print()
 
     rows, stair_rows = [], []
     brk_rows = []
-    n_angle_flips = [0]   # list so the per-test loop can increment it
+    n_angle_flips = 0
 
     for path in files:
         df, meta = read_test(path)
@@ -264,19 +223,10 @@ def main():
         if args.flip:
             gyro = -gyro
 
-        # Encoder angle is absolute and does not reset between tests -- zero
-        # it per test. Older files without the column fall back to
-        # integrating velocity.
-        #
-        # SIGN: sensor.getAngle() returns the RAW encoder direction, while
-        # motor.shaft_velocity has the direction correction found during
-        # initFOC() alignment applied to it. On this rig they come out
-        # opposite (d(angle)/dt tracks -wheel_vel at slope ~-0.98 in every
-        # test), exactly like the old vel_raw/vel_filtered mirror. Left
-        # uncorrected, angle and velocity would disagree about which way the
-        # wheel is turning, which would silently corrupt anything using both.
-        # Detected per test rather than assumed, so a firmware change that
-        # switches to motor.shaft_angle won't break this.
+        # Zero the encoder angle per test (older files: integrate velocity).
+        # sensor.getAngle() is in raw encoder direction while shaft_velocity
+        # has the initFOC correction, so they can disagree in sign. Check the
+        # slope of d(angle)/dt vs velocity per test and flip if negative.
         angle_flipped = False
         if "wheel_angle_rad" in df.columns:
             wa = df["wheel_angle_rad"].to_numpy().astype(np.float64)
@@ -288,7 +238,7 @@ def main():
                 if slope < 0:
                     wheel_angle = -wheel_angle
                     angle_flipped = True
-                    n_angle_flips[0] += 1
+                    n_angle_flips += 1
         else:
             wheel_angle = integrate(wheel_vel, t_s)
 
@@ -317,7 +267,6 @@ def main():
             out["current_mA"] = np.round(cur, 3)
             out["busV"] = np.round(bus, 4)
             out["power_mW"] = np.round(bus * cur, 3)
-            # Iq from power balance; masked where Uq is too small to divide by.
             with np.errstate(divide="ignore", invalid="ignore"):
                 iq = np.where(np.abs(tv) >= args.iq_min_v, bus * (cur / 1000.0) / tv, np.nan)
             out["iq_est_A"] = np.round(iq, 5)
@@ -334,7 +283,7 @@ def main():
             out.to_csv(f, index=False)
 
         if stair:
-            bo, rs, pk = find_breakaway(out, bias, args.settle_dps)
+            bo, rs, pk = find_breakaway(out, args.settle_dps)
             stair_rows.append({"file": name, "breakaway_V": bo, "restick_V": rs,
                                "max_V": pk, "n": len(out)})
             print(f"  wrote {outpath}  [staircase] breakaway~{bo:.2f}V restick~{rs:.2f}V")
@@ -342,9 +291,7 @@ def main():
             iq_ss = np.nan
             if "iq_est_A" in out.columns:
                 tail = out["iq_est_A"].to_numpy()[-20:]
-                # All-NaN is expected and correct for release-to-zero tests:
-                # targetV is 0 there, so Iq can't be recovered from power
-                # balance. nanmean would warn on an all-NaN slice, so check.
+                # All-NaN for release-to-zero tests (targetV is 0).
                 if np.any(np.isfinite(tail)):
                     iq_ss = round(float(np.nanmean(tail)), 5)
             b = out[out["phase"] == "B"]
@@ -381,18 +328,14 @@ def main():
         summary.to_csv(os.path.join(outdir, "summary.csv"), index=False)
         print(f"\n  wrote {os.path.join(outdir,'summary.csv')}")
 
-        if n_angle_flips[0]:
-            print(f"\n  note: wheel_angle_rad sign was inverted relative to wheel_vel in "
-                  f"{n_angle_flips[0]} test(s) and has been corrected.")
-            print("    sensor.getAngle() reports raw encoder direction; motor.shaft_velocity")
-            print("    has the initFOC() alignment correction applied. Logging")
-            print("    motor.shaft_angle instead would fix this at the source.")
+        if n_angle_flips:
+            print(f"\n  note: wheel_angle_rad sign flipped to match wheel_vel in "
+                  f"{n_angle_flips} test(s).")
 
         bad = summary[summary["phaseA_clean"] == "no"]
         if len(bad):
-            print(f"\n  ! {len(bad)} test(s) reported phaseA_clean=no -- the platform was still")
-            print("    moving when the step fired, so phase B started from a contaminated")
-            print("    initial condition. Consider excluding these from fits:")
+            print(f"\n  ! {len(bad)} test(s) reported phaseA_clean=no (platform still moving")
+            print("    when the step fired). Consider excluding these from fits:")
             for _, r in bad.iterrows():
                 print(f"      test {int(r['test']):3d} rep {int(r['rep'])}  {r['label']}")
 
@@ -429,12 +372,12 @@ def main():
         wmoved = agg[agg["wheel_moved"]]
         print()
         if len(wmoved):
-            print(f"  MOTOR deadband:    wheel first turns at step {wmoved.step_V.iloc[0]:.2f} V")
+            print(f"  Motor deadband:     wheel first turns at step {wmoved.step_V.iloc[0]:.2f} V")
         if len(moved):
-            print(f"  PLATFORM breakaway: first moves at step {moved.step_V.iloc[0]:.2f} V "
+            print(f"  Platform breakaway: first moves at step {moved.step_V.iloc[0]:.2f} V "
                   f"(threshold {args.settle_dps} dps)")
         else:
-            print(f"  PLATFORM never exceeded {args.settle_dps} dps -- raise BREAK_MAX_V and rerun.")
+            print(f"  Platform never exceeded {args.settle_dps} dps. Raise BREAK_MAX_V and rerun.")
 
     if stair_rows:
         sdf = pd.DataFrame(stair_rows)

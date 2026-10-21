@@ -3,8 +3,7 @@
 #include <task.h>
 #include <queue.h>
 
-// Tagged record. The union keeps every queue item one size (queues copy by value)
-// while carrying different payloads.
+// Queue item: either a line of text or a function to run on telemTask.
 enum : uint8_t { K_TEXT = 0, K_CALL = 1 };
 
 struct TelemMsg {
@@ -23,7 +22,6 @@ static volatile bool     s_active  = false;
 static volatile uint32_t s_drops   = 0;
 static volatile uint32_t s_pending = 0;   // enqueued but not yet executed
 
-// The ONLY place the serial ports are touched once telemTask is active.
 static void writeBoth(const char* s) {
   if (s_usb) s_usb->println(s);
   if (s_bt)  s_bt->println(s);
@@ -32,9 +30,6 @@ static void writeBoth(const char* s) {
 static void telemTask(void*) {
   TelemMsg m;
   for (;;) {
-    // Blocks while the queue is empty -> consumes no CPU. Wakes only once the
-    // control task has yielded (blocked on its own notification), so the two
-    // never run concurrently in the serial driver.
     if (xQueueReceive(s_q, &m, portMAX_DELAY) == pdTRUE) {
       switch (m.kind) {
         case K_TEXT: writeBoth(m.text); break;
@@ -57,8 +52,7 @@ void telem_activate() { s_active = true; }
 bool telem_isActive() { return s_active; }
 
 void telem_print(const String& s) {
-  // Boot path: telemTask can't drain until the control loop yields, so write
-  // straight through. Single-writer still holds -- the task isn't running yet.
+  // Boot: telemTask cannot drain yet, so write straight through.
   if (!s_active || !s_q) { writeBoth(s.c_str()); return; }
 
   TelemMsg m;
@@ -71,7 +65,6 @@ void telem_print(const String& s) {
 
 void telem_run(void (*fn)()) {
   if (!fn) return;
-  // Before activation there is no other writer, so just run it inline.
   if (!s_active || !s_q) { fn(); return; }
 
   TelemMsg m;

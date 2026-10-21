@@ -1,23 +1,15 @@
 #!/usr/bin/env python3
 """
-Live camera view over HTTP, with AprilTag detection overlay. Runs ON THE PI.
+Live camera view over HTTP with an AprilTag overlay. Runs on the Pi.
 
-A viewer for a headless Pi: open http://raspberrypi.local:8080 from any browser
-on the same network. Serves multipart/x-mixed-replace (motion JPEG), which every
-browser renders natively with no plugin and no client-side anything.
+Open http://raspberrypi.local:8080 in a browser on the same network. Each
+detected tag is drawn with its id, apparent width in pixels and a rough range.
+The range uses a measured focal length with no calibration, so it is labelled
+UNCAL and is only indicative. Useful for aiming the camera and checking that
+all three tags are detected at the ranges you care about.
 
-Doubles as the aiming tool for Phase 4 -- it draws each detected tag's outline,
-id, and apparent width in pixels, so you can position the dock, check that all
-three tags are in frame at the ranges you care about, and see detection drop out
-in real time as you back away.
-
-NOT a measurement tool. The range column is computed from the SPEC-SHEET focal
-length (f = 424 px at 1280x720, derived from the 120 deg DFOV), not from a
-calibration, so treat it as indicative only -- it is labelled UNCAL on screen for
-that reason. Real numbers come from Step 4.1.
-
-Do not run this at the same time as pi_vision_bench.py -- both want /dev/video0
-and the second one to ask will fail or get garbage.
+Only one process can hold /dev/video0, so do not run this alongside the other
+camera scripts.
 
     ~/vision/bin/python pi_cam_view.py
     ~/vision/bin/python pi_cam_view.py --width 640 --height 480 --port 8080
@@ -32,8 +24,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import cv2
 import numpy as np
 
-# Physical black-square width per tag id, metres. Update once measured with
-# calipers -- printers scale, and this multiplies range directly.
+# Black-square edge length per tag id, metres. Scales range directly.
 TAG_SIZE_M = {0: 0.120, 1: 0.040, 2: 0.040, 3: 0.020}
 DEFAULT_TAG_M = 0.040
 
@@ -42,10 +33,8 @@ lock = threading.Lock()
 
 
 def make_detector():
-    # Debian python3-apriltag first -- the reference detector, prebuilt.
-    # The kwarg is `threads`, NOT `Nthreads` (the module's own docstring is wrong
-    # and the C binding rejects it). It defaults to 1. Using 2 rather than 4
-    # because this viewer shares the CPU with the HTTP server and JPEG encode.
+    # Prefer Debian's python3-apriltag. Its kwarg is `threads` (not `Nthreads`
+    # as its docstring says). 2 threads leaves CPU for the HTTP server.
     try:
         from apriltag import apriltag as ATag
         d = ATag("tag36h11", threads=2, decimate=1.0, refine_edges=True)
@@ -72,9 +61,7 @@ def make_detector():
 def detections(mode, det, gray):
     """Normalise every backend to [(id, 4x2 corner array), ...]."""
     if mode == "deb_apriltag":
-        # Returns dicts; corners live under 'lb-rb-rt-lt' in that order, so
-        # indices 0-1 are the bottom edge and 2-3 the top -- which is what the
-        # apparent-width calculation below assumes.
+        # Corners are ordered lb, rb, rt, lt: 0-1 bottom edge, 2-3 top edge.
         return [(int(r["id"]), np.array(r["lb-rb-rt-lt"], dtype=float))
                 for r in det.detect(gray)]
     if mode == "apriltag":
@@ -98,17 +85,9 @@ def capture_loop(args):
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    # MEASURED 2026-08-20, not from the spec sheet. Two known-distance readings
-    # of the 12 cm tag: 115 px @ 1.00 m -> 958, 281 px @ 0.40 m -> 937. Mean 947.
-    #
-    # The spec sheet claims 120 deg DFOV, which would be f = 424. The measured
-    # 947 implies ~76 deg DFOV (68 H, 42 V) -- so either the spec is marketing or
-    # 720p is a CENTRE CROP of the sensor rather than a downscale. Trust the
-    # measurement: it is self-consistent across two distances to 2%.
-    #
-    # This is a focal length only -- NOT a calibration. Principal point is
-    # assumed centred and distortion is uncorrected, so bearing degrades toward
-    # the frame edges. Run pi_calibrate.py when that starts to matter.
+    # Focal length measured from the 12 cm tag at two known distances (947 px
+    # at 1280 wide). The spec sheet's 120 deg DFOV would imply 424 px, which
+    # does not match. No principal point or distortion correction.
     f_px = 947.0 * (w / 1280.0)
 
     mode, det = (None, None) if args.no_detect else make_detector()
@@ -127,8 +106,7 @@ def capture_loop(args):
             for tid, corners in detections(mode, det, gray):
                 pts = corners.astype(int)
                 cv2.polylines(frame, [pts], True, (0, 255, 0), 2)
-                # Apparent width from the mean of the two horizontal edges --
-                # less noisy than one edge, and closer to what PnP sees.
+                # Apparent width: mean of the two horizontal edges.
                 px = 0.5 * (np.linalg.norm(corners[0] - corners[1]) +
                             np.linalg.norm(corners[2] - corners[3]))
                 s = TAG_SIZE_M.get(tid, DEFAULT_TAG_M)
@@ -159,7 +137,7 @@ text-align:center}img{max-width:100%;height:auto}</style></head>
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
-        pass                      # keep the console clean for the capture thread
+        pass
 
     def do_GET(self):
         if self.path != "/stream":
@@ -183,9 +161,9 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(b"--frame\r\nContent-Type: image/jpeg\r\n"
                                  b"Content-Length: " +
                                  str(len(jpg)).encode() + b"\r\n\r\n" + jpg + b"\r\n")
-                time.sleep(1.0 / 15)      # cap the SERVED rate; capture is separate
+                time.sleep(1.0 / 15)      # served rate; capture runs separately
         except (BrokenPipeError, ConnectionResetError):
-            pass                          # browser tab closed -- normal
+            pass                          # browser tab closed
 
 
 def main():
